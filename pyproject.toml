@@ -44,7 +44,7 @@ dev = [
     # the tree or add rules and break `black --check` / `ruff check` on an
     # unrelated PR. Bump deliberately.
     "ruff>=0.5,<0.15",
-    "black>=24.0,<26",
+    "black>=24.0,<27",
     "mypy>=1.10",
     "build>=1.2",
 ]
