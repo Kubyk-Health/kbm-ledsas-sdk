@@ -1,0 +1,83 @@
+LEDSAS SDK v0.3.2 - THIRD-PARTY SOFTWARE NOTICES
+
+This software includes the following third-party components:
+
+============================================================================
+
+1. aio-pika (v9.4.0+)
+   License: Apache License 2.0
+   Copyright: Copyright (c) 2019 Mosquito
+   URL: https://github.com/mosquito/aio-pika
+
+2. azure-storage-blob (v12.19.0+)
+   License: MIT License
+   Copyright: Copyright (c) Microsoft Corporation
+   URL: https://github.com/Azure/azure-sdk-for-python
+
+3. pydantic (v2.5.0+)
+   License: MIT License
+   Copyright: Copyright (c) 2023 Samuel Colvin
+   URL: https://github.com/pydantic/pydantic
+
+4. aiohttp (v3.8.0+)
+   License: Apache License 2.0
+   Copyright: Copyright (c) 2013-2023 aiohttp contributors
+   URL: https://github.com/aio-libs/aiohttp
+
+5. Python Runtime (3.11+)
+   License: Python Software Foundation License
+   Copyright: Copyright (c) 2001-2024 Python Software Foundation
+   URL: https://www.python.org/
+
+============================================================================
+
+The SDK itself does not redistribute the binaries of the listed
+third-party packages — they are pulled at install time by `pip install`
+from PyPI and ship with their own LICENSE files inside the install
+directory (e.g. `venv/lib/python3.11/site-packages/aio_pika-*.dist-info/LICENSE`).
+The URLs above link to each project's source, which also carries the
+full license text.
+
+Indirect (transitive) dependencies pulled in by the four direct deps
+above, annotated with the path that pulls each one:
+
+  azure-core            (via azure-storage-blob)
+  cryptography          (via azure-storage-blob -> azure-core)
+  cffi                  (via cryptography)
+  pycparser             (via cffi)
+  isodate               (via azure-storage-blob -> azure-core)
+  requests              (via azure-storage-blob -> azure-core)
+  urllib3               (via requests)
+  certifi               (via requests)  — License: MPL-2.0 (Mozilla Public
+                        License 2.0). This is the only non-permissive
+                        (weak file-level copyleft) license in the
+                        dependency tree; all others are Apache-2.0 / MIT /
+                        BSD / PSF. The SDK does not modify or redistribute
+                        certifi (pip pulls it at install time as above), so
+                        unmodified use imposes no MPL source-disclosure
+                        obligation.
+  charset_normalizer    (via requests)
+  idna                  (via requests, yarl)
+
+  aiormq                (via aio-pika)
+  pamqp                 (via aiormq)
+
+  multidict             (via aiohttp, yarl)
+  yarl                  (via aiohttp)
+  frozenlist            (via aiohttp, aiosignal)
+  aiosignal             (via aiohttp)
+  aiohappyeyeballs      (via aiohttp)
+  propcache             (via aiohttp, yarl)
+  attrs                 (via aiohttp)
+
+  pydantic-core         (via pydantic)
+  annotated-types       (via pydantic)
+  typing-extensions     (via pydantic, azure-core)
+  typing-inspection     (via pydantic)
+
+Each ships its own license file in the install directory (e.g.
+`venv/lib/python3.11/site-packages/<pkg>-*.dist-info/LICENSE`).
+
+All third-party software is used in accordance with their respective licenses.
+
+Last Updated: 2026-06-10

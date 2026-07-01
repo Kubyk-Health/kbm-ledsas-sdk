@@ -1,0 +1,23 @@
+# gitleaks configuration for kbm-ledsas-sdk.
+# Extends the default ruleset and allowlists known-safe test fixtures /
+# documentation values that are NOT real secrets. Reviewed 2026-07-01:
+# both gitleaks and trufflehog reported zero verified secrets.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Known-safe fixtures: public Azurite dev key, UUID test fixtures, obvious fakes"
+regexTarget = "match"
+regexes = [
+  # Microsoft's WELL-KNOWN public Azurite development storage key — documented
+  # in every Azure dev example; used here so the example service runs offline.
+  '''Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==''',
+  # UUID literal used as an idempotency_key across model tests (matched only
+  # because the field name contains "key").
+  '''a6f6d1e7-6c8a-4f6b-9c4b-4c2f8dbf1d99''',
+  # Obvious fake account key in a validation test.
+  '''Fak3K3yForT3sts999==''',
+  # Default RabbitMQ guest credentials in local/dev/test URLs (not a secret).
+  '''amqp://guest:guest@''',
+]
