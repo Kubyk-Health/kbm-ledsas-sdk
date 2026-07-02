@@ -1,0 +1,109 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kbm-ledsas-sdk"
+version = "0.3.2"
+description = "KeborMed LEDSAS SDK - Python client for building Local External Data Sources Action Service (LEDSAS) data-processing services"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "KeborMed", email = "support@kebormed.com" },
+]
+keywords = ["ledsas", "kebormed", "rabbitmq", "azure-blob", "medical", "data-processing", "sdk"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic>=2.5.0,<3.0",
+    "aio-pika>=9.4.0,<10.0",
+    "azure-storage-blob>=12.19.0,<13.0",
+    "aiohttp>=3.8.0,<4.0",
+    # Security floor: cryptography arrives transitively via azure-storage-blob
+    # (which imposes no upper bound). Pinning the floor keeps every install off
+    # versions flagged by security scans; it resolves cleanly to the latest patch.
+    "cryptography>=48.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    # Upper bounds on the formatters/linters so a future release can't reformat
+    # the tree or add rules and break `black --check` / `ruff check` on an
+    # unrelated PR. Bump deliberately.
+    "ruff>=0.5,<0.15",
+    "black>=24.0,<26",
+    "mypy>=1.10",
+    "build>=1.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/Kubyk-Health/kbm-ledsas-sdk"
+Repository = "https://github.com/Kubyk-Health/kbm-ledsas-sdk"
+Issues = "https://github.com/Kubyk-Health/kbm-ledsas-sdk/issues"
+Changelog = "https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["kbm_ledsas_sdk*"]
+
+[tool.setuptools.package-data]
+kbm_ledsas_sdk = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "integration: live wire tests that need Docker + Azurite (skip if unavailable)",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Pragmatic baseline for launch: correctness (E/F/W), imports (I), modern syntax
+# (UP), common bugs (B), comprehensions (C4), and Ruff's own rules. The stricter
+# families (typing-annotations, security-asserts, docstrings, etc.) can be
+# adopted incrementally. Line length is enforced by black, so E501 is ignored.
+select = ["E", "F", "W", "I", "UP", "B", "C4", "PIE"]
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# C408: dict(...) literals are fine in test fixtures; UP031: one test deliberately
+# exercises %-formatting to prove credential redaction.
+"tests/**" = ["B011", "B017", "C408", "UP031"]
+
+[tool.coverage.run]
+source = ["kbm_ledsas_sdk"]
+omit = ["*/tests/*", "*/__pycache__/*"]

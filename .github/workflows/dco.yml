@@ -1,0 +1,40 @@
+name: DCO
+
+# Verifies every commit in a pull request carries a "Signed-off-by:" trailer
+# (Developer Certificate of Origin). See CONTRIBUTING.md for how to sign off.
+#
+# Alternative: install the DCO GitHub App (https://github.com/apps/dco) and
+# delete this workflow — the app does the same check with a nicer UI.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dco-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check Signed-off-by on all PR commits
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          missing=0
+          for sha in $(git rev-list "$base".."$head"); do
+            author="$(git show -s --format='%an <%ae>' "$sha")"
+            if ! git show -s --format='%(trailers:key=Signed-off-by)' "$sha" | grep -q "Signed-off-by:"; then
+              echo "::error::commit $sha ($author) is missing a Signed-off-by trailer"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "One or more commits are not signed off. See CONTRIBUTING.md (git commit -s)."
+            exit 1
+          fi
+          echo "All commits are signed off. ✅"

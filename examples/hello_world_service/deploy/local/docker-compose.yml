@@ -1,0 +1,68 @@
+# Local development infrastructure for the hello-world LEDSAS service:
+# RabbitMQ (message queue) + Azurite (Azure Blob Storage emulator).
+#
+# Usage (from this directory):
+#   docker compose up -d        # Start services
+#   docker compose ps           # Check status
+#   docker compose down -v      # Stop + discard data
+#
+# Every host-port mapping below is prefixed with `127.0.0.1:` so the dev
+# broker (guest/guest creds) and Azurite (well-known account key) listen on
+# loopback only — same threat model the SDK applies to its own health
+# server and amqp:// non-loopback refusal.
+#
+# NOTE: this stack uses the standard host ports (5672/15672/10000). If you run
+# another local RabbitMQ/Azurite stack, stop it first to avoid port conflicts.
+
+services:
+  rabbitmq:
+    # RabbitMQ 4.1 (LTS) — matches the SDK's local-dev stack.
+    image: rabbitmq:4.1-management-alpine
+    container_name: hello-world-rabbitmq
+    ports:
+      - "127.0.0.1:5672:5672"    # AMQP protocol
+      - "127.0.0.1:15672:15672"  # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hello-world-net
+
+  azurite:
+    # Pinned tag — keeps the local-dev image reproducible across machines.
+    image: mcr.microsoft.com/azure-storage/azurite:3.34.0
+    container_name: hello-world-azurite
+    ports:
+      - "127.0.0.1:10000:10000"  # Blob service (queue/table not mapped)
+    # --skipApiVersionCheck lets newer azure-storage-blob SDKs negotiate
+    # API versions this Azurite image doesn't recognize yet.
+    command: azurite --blobHost 0.0.0.0 --skipApiVersionCheck
+    volumes:
+      - azurite_data:/data
+    healthcheck:
+      # TCP-only probe — Azurite returns HTTP 400 to a no-query probe and
+      # may bind IPv4 only, so an HTTP healthcheck false-negatives.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 10000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hello-world-net
+
+volumes:
+  rabbitmq_data:
+    name: hello-world-rabbitmq-data
+  azurite_data:
+    name: hello-world-azurite-data
+
+networks:
+  hello-world-net:
+    name: hello-world-net
+    driver: bridge

@@ -1,0 +1,5 @@
+# The LEDSAS SDK (pulls in its own dependencies: pydantic, aio-pika,
+# azure-storage-blob, aiohttp, cryptography).
+kbm-ledsas-sdk>=0.3.2
+
+# Add your service's own pinned dependencies below.

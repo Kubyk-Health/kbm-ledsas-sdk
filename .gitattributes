@@ -1,0 +1,16 @@
+# Normalize line endings
+* text=auto eol=lf
+
+*.py    text diff=python
+*.md    text
+*.txt   text
+*.toml  text
+*.yml   text
+*.yaml  text
+
+# Binary assets (no diff, no eol conversion)
+*.png   binary
+*.jpg   binary
+*.gz    binary
+*.whl   binary
+*.dcm   binary
