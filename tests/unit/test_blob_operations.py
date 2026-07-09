@@ -193,19 +193,18 @@ class TestStreamingMemoryBound:
     These tests *do not* exercise SDK code or transport. They iterate a
     standalone async generator and use tracemalloc to verify the
     consume-while-streaming pattern stays bounded. They prove the pattern,
-    not the SDK's implementation of it. Wire-level memory behavior of the
-    SDK's ``download_stream`` / ``upload_stream`` is covered by the live
-    integration tests under ``tests/integration/``.
-
-    TC ID: TC-U-PERF-001, TC-U-PERF-002
+    not the SDK's implementation of it. These unit tests assert the
+    consume-while-streaming pattern's bounded-memory property with a
+    synthetic generator; the SDK's own wire-level streaming is not
+    exercised here.
     """
 
     @pytest.mark.asyncio
     async def test_download_stream_memory_bounded_with_synthetic_generator(self):
         """
-        TC-U-PERF-001: Verify the streaming pattern has bounded memory.
+        Verify the streaming pattern has bounded memory.
 
-        Requirement: NFR-SRS-PERF-001 - Peak memory < 50MB for multi-GB files
+        Property: peak memory stays < 50 MB even for multi-GB files.
         Method: Use tracemalloc to measure peak memory while consuming a
         standalone async generator that mimics the SDK's chunk-yield shape.
         Acceptance: Peak memory delta < 50MB (52,428,800 bytes)
@@ -259,9 +258,9 @@ class TestStreamingMemoryBound:
     @pytest.mark.asyncio
     async def test_upload_stream_memory_bounded_with_synthetic_generator(self):
         """
-        TC-U-PERF-002: Verify the streaming-upload pattern has bounded memory.
+        Verify the streaming-upload pattern has bounded memory.
 
-        Requirement: NFR-SRS-PERF-001 - Memory proportional to chunk size
+        Property: memory stays proportional to chunk size, not total size.
         Method: Use tracemalloc to measure memory while iterating a
         standalone async generator that mimics the SDK's upload chunk shape.
         Acceptance: Peak memory delta < 50MB

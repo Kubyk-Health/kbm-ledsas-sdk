@@ -32,6 +32,8 @@ focused on the data transformation.
 
 ## Installation
 
+Requires **Python 3.11 or newer**.
+
 ```bash
 pip install kbm-ledsas-sdk
 ```

@@ -33,7 +33,7 @@ Configure SDK behavior via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KBM_LEDSAS_SERVICE_NAME` | Required (env or constructor) | Service name for queue binding. Validated `^[A-Za-z0-9][A-Za-z0-9._\-]*$`, 1..64 chars. When set, takes precedence over `ServiceApp(service_name=...)`. At least one of the two must be provided. |
+| `KBM_LEDSAS_SERVICE_NAME` | Constructor arg required; env optional | Service name for queue binding. Validated `^[A-Za-z0-9][A-Za-z0-9._\-]*$`, 1..64 chars. The constructor argument `ServiceApp(service_name=...)` is always required; when this env var is also set it overrides the constructor value. |
 | `KBM_LEDSAS_RABBITMQ_URL` | Required | RabbitMQ connection URL |
 | `KBM_LEDSAS_BLOB_CONN_STRING` | Required | Azure Blob connection string (required even if your handlers never call `ctx.blob` — the blob client initializes at startup) |
 | `KBM_LEDSAS_CONTAINER` | `dev` | Default blob container |
@@ -728,8 +728,9 @@ export KBM_LEDSAS_HANDLER_TIMEOUT=0     # Disable timeout
 When `KBM_LEDSAS_HANDLER_TIMEOUT` > 0:
 
 1. SDK wraps handler execution with `asyncio.wait_for()`.
-2. If handler exceeds timeout, `asyncio.CancelledError` is raised.
-3. SDK catches cancellation and treats it as a timeout error.
+2. If the handler exceeds the timeout, `asyncio.wait_for()` cancels it and
+   raises `asyncio.TimeoutError` (a built-in `TimeoutError` on Python 3.11+).
+3. SDK catches that `TimeoutError` and classifies it as a timeout.
 4. Error response sent to caller with code `Timeout`.
 
 ### Cancellation Safety
@@ -1093,7 +1094,10 @@ For the verbose body (useful during development), set
 ```
 
 In verbose mode, a failing check appears as `"unhealthy: <reason>"` in
-the `checks` map.
+the `checks` map. The example above is illustrative — each endpoint lists
+only its own checks: `/health` (and `/livez`) report `process` plus your
+`@app.liveness_check`s, while `/ready` (and `/readyz`) report `transport`
+plus your `@app.readiness_check`s.
 
 ### Deployment id
 
