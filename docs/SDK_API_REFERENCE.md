@@ -1,6 +1,6 @@
-# LEDSAS SDK API Reference v0.3.2
+# LEDSAS SDK API Reference v0.3.3
 
-Complete reference for all SDK APIs implemented in kbm-ledsas-sdk v0.3.2.
+Complete reference for all SDK APIs implemented in kbm-ledsas-sdk v0.3.3.
 
 > **Note:** The SDK connects directly to RabbitMQ and Azure Blob Storage; you
 > configure it through the connection environment variables documented below.
@@ -121,7 +121,7 @@ The SDK expects incoming messages to follow a specific structure with an
 | `idempotency_key` | string | Yes | Key for idempotent processing |
 | `sent_at` | string | Yes | ISO8601 timestamp when message was sent |
 | `trace_id` | string | Yes | Distributed tracing ID |
-| `reply_to` | string | No | Name of a **pre-declared AMQP exchange** to publish the response to. URL-safe: `^([A-Za-z0-9_\-:.]+)?$`, max 127 chars (matches AMQP's protocol-level cap on exchange-name length and the shape of `trace_id` / `idempotency_key` / `job_id`). SDK publishes with routing key `response` (or `status` for `emit_status`). The SDK does not declare this exchange — the caller owns it. Leave empty for fire-and-forget. See `examples/hello_world_service/scripts/send_hello.py` for a runnable consumer example. |
+| `reply_to` | string | No | Name of a **pre-declared AMQP exchange** to publish the response to. URL-safe: `^([A-Za-z0-9_\-:.]+)?$`, max 127 chars (matches AMQP's protocol-level cap on exchange-name length and the shape of `trace_id` / `idempotency_key` / `job_id`). SDK publishes with routing key `response` (or `status` for `emit_status`). The SDK does not declare this exchange — the caller owns it. **Contract: the exchange must exist AND have at least one queue bound** for the `response` routing key; the SDK publishes replies as mandatory, so a missing exchange *or* an unroutable response (no bound queue) fails the reply and dead-letters the command. Leave empty for fire-and-forget. See `examples/hello_world_service/scripts/send_hello.py` for a runnable consumer example. |
 | `deadline` | string | No | ISO8601 deadline for processing |
 | `priority` | int | No | Message priority (higher = more urgent) |
 | `job_id` | string | No | Business-level job identifier |
@@ -920,7 +920,8 @@ export KBM_LEDSAS_LOG_FORMAT=text     # human-readable / colored
 
 **On expected error cases the SDK now suppresses upstream-library
 traceback noise** (`aio_pika`/`aiormq` `ChannelNotFoundEntity` raised
-by a missing reply_to exchange) — you still get the SDK's own clean
+by a missing reply_to exchange, and the unroutable-return raised when
+the exchange exists but has no bound queue) — you still get the SDK's own clean
 ERROR line and the DLQ counter. Genuine connection / channel errors
 still surface unchanged.
 
@@ -1082,7 +1083,7 @@ For the verbose body (useful during development), set
 {
   "status": "healthy",
   "service": "csv-processor",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "checks": {
     "process": "healthy",
     "transport": "healthy",
@@ -1182,8 +1183,8 @@ if app.health_server_running:
 
 ---
 
-**Version:** 0.3.2
-**Release:** 2026-06-10
+**Version:** 0.3.3
+**Release:** 2026-07-09
 
 ### Version history
 
