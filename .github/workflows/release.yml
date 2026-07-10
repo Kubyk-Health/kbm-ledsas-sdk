@@ -89,7 +89,7 @@ jobs:
           repository-url: https://test.pypi.org/legacy/
 
   attach-release-assets:
-    name: Attach dist to GitHub Release
+    name: Attach dist + SBOM to GitHub Release
     if: github.event_name == 'release'
     needs: publish-pypi
     runs-on: ubuntu-latest
@@ -103,4 +103,32 @@ jobs:
       - name: Upload sdist + wheel to the Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber --repo "${{ github.repository }}"
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" dist/* --clobber --repo "${{ github.repository }}"
+
+      # CycloneDX SBOM: generated AFTER the wheel/sdist are already attached, so
+      # a hypothetical SBOM failure never blocks the core release assets.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Generate CycloneDX SBOM from the built wheel
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          # Resolve the wheel's runtime dependency closure in a clean venv, drop
+          # the venv seed tooling (pip/setuptools/wheel — not SDK deps), then SBOM
+          # it. cyclonedx-py runs from the runner python, kept out of the scanned
+          # environment.
+          python -m venv /tmp/sdkenv
+          /tmp/sdkenv/bin/pip install --quiet dist/*.whl
+          /tmp/sdkenv/bin/pip uninstall --quiet -y pip setuptools wheel || true
+          python -m pip install --quiet cyclonedx-bom
+          cyclonedx-py environment /tmp/sdkenv/bin/python --of JSON --sv 1.6 \
+            -o "kbm_ledsas_sdk-${VERSION}.cdx.json"
+      - name: Upload SBOM to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" "kbm_ledsas_sdk-${TAG#v}.cdx.json" --clobber --repo "${{ github.repository }}"
