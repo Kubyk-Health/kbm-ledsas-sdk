@@ -1,6 +1,6 @@
-# LEDSAS SDK API Reference v0.3.2
+# LEDSAS SDK API Reference v0.3.3
 
-Complete reference for all SDK APIs implemented in kbm-ledsas-sdk v0.3.2.
+Complete reference for all SDK APIs implemented in kbm-ledsas-sdk v0.3.3.
 
 > **Note:** The SDK connects directly to RabbitMQ and Azure Blob Storage; you
 > configure it through the connection environment variables documented below.
@@ -33,7 +33,7 @@ Configure SDK behavior via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KBM_LEDSAS_SERVICE_NAME` | Required (env or constructor) | Service name for queue binding. Validated `^[A-Za-z0-9][A-Za-z0-9._\-]*$`, 1..64 chars. When set, takes precedence over `ServiceApp(service_name=...)`. At least one of the two must be provided. |
+| `KBM_LEDSAS_SERVICE_NAME` | Constructor arg required; env optional | Service name for queue binding. Validated `^[A-Za-z0-9][A-Za-z0-9._\-]*$`, 1..64 chars. The constructor argument `ServiceApp(service_name=...)` is always required; when this env var is also set it overrides the constructor value. |
 | `KBM_LEDSAS_RABBITMQ_URL` | Required | RabbitMQ connection URL |
 | `KBM_LEDSAS_BLOB_CONN_STRING` | Required | Azure Blob connection string (required even if your handlers never call `ctx.blob` — the blob client initializes at startup) |
 | `KBM_LEDSAS_CONTAINER` | `dev` | Default blob container |
@@ -121,7 +121,7 @@ The SDK expects incoming messages to follow a specific structure with an
 | `idempotency_key` | string | Yes | Key for idempotent processing |
 | `sent_at` | string | Yes | ISO8601 timestamp when message was sent |
 | `trace_id` | string | Yes | Distributed tracing ID |
-| `reply_to` | string | No | Name of a **pre-declared AMQP exchange** to publish the response to. URL-safe: `^([A-Za-z0-9_\-:.]+)?$`, max 127 chars (matches AMQP's protocol-level cap on exchange-name length and the shape of `trace_id` / `idempotency_key` / `job_id`). SDK publishes with routing key `response` (or `status` for `emit_status`). The SDK does not declare this exchange — the caller owns it. Leave empty for fire-and-forget. See `examples/hello_world_service/scripts/send_hello.py` for a runnable consumer example. |
+| `reply_to` | string | No | Name of a **pre-declared AMQP exchange** to publish the response to. URL-safe: `^([A-Za-z0-9_\-:.]+)?$`, max 127 chars (matches AMQP's protocol-level cap on exchange-name length and the shape of `trace_id` / `idempotency_key` / `job_id`). SDK publishes with routing key `response` (or `status` for `emit_status`). The SDK does not declare this exchange — the caller owns it. **Contract: the exchange must exist AND have at least one queue bound** for the `response` routing key; the SDK publishes replies as mandatory, so a missing exchange *or* an unroutable response (no bound queue) fails the reply and dead-letters the command. Leave empty for fire-and-forget. See `examples/hello_world_service/scripts/send_hello.py` for a runnable consumer example. |
 | `deadline` | string | No | ISO8601 deadline for processing |
 | `priority` | int | No | Message priority (higher = more urgent) |
 | `job_id` | string | No | Business-level job identifier |
@@ -728,8 +728,9 @@ export KBM_LEDSAS_HANDLER_TIMEOUT=0     # Disable timeout
 When `KBM_LEDSAS_HANDLER_TIMEOUT` > 0:
 
 1. SDK wraps handler execution with `asyncio.wait_for()`.
-2. If handler exceeds timeout, `asyncio.CancelledError` is raised.
-3. SDK catches cancellation and treats it as a timeout error.
+2. If the handler exceeds the timeout, `asyncio.wait_for()` cancels it and
+   raises `asyncio.TimeoutError` (a built-in `TimeoutError` on Python 3.11+).
+3. SDK catches that `TimeoutError` and classifies it as a timeout.
 4. Error response sent to caller with code `Timeout`.
 
 ### Cancellation Safety
@@ -920,7 +921,8 @@ export KBM_LEDSAS_LOG_FORMAT=text     # human-readable / colored
 
 **On expected error cases the SDK now suppresses upstream-library
 traceback noise** (`aio_pika`/`aiormq` `ChannelNotFoundEntity` raised
-by a missing reply_to exchange) — you still get the SDK's own clean
+by a missing reply_to exchange, and the unroutable-return raised when
+the exchange exists but has no bound queue) — you still get the SDK's own clean
 ERROR line and the DLQ counter. Genuine connection / channel errors
 still surface unchanged.
 
@@ -1082,7 +1084,7 @@ For the verbose body (useful during development), set
 {
   "status": "healthy",
   "service": "csv-processor",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "checks": {
     "process": "healthy",
     "transport": "healthy",
@@ -1092,7 +1094,10 @@ For the verbose body (useful during development), set
 ```
 
 In verbose mode, a failing check appears as `"unhealthy: <reason>"` in
-the `checks` map.
+the `checks` map. The example above is illustrative — each endpoint lists
+only its own checks: `/health` (and `/livez`) report `process` plus your
+`@app.liveness_check`s, while `/ready` (and `/readyz`) report `transport`
+plus your `@app.readiness_check`s.
 
 ### Deployment id
 
@@ -1182,8 +1187,8 @@ if app.health_server_running:
 
 ---
 
-**Version:** 0.3.2
-**Release:** 2026-06-10
+**Version:** 0.3.3
+**Release:** 2026-07-09
 
 ### Version history
 

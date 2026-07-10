@@ -12,7 +12,7 @@ import aio_pika
 import aiormq.exceptions
 
 from kbm_ledsas_sdk.amqp.consumer import AMQPConsumer
-from kbm_ledsas_sdk.amqp.publisher import AMQPPublisher
+from kbm_ledsas_sdk.amqp.publisher import AMQPPublisher, _is_unroutable_return
 from kbm_ledsas_sdk.amqp.topology import declare_topology
 from kbm_ledsas_sdk.blob.azure_client import AzureBlobClient
 from kbm_ledsas_sdk.blob.direct_operations import DirectBlobOperations
@@ -108,6 +108,14 @@ class DirectTransport(Transport):
         # logging and tests; not currently wired into a metrics backend.
         self.reply_publish_failures: int = 0
         self.status_publish_failures: int = 0
+        # Subset of reply_publish_failures: the reply exchange EXISTS but
+        # the mandatory publish came back unroutable (Basic.Return — no
+        # queue bound for the routing key; see publisher's
+        # _is_unroutable_return). Distinguishes "orchestrator never
+        # declared its reply exchange" from "declared it but the reply
+        # queue is missing/unbound". Statuses stay best-effort with the
+        # single status_publish_failures counter.
+        self.reply_unroutable_failures: int = 0
 
         # Blob components
         self.azure_client = AzureBlobClient(blob_conn_string, default_container)
@@ -313,8 +321,10 @@ class DirectTransport(Transport):
         if not self.publisher:
             raise RuntimeError("Transport not started. Call start() first.")
 
-        # Extract exchange name from reply_to field
-        # reply_to format: "resp.{tenant}.{service}.v1"
+        # Extract exchange name from reply_to field. reply_to is an
+        # arbitrary caller-owned exchange name — the caller declares (and
+        # binds a queue to) whatever exchange it wants replies on; the SDK
+        # does not impose a naming convention here.
         exchange_name = response.envelope.reply_to
 
         # Skip if no reply_to specified
@@ -346,33 +356,59 @@ class DirectTransport(Transport):
             return True
         except Exception as e:
             self.reply_publish_failures += 1
-            # When pamqp rejected the exchange
-            # name on protocol grounds (length > 127), point the
-            # operator at the actual cause rather than at the orchestrator.
-            # The envelope schema now caps reply_to at 127, so reaching
-            # this branch means the value bypassed the SDK validator —
-            # log a more specific hint.
-            if isinstance(e, ValueError) and "Max length exceeded" in str(e):
+            # Point the operator at the actual cause:
+            # - unroutable return (Basic.Return): the exchange exists but
+            #   no queue is bound — bump the distinguishing sub-counter.
+            # - bare DeliveryError (Basic.Nack): the broker refused to
+            #   confirm the publish (e.g. reject-publish overflow policy).
+            # - pamqp 127-byte ValueError: the exchange name itself was
+            #   rejected on protocol grounds. The envelope schema caps
+            #   reply_to at 127, so reaching this branch means the value
+            #   bypassed the SDK validator.
+            # - anything else: exchange missing / channel error.
+            # A DeliveryError's args can embed the returned message, body
+            # bytes included — never format the exception itself into the
+            # log line; use a short static description instead.
+            if isinstance(e, aio_pika.exceptions.DeliveryError):
+                if _is_unroutable_return(e):
+                    self.reply_unroutable_failures += 1
+                    error_text = "message returned unroutable (Basic.Return)"
+                    action_hint = (
+                        "the exchange exists but has no queue bound for "
+                        "routing key 'response' — verify the caller declared "
+                        "AND bound its reply queue (durable, not auto-delete)."
+                    )
+                else:
+                    error_text = "broker did not confirm the publish (Basic.Nack)"
+                    action_hint = (
+                        "the broker rejected the reply publish — check the "
+                        "reply queue's policies (e.g. x-overflow: "
+                        "reject-publish) and broker health."
+                    )
+            elif isinstance(e, ValueError) and "Max length exceeded" in str(e):
+                error_text = str(e)
                 action_hint = (
                     "the exchange name is longer than AMQP's 127-byte "
                     "protocol limit. Use a shorter reply_to."
                 )
             else:
+                error_text = str(e)
                 action_hint = "verify the orchestrator pre-declared this exchange."
             logger.error(
                 "Failed to send response to reply_to exchange '%s': %s "
                 "(failures so far: %d). Command will be NACKed to DLQ; "
                 "%s",
                 exchange_name,
-                e,
+                error_text,
                 self.reply_publish_failures,
                 action_hint,
                 extra={
                     "message_id": response.envelope.message_id,
                     "correlation_id": response.envelope.correlation_id,
                     "exchange": exchange_name,
-                    "error": str(e),
+                    "error": error_text,
                     "reply_publish_failures": self.reply_publish_failures,
+                    "reply_unroutable_failures": self.reply_unroutable_failures,
                 },
             )
             return False
@@ -430,17 +466,28 @@ class DirectTransport(Transport):
             # reply infra is broken" from "orchestrator isn't listening
             # to status updates."
             self.status_publish_failures += 1
+            # A DeliveryError's args can embed the returned message, body
+            # bytes included — never format the exception itself into the
+            # log line; use a short static description instead.
+            if isinstance(e, aio_pika.exceptions.DeliveryError):
+                error_text = (
+                    "message returned unroutable (Basic.Return)"
+                    if _is_unroutable_return(e)
+                    else "broker did not confirm the publish (Basic.Nack)"
+                )
+            else:
+                error_text = str(e)
             logger.warning(
                 "Failed to send status to reply_to exchange '%s': %s "
                 "(status failures so far: %d). Continuing.",
                 exchange_name,
-                e,
+                error_text,
                 self.status_publish_failures,
                 extra={
                     "message_id": status.envelope.message_id,
                     "correlation_id": status.envelope.correlation_id,
                     "exchange": exchange_name,
-                    "error": str(e),
+                    "error": error_text,
                     "status_publish_failures": self.status_publish_failures,
                 },
             )

@@ -161,7 +161,13 @@ async def _publish_and_wait(
         rx = await channel.declare_exchange(
             reply_exchange, aio_pika.ExchangeType.TOPIC, durable=True
         )
-        rq = await channel.declare_queue(reply_queue, durable=False, auto_delete=True)
+        # durable=True + auto_delete=False: an auto_delete reply queue
+        # vanishes the moment its consumer disconnects, unbinding the
+        # exchange — after which every response the SDK publishes is
+        # unroutable and dead-letters the command it answers (the SDK
+        # publishes replies mandatory). This script owns and deletes the
+        # queue explicitly in the finally below.
+        rq = await channel.declare_queue(reply_queue, durable=True, auto_delete=False)
         await rq.bind(rx, routing_key="response")
 
         # Reference the command exchange the service declares (do NOT
@@ -195,7 +201,13 @@ async def _publish_and_wait(
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
             await rq.cancel(consumer_tag)
-            # Cleanup: remove the transient reply exchange we created.
+            # Cleanup: the reply queue is durable + not auto_delete now, so
+            # delete it explicitly (it no longer disappears on disconnect),
+            # then remove the transient reply exchange we created.
+            try:
+                await rq.delete(if_unused=False, if_empty=False)
+            except Exception:
+                pass
             try:
                 await rx.delete(if_unused=True)
             except Exception:

@@ -65,7 +65,7 @@ from .models import errors
 from .runtime.context import ExecutionContext
 from .utils.logging import json_log_formatter
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 __all__ = [
     "ExecutionContext",

@@ -14,10 +14,26 @@ import logging
 
 from aio_pika import DeliveryMode, Message
 from aio_pika.abc import AbstractConnection, AbstractExchange
+from aio_pika.exceptions import DeliveryError, PublishError
 
 from kbm_ledsas_sdk.models.messages import Response, Status
 
 logger = logging.getLogger(__name__)
+
+
+def _is_unroutable_return(e: BaseException) -> bool:
+    """True when the broker RETURNED a mandatory publish (Basic.Return).
+
+    aiormq raises ``PublishError`` (a ``DeliveryError`` subclass) for the
+    returned-unroutable case specifically; a *bare* ``DeliveryError`` means
+    the broker refused to confirm the publish (Basic.Nack — e.g. a queue
+    ``x-overflow: reject-publish`` policy or a broker-side error), which is
+    a different operator condition. This predicate is the single place
+    that distinction lives — the transport layer imports it to pick the
+    right counter and operator hint, so classification cannot drift
+    between the two modules.
+    """
+    return isinstance(e, PublishError)
 
 
 def _classify_publish_error(e: BaseException) -> tuple[bool, str | None]:
@@ -33,6 +49,16 @@ def _classify_publish_error(e: BaseException) -> tuple[bool, str | None]:
 
     - ``ChannelNotFoundEntity`` — the caller's ``reply_to`` exchange does
       not exist on the broker. Normal operator misconfiguration.
+    - ``PublishError`` (DeliveryError subclass) — the exchange exists but
+      the broker returned the mandatory publish (Basic.Return): no queue
+      is bound for the routing key, so the message is unroutable. Normal
+      operator misconfiguration (the caller declared its reply exchange
+      but forgot to declare/bind the reply queue, or the queue was
+      auto-deleted).
+    - bare ``DeliveryError`` — the broker refused to confirm the publish
+      (Basic.Nack; e.g. queue overflow with a reject-publish policy).
+      Distinct condition, same noise treatment: an AMQP-level refusal
+      carries no diagnostic value in a Python traceback.
     - ``ValueError("Max length exceeded for exchange")`` — pamqp's
       protocol-layer check that an exchange name fits in 127 bytes.
       SDKConfig + envelope schema now cap
@@ -46,6 +72,10 @@ def _classify_publish_error(e: BaseException) -> tuple[bool, str | None]:
     name = type(e).__name__
     if name == "ChannelNotFoundEntity":
         return True, "reply_to exchange missing on broker"
+    if isinstance(e, DeliveryError):
+        if _is_unroutable_return(e):
+            return True, "reply_to exchange has no bound queue (message unroutable)"
+        return True, "broker did not confirm the publish (Basic.Nack)"
     if isinstance(e, ValueError) and "Max length exceeded" in str(e):
         return True, "exchange name exceeds AMQP 127-byte protocol limit"
     return False, None
@@ -149,7 +179,12 @@ class AMQPPublisher:
             },
         )
 
-        channel = await self.connection.channel()
+        # on_return_raises=True: aio-pika does NOT raise on a returned
+        # mandatory publish by default — it resolves normally with the
+        # returned message, which would silently swallow an unroutable
+        # response. With this flag a Basic.Return raises PublishError
+        # (a DeliveryError subclass) so the failure chain fires.
+        channel = await self.connection.channel(on_return_raises=True)
         try:
             # Passive declare: only check existence, do NOT redeclare with our
             # own args. This lets the caller (orchestrator) own the exchange's
@@ -158,11 +193,15 @@ class AMQPPublisher:
             # blast-radius if the exchange is missing.
             exchange: AbstractExchange = await channel.get_exchange(exchange_name, ensure=True)
 
-            # Publish with mandatory flag and wait for confirm
+            # Publish mandatory and wait for confirm. If the exchange has
+            # no queue bound for this routing key the broker returns the
+            # message (Basic.Return) and aio-pika raises DeliveryError —
+            # an unroutable response must surface as a failure (the caller
+            # NACKs the command to DLQ) instead of vanishing silently.
             await exchange.publish(
                 message=message,
                 routing_key=routing_key,
-                mandatory=False,  # Don't return message - we may not have a queue bound
+                mandatory=True,
             )
 
             logger.info(
@@ -261,17 +300,22 @@ class AMQPPublisher:
             },
         )
 
-        channel = await self.connection.channel()
+        # on_return_raises=True: see publish_response() — required for a
+        # returned mandatory publish to raise instead of resolving.
+        channel = await self.connection.channel(on_return_raises=True)
         try:
             # Passive declare: only check existence, do NOT redeclare with our
             # own args. See publish_response() for rationale.
             exchange: AbstractExchange = await channel.get_exchange(exchange_name, ensure=True)
 
-            # Publish without mandatory flag - we may not have a queue bound
+            # Publish mandatory so an unroutable status raises DeliveryError
+            # just like responses do (parity across both publish sites).
+            # Statuses remain best-effort: Transport.send_status swallows
+            # the failure with a WARNING and a counter bump.
             await exchange.publish(
                 message=message,
                 routing_key=routing_key,
-                mandatory=False,
+                mandatory=True,
             )
 
             logger.info(

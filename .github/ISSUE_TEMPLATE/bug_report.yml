@@ -29,7 +29,7 @@ body:
     id: sdk-version
     attributes:
       label: SDK version
-      placeholder: "e.g. 0.3.2 (pip show kbm-ledsas-sdk)"
+      placeholder: "e.g. 0.3.3 (pip show kbm-ledsas-sdk)"
     validations:
       required: true
   - type: input

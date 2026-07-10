@@ -381,7 +381,7 @@ class TestConcurrencyControl:
     """Test concurrency limiting via semaphore."""
 
     @pytest.mark.skip(
-        reason="Concurrency testing complex with MockTransport timing - tested in integration tests"
+        reason="Deterministic concurrency-limit timing assertion not yet implemented for MockTransport"
     )
     @pytest.mark.asyncio
     async def test_concurrency_limit_respected(self, app):

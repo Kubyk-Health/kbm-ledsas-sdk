@@ -1,4 +1,4 @@
-LEDSAS SDK v0.3.2 - THIRD-PARTY SOFTWARE NOTICES
+LEDSAS SDK v0.3.3 - THIRD-PARTY SOFTWARE NOTICES
 
 This software includes the following third-party components:
 

@@ -411,6 +411,12 @@ class AMQPConsumer:
         # after the app-level "Max retries (N) exceeded" line.
         prior_count = self.retry_counts.get(message_id, 0)
         if requeue:
+            # Bound the map: a requeued message whose redelivery lands on
+            # ANOTHER replica orphans its slot here forever — evict the
+            # oldest at the cap instead of growing unboundedly. Eviction
+            # only resets that message's local retry budget.
+            if message_id not in self.retry_counts and len(self.retry_counts) >= 10_000:
+                self.retry_counts.pop(next(iter(self.retry_counts)))
             self.retry_counts[message_id] = prior_count + 1
             logged_count = prior_count + 1
         else:

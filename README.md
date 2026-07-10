@@ -32,6 +32,8 @@ focused on the data transformation.
 
 ## Installation
 
+Requires **Python 3.11 or newer**.
+
 ```bash
 pip install kbm-ledsas-sdk
 ```
@@ -141,6 +143,8 @@ The SDK is configured through environment variables. The most common are below; 
 
 - [API Reference](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/docs/SDK_API_REFERENCE.md)
 - [Example service](https://github.com/Kubyk-Health/kbm-ledsas-sdk/tree/main/examples/hello_world_service)
+- [Compatibility & supported versions](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/COMPATIBILITY.md)
+- [Upgrade guide](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/UPGRADING.md)
 - [Changelog](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/CHANGELOG.md)
 
 ## Contributing
