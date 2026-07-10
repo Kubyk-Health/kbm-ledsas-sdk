@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queue to your reply exchange (declare it `durable=True, auto_delete=False`
   — see `examples/hello_world_service/scripts/send_hello.py`), or set
   `reply_to` to `""` for fire-and-forget. Correctly wired reply
-  infrastructure is unaffected.
+  infrastructure is unaffected. See [UPGRADING.md](UPGRADING.md) for the full
+  upgrade guide and [COMPATIBILITY.md](COMPATIBILITY.md) for the support matrix.
 
 ### Added
 
