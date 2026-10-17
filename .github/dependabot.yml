@@ -1,17 +1,37 @@
 version: 2
 updates:
+  # Python dependencies in pyproject.toml (runtime and the dev toolchain), one
+  # grouped pull request per week.
   - package-ecosystem: pip
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     labels:
       - dependencies
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
 
+  # SHA-pinned GitHub Actions, one grouped pull request per week.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    open-pull-requests-limit: 10
     labels:
       - dependencies
       - ci
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # The example service's base image tag (the tag is the SDK version).
+  - package-ecosystem: docker
+    directory: "/examples/hello_world_service"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
