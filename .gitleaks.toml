@@ -13,6 +13,8 @@ regexes = [
   # Microsoft's WELL-KNOWN public Azurite development storage key — documented
   # in every Azure dev example; used here so the example service runs offline.
   '''Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==''',
+  # The same public key split across two string literals (first half).
+  '''Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/''',
   # UUID literal used as an idempotency_key across model tests (matched only
   # because the field name contains "key").
   '''a6f6d1e7-6c8a-4f6b-9c4b-4c2f8dbf1d99''',
