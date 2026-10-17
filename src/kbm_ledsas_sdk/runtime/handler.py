@@ -16,6 +16,10 @@ The registry:
 """
 
 import asyncio
+import collections
+import collections.abc
+import dataclasses
+import enum
 import inspect
 import json
 import logging
@@ -231,24 +235,24 @@ def _normalize_result(value: Any, path: str, active: set[int]) -> Any:
     converts it (see :func:`_json_key`), at every level, so a top-level key
     and a nested key are treated alike. Values are left to the reply
     serializer, except binary data (``bytes``, ``bytearray``,
-    ``memoryview``), which is refused at any level, inside sets too,
-    whatever its content (see :func:`_bytes_problem`). Containers are
-    copied only where a key changes.
+    ``memoryview``), which is refused whatever its content (see
+    :func:`_bytes_problem`).
+
+    Everything the serializer writes as a JSON object or array is walked:
+    dicts, lists, tuples, sets, frozensets, deques, a dataclass's fields
+    (the dataclass becomes the dict of its fields), an ``Enum``'s value, and
+    generators and other iterators, which are read here once into a list
+    (the reply carries that list, so they are never read twice). A pydantic
+    model (or pydantic dataclass) is not walked: it is written with its own
+    serialization settings. Other containers are copied only where
+    something changes.
 
     Raises _ResultProblem for a key with no JSON form, two keys that would
-    become the same JSON key, binary data, or a container that contains
-    itself.
+    become the same JSON key, binary data, a container that contains
+    itself, or an iterator whose reading raises.
     """
     if isinstance(value, _BINARY):
         raise _bytes_problem(value, path)
-    if isinstance(value, (set, frozenset)):
-        # Set items are hashable, so they hold no dict keys to convert;
-        # only binary data (and tuples or frozensets holding some) is
-        # looked for. The index is the item's place in the reply's list.
-        for i, item in enumerate(value):
-            if isinstance(item, _WALKED):
-                _normalize_result(item, f"{path}[{i}]", active)
-        return value
     if isinstance(value, dict):
         if id(value) in active:
             raise _ResultProblem(f"{path}: the dict contains itself")
@@ -262,7 +266,7 @@ def _normalize_result(value: Any, path: str, active: set[int]) -> Any:
                     raise _ResultProblem(
                         f"{path}: two keys become the same JSON key " f"{json.dumps(json_key)}"
                     )
-                if isinstance(item, _WALKED):
+                if type(item) not in _LEAF_TYPES and _walked(item):
                     new_item = _normalize_result(item, f"{path}[{json.dumps(json_key)}]", active)
                 else:
                     new_item = item
@@ -271,17 +275,20 @@ def _normalize_result(value: Any, path: str, active: set[int]) -> Any:
         finally:
             active.discard(id(value))
         return out if changed else value
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, _SEQUENCES):
+        # Lists, tuples, sets, frozensets and deques are written as JSON
+        # arrays in their iteration order; the index is the place in that
+        # array. Set items are hashable, so they hold no dict directly,
+        # but a tuple, a dataclass or a generator among them can.
         if id(value) in active:
             raise _ResultProblem(f"{path}: the list contains itself")
         active.add(id(value))
         try:
-            # Only nested containers can hold a key to convert (and binary
-            # data is refused); other scalars are skipped without a call
+            # Values of a leaf type are skipped with one set lookup
             # (results can hold millions of them).
             items: list | None = None
             for i, item in enumerate(value):
-                if isinstance(item, _WALKED):
+                if type(item) not in _LEAF_TYPES and _walked(item):
                     new_item = _normalize_result(item, f"{path}[{i}]", active)
                     if new_item is not item:
                         if items is None:
@@ -290,15 +297,74 @@ def _normalize_result(value: Any, path: str, active: set[int]) -> Any:
         finally:
             active.discard(id(value))
         return value if items is None else items
+    if hasattr(type(value), "__pydantic_serializer__"):
+        # A pydantic model or pydantic dataclass: its own serializer and
+        # settings (ser_json_bytes, field serializers) write it.
+        return value
+    if isinstance(value, enum.Enum):
+        # Written as its value.
+        inner = value.value
+        if type(inner) in _LEAF_TYPES or not _walked(inner):
+            return value
+        new_inner = _normalize_result(inner, f"{path}.value", active)
+        return value if new_inner is inner else new_inner
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        # Written as a JSON object of its fields, in their order: it is
+        # replaced by that dict (the same JSON), so the later checks of
+        # the reply see inside it.
+        if id(value) in active:
+            raise _ResultProblem(f"{path}: the {type(value).__name__} contains itself")
+        active.add(id(value))
+        try:
+            fields: dict[str, Any] = {}
+            for field in dataclasses.fields(value):
+                try:
+                    item = getattr(value, field.name)
+                except Exception as e:
+                    raise _ResultProblem(
+                        f"{path}: reading its field {json.dumps(field.name)} "
+                        f"raised {type(e).__name__}"
+                    ) from None
+                if type(item) not in _LEAF_TYPES and _walked(item):
+                    new_item = _normalize_result(item, f"{path}[{json.dumps(field.name)}]", active)
+                else:
+                    new_item = item
+                fields[field.name] = new_item
+        finally:
+            active.discard(id(value))
+        return fields
+    if isinstance(value, collections.abc.Iterator):
+        # A generator, map(), zip(), an open file, ...: written as the
+        # list of its items. Read once, here; the reply carries this list.
+        try:
+            items = list(value)
+        except Exception as e:
+            raise _ResultProblem(
+                f"{path}: reading this {type(value).__name__} raised "
+                f"{type(e).__name__}: {_short_text(e)}"
+            ) from None
+        return _normalize_result(items, path, active)
     return value
 
 
 # Binary data, refused in a result whatever its content (_bytes_problem).
 _BINARY = (bytes, bytearray, memoryview)
 
-# The values _normalize_result looks into: containers that can hold a dict
-# key to convert or binary data, and binary data itself.
-_WALKED = (dict, list, tuple, set, frozenset) + _BINARY
+# Containers written as a JSON array.
+_SEQUENCES = (list, tuple, set, frozenset, collections.deque)
+
+# Types whose values hold nothing to walk (no key, no binary data).
+_LEAF_TYPES = frozenset({str, int, float, bool, type(None)})
+
+# The types _normalize_result looks into, besides dataclass instances.
+_WALKED_TYPES = (dict, *_SEQUENCES, *_BINARY, enum.Enum, collections.abc.Iterator)
+
+
+def _walked(value: Any) -> bool:
+    """Whether :func:`_normalize_result` looks into ``value`` (see there)."""
+    return isinstance(value, _WALKED_TYPES) or (
+        dataclasses.is_dataclass(value) and not isinstance(value, type)
+    )
 
 
 # Serializes one value the way a reply payload's values are serialized.
@@ -328,7 +394,22 @@ def _value_problem(value: Any) -> str | None:
         json.dumps(_JSONABLE.dump_python(value, mode="json"))
         return None
     except UnicodeDecodeError:
-        return "bytes that are not UTF-8 text; return text (for example base64) or a blob reference"
+        # Binary data outside a pydantic model is refused before this
+        # point (_normalize_result); a model writes its bytes as UTF-8
+        # text unless it sets ser_json_bytes.
+        return (
+            f"an instance of {_type_name(value)} holding bytes that are not "
+            f"UTF-8 text (a pydantic model writes bytes as UTF-8 text unless "
+            f"it sets ser_json_bytes); base64-encode them, or store them in "
+            f"a blob and return the reference"
+        )
+    except UnicodeEncodeError:
+        # A dict key with a lone surrogate inside an object the SDK does
+        # not walk (a pydantic model).
+        return (
+            f"an instance of {_type_name(value)} holding text with a lone "
+            f"surrogate, which UTF-8 cannot encode"
+        )
     except ValueError as e:
         text = _safe_str(e)
         if "digits" in text:
@@ -1216,7 +1297,12 @@ class HandlerRegistry:
             ) as e:  # ValidationError, PydanticSerializationError, TypeError, ValueError
                 where = None
                 try:
-                    where = _locate_unserializable(payload)
+                    if isinstance(e, UnicodeEncodeError):
+                        # A nested dict key with a lone surrogate: the
+                        # serializer cannot encode it.
+                        where = _find_lone_surrogate(payload, "payload")
+                    if where is None:
+                        where = _locate_unserializable(payload)
                 except Exception:  # pragma: no cover - never fail the reply
                     where = None
                 if where is None:
@@ -1233,12 +1319,17 @@ class HandlerRegistry:
                 # Text with a lone surrogate (a "\ud800" escape a JSON
                 # request can carry) is written by json.dumps as an escape
                 # that strict JSON readers refuse (.NET throws when the
-                # string is read), and in a dict key the serializer
+                # string is read), and in a top-level key the serializer
                 # silently replaces it with U+FFFD: refused like any other
                 # value with no JSON form. Only a body holding "\ud" (an
-                # escaped surrogate) or "\ufffd" can come from one.
+                # escaped surrogate) or "\ufffd" can come from one. The
+                # keys are looked for in the result as returned; the
+                # values in the JSON form just built, which also holds
+                # what the walk does not look into (set items, a pydantic
+                # model's fields).
                 where = (
                     _find_lone_surrogate(payload, "payload")
+                    or _find_lone_surrogate(dumped["payload"], "payload")
                     if "\\ud" in body or "\\ufffd" in body
                     else None
                 )
