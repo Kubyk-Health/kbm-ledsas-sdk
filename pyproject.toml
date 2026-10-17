@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+# Build backend pinned exactly (not a floor): the release workflow builds in an
+# isolated environment from this list, and an unpinned setuptools changes the
+# wheel (its dist-info/WHEEL "Generator:" line) whenever setuptools releases.
+# Pinned, the wheel published to PyPI has the same content as the one built and
+# reviewed before the release. Bump deliberately.
+requires = ["setuptools==84.0.0", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
