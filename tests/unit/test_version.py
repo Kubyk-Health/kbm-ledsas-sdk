@@ -17,9 +17,7 @@ import pytest
 import kbm_ledsas_sdk
 
 ROOT = Path(__file__).resolve().parents[2]
-VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
-    "version"
-]
+VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 
 
 def _read(rel: str) -> str:
@@ -50,7 +48,9 @@ def test_api_reference_names_the_version():
 
 def test_changelog_has_an_entry_and_a_compare_link():
     text = _read("CHANGELOG.md")
-    assert re.search(rf"^## \[{re.escape(VERSION)}\] - [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$", text, re.M)
+    assert re.search(
+        rf"^## \[{re.escape(VERSION)}\] - [0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$", text, re.M
+    )
     assert re.search(
         rf"^\[Unreleased\]: https://github\.com/Kubyk-Health/kbm-ledsas-sdk/compare/"
         rf"v{re.escape(VERSION)}\.\.\.HEAD$",
@@ -69,9 +69,7 @@ def test_upgrading_has_a_section_for_the_current_release():
 
 
 def test_third_party_notices_header():
-    assert _read("THIRD_PARTY_NOTICES.txt").splitlines()[0].startswith(
-        f"LEDSAS SDK v{VERSION} - "
-    )
+    assert _read("THIRD_PARTY_NOTICES.txt").splitlines()[0].startswith(f"LEDSAS SDK v{VERSION} - ")
 
 
 def test_bug_report_placeholder():

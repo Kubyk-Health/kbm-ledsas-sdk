@@ -10,6 +10,7 @@ These serve as the AUTOMATED VERIFICATION that documentation and code
 stay in sync.
 """
 
+import logging
 import os
 from unittest.mock import patch
 
@@ -21,7 +22,7 @@ from kbm_ledsas_sdk.runtime.env_vars import (
     get_env_var,
 )
 
-# Azurite-style connection string used for config construction.
+# Azurite-style connection string.
 _BLOB_CONN = (
     "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;"
     "AccountKey=xxx;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1"
@@ -103,14 +104,45 @@ class TestDocumentedDefaultsMatchCode:
         assert config.blob_container == "dev"
 
 
-class TestConfigModelFields:
-    """SDKConfig carries only the documented configuration fields."""
+class TestRetiredModeVars:
+    """The retired mode settings are accepted but ignored,
+    with a one-time warning, and absent from the SDKConfig model."""
 
     def test_config_has_no_mode_fields(self):
-        """SDKConfig does not carry any transport-selection field."""
+        """SDKConfig no longer carries mode / dev_mode fields."""
         fields = set(SDKConfig.model_fields.keys())
         assert "mode" not in fields
         assert "dev_mode" not in fields
+
+    def test_retired_var_warns_once(self, caplog):
+        """A single warning lists the retired vars; a second from_env is silent."""
+        env = {
+            "KBM_LEDSAS_MODE": "direct",
+            "KBM_LEDSAS_DEV": "1",
+            "KBM_LEDSAS_RABBITMQ_URL": "amqp://guest:guest@127.0.0.1:5672/",
+            "KBM_LEDSAS_BLOB_CONN_STRING": _BLOB_CONN,
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with caplog.at_level(logging.WARNING):
+                SDKConfig.from_env("svc")
+                SDKConfig.from_env("svc")  # second call: once-per-process guard
+        warnings = [r for r in caplog.records if "no longer used" in r.getMessage()]
+        assert len(warnings) == 1
+        # The single warning names whichever retired vars were present.
+        assert "KBM_LEDSAS_MODE" in warnings[0].getMessage()
+        assert "KBM_LEDSAS_DEV" in warnings[0].getMessage()
+
+    def test_no_retired_var_no_warning(self, caplog):
+        """No retired var set -> no deprecation warning."""
+        env = {
+            "KBM_LEDSAS_RABBITMQ_URL": "amqp://guest:guest@127.0.0.1:5672/",
+            "KBM_LEDSAS_BLOB_CONN_STRING": _BLOB_CONN,
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with caplog.at_level(logging.WARNING):
+                SDKConfig.from_env("svc")
+        warnings = [r for r in caplog.records if "no longer used" in r.getMessage()]
+        assert warnings == []
 
 
 class TestNoUnimplementedVariables:
@@ -129,9 +161,8 @@ class TestCustomerJourneyScenario:
     """Simulate the exact scenario a customer follows from documentation."""
 
     def test_customer_setup_reads_credentials(self):
-        """Customer following the README setup should connect.
-
-        from_env reads the connection credentials into the config.
+        """A customer following the README quickstart connects: from_env
+        reads the connection credentials into the config.
         """
         env = {
             "KBM_LEDSAS_RABBITMQ_URL": "amqp://guest:guest@127.0.0.1:5672/",
@@ -148,14 +179,13 @@ class TestRegistryValidValues:
 
     def test_log_level_valid_values(self):
         spec = get_env_var("KBM_LEDSAS_LOG_LEVEL")
-        assert set(spec.valid_values) == {
-            "DEBUG",
-            "INFO",
-            "WARNING",
-            "ERROR",
-            "CRITICAL",
-        }
+        assert set(spec.valid_values) == {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
     def test_log_format_valid_values(self):
         spec = get_env_var("KBM_LEDSAS_LOG_FORMAT")
         assert set(spec.valid_values) == {"json", "text"}
+
+    def test_mode_and_dev_not_in_registry(self):
+        """The retired mode settings are absent from the registry."""
+        assert get_env_var("KBM_LEDSAS_MODE") is None
+        assert get_env_var("KBM_LEDSAS_DEV") is None

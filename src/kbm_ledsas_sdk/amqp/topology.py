@@ -1,13 +1,14 @@
 """
 AMQP topology declaration for RabbitMQ exchanges and queues.
 
-Declares the messaging infrastructure for Direct transport mode.
+Declares the RabbitMQ exchanges and queues a service consumes from.
 """
 
 import logging
 
 from aio_pika import ExchangeType
 from aio_pika.abc import AbstractChannel, AbstractQueue
+from aio_pika.exceptions import AMQPError
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,7 @@ async def declare_topology(
         #
         # NOTE on upgrade: queues declared by an older SDK without these
         # arguments will fail to re-declare with PRECONDITION_FAILED.
-        # Operators upgrading from an earlier version must delete the
+        # Operators upgrading from < v0.1.8-recut1 must delete the
         # existing DLQ (`dlq.queue.{tenant}.{service}.v1`) once before
         # restarting; the SDK will re-create it with the new arguments.
         # Customers who want different limits can pre-declare the DLQ
@@ -253,10 +254,16 @@ async def declare_topology(
                 e,
                 extra={"error": str(e)},
             )
-        else:
-            logger.error(
-                "Failed to declare AMQP topology",
-                exc_info=True,
+        elif isinstance(e, AMQPError):
+            # The broker refused a declaration (an existing queue with
+            # other arguments, missing permissions, ...). The transport
+            # reports it as one ERROR line with the broker's reason and the
+            # remedy; a traceback here would only repeat it.
+            logger.debug(
+                "Broker refused the AMQP topology declaration: %s",
+                e,
                 extra={"error": str(e)},
             )
+        else:
+            logger.error("Failed to declare AMQP topology", exc_info=True, extra={"error": str(e)})
         raise

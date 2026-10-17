@@ -6,11 +6,16 @@ settings from ``KBM_LEDSAS_*`` environment variables. See
 :meth:`SDKConfig.from_env` for the full variable list.
 """
 
+import ipaddress
+import logging
 import os
+import re
+from typing import Any
 
 from pydantic import (
     BaseModel,
     Field,
+    ValidationError,
     field_serializer,
     field_validator,
     model_validator,
@@ -18,9 +23,54 @@ from pydantic import (
 
 from kbm_ledsas_sdk.runtime.security import (
     _is_truthy,
+    _read_env,
+    _strip_surrounding_quotes,  # noqa: F401
     check_topology_name_budget,
     check_transport_security,
+    parse_bool_env,
 )
+
+_logger = logging.getLogger(__name__)
+
+# Retired env vars (since v0.3.0 they no longer configure anything). They
+# are accepted but ignored; from_env warns once if any is present.
+_LEGACY_MODE_VARS = ("KBM_LEDSAS_MODE", "KBM_LEDSAS_DEV")
+_legacy_mode_warned = False
+
+
+def _warn_legacy_mode_vars_once() -> None:
+    """Warn once per process if any retired env var is set.
+
+    Since v0.3.0 these variables no longer configure anything, so they are
+    accepted but ignored — nothing breaks for existing deployments. A
+    single warning lists whichever are present so operators can drop them.
+    """
+    global _legacy_mode_warned
+    if _legacy_mode_warned:
+        return
+    present = [v for v in _LEGACY_MODE_VARS if os.getenv(v) not in (None, "")]
+    if present:
+        _legacy_mode_warned = True
+        _logger.warning(
+            "%s no longer used (since v0.3.0): this package always runs "
+            "its built-in transport. Remove the variable(s) from your "
+            "environment.",
+            " / ".join(present),
+        )
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    """Read a ``KBM_LEDSAS_*`` variable the same way however it was set.
+
+    Surrounding whitespace (a trailing carriage return from a Windows
+    ``.env`` file, a newline from a secret file) and ONE matched pair of
+    surrounding quotes are removed. ``docker run --env-file`` passes quotes
+    through verbatim, while the shell ``set -a; . ./.env`` path removes
+    them, so ``KBM_LEDSAS_LOG_LEVEL="INFO"`` gives ``INFO`` either way.
+    Returns ``default`` when the variable is unset. (Shared with the other
+    readers of ``KBM_LEDSAS_*`` variables: ``security._read_env``.)
+    """
+    return _read_env(name, default)
 
 
 def _int_env(name: str, default: str) -> int:
@@ -32,54 +82,149 @@ def _int_env(name: str, default: str) -> int:
     helper names the offending variable in the error so the startup
     message points at the actual knob.
     """
-    raw = os.getenv(name, default)
+    raw = _env(name, default)
     try:
         return int(raw)
     except ValueError:
-        raise ValueError(f"{name}={raw!r} is not a valid integer") from None
+        raise ValueError(f"{name}={os.getenv(name, default)!r} is not a valid integer") from None
 
 
 def _bool_env(name: str, default: str = "false") -> bool:
-    """Parse a boolean env var with consistent, lenient semantics.
+    """Parse a boolean env var, refusing a value that is not a boolean.
 
-    The SDK previously had two boolean-parsing
-    conventions. Feature flags (GENERIC_ERRORS, HEALTH_VERBOSE) accepted
-    ``true`` only; security flags (ALLOW_INSECURE_AMQP, DEBUG) accepted
-    ``1`` only. A customer setting ``KBM_LEDSAS_ALLOW_INSECURE_AMQP=true``
-    (a reasonable guess from the GENERIC_ERRORS pattern) silently
-    failed closed without any signal that the value wasn't honored.
-
-    Standardize on a single permissive parser: ``1``, ``true``, ``yes``,
-    ``on``, ``t``, ``y`` (case-insensitive, whitespace-stripped) are
-    truthy. Everything else — including the empty string, ``0``,
-    ``false``, ``no``, ``off``, and any unrecognized token — is falsy.
-    Security-sensitive knobs (ALLOW_INSECURE_AMQP, DEBUG) keep their
-    fail-closed semantics: unknown tokens are still treated as off.
+    One parser for every boolean setting (GENERIC_ERRORS, HEALTH_VERBOSE,
+    ALLOW_INSECURE_AMQP, DEBUG): ``1``, ``true``, ``yes``, ``on``, ``t``,
+    ``y`` are true, ``0``, ``false``, ``no``, ``off``, ``f``, ``n`` false
+    (any letter case); unset or empty gives the default. Any other value (a
+    typo such as ``ture``) is a configuration error naming the variable:
+    treating it as false would, for example, leave
+    ``KBM_LEDSAS_GENERIC_ERRORS=ture`` sending detailed error messages to
+    callers, the opposite of what was asked.
     """
-    return _is_truthy(os.getenv(name, default))
+    return parse_bool_env(name, _is_truthy(default))
 
 
-def _strip_surrounding_quotes(value: str | None) -> str | None:
-    """Strip a single matched pair of surrounding quotes from a value.
+# The environment variable behind each SDKConfig field, for configuration
+# error messages.
+_FIELD_ENV_VARS = {
+    "service_name": "KBM_LEDSAS_SERVICE_NAME",
+    "tenant": "KBM_LEDSAS_TENANT",
+    "rabbitmq_url": "KBM_LEDSAS_RABBITMQ_URL",
+    "blob_conn_string": "KBM_LEDSAS_BLOB_CONN_STRING",
+    "blob_container": "KBM_LEDSAS_CONTAINER",
+    "prefetch": "KBM_LEDSAS_PREFETCH",
+    "concurrency": "KBM_LEDSAS_CONCURRENCY",
+    "log_level": "KBM_LEDSAS_LOG_LEVEL",
+    "log_format": "KBM_LEDSAS_LOG_FORMAT",
+    "handler_timeout": "KBM_LEDSAS_HANDLER_TIMEOUT",
+    "max_retries": "KBM_LEDSAS_MAX_RETRIES",
+    "generic_errors": "KBM_LEDSAS_GENERIC_ERRORS",
+    "max_payload_bytes": "KBM_LEDSAS_MAX_PAYLOAD_BYTES",
+    "health_port": "KBM_LEDSAS_HEALTH_PORT",
+    "health_host": "KBM_LEDSAS_HEALTH_HOST",
+    "health_verbose": "KBM_LEDSAS_HEALTH_VERBOSE",
+    "connect_timeout": "KBM_LEDSAS_CONNECT_TIMEOUT",
+}
+# Fields whose value is never repeated in a message.
+_SECRET_FIELDS = frozenset({"rabbitmq_url", "blob_conn_string"})
+_PLAIN_NUMBER = re.compile(r"^-?\d{1,30}$")
 
-    ``docker run --env-file`` (unlike compose's dotenv parser and the
-    shell ``set -a; source .env`` path) performs NO quote stripping, so a
-    ``.env`` line written ``KBM_LEDSAS_RABBITMQ_URL="amqp://..."`` — the
-    quoting the shell-source path requires — reaches the process with the
-    literal double quotes still attached. Left intact, the quoted scheme
-    no longer parses as ``amqp://`` (yarl yields ``scheme=''``), which both
-    breaks the connection with a confusing late error AND silently bypasses
-    the cleartext-AMQP refusal in :func:`check_transport_security`. We
-    normalize by removing one matched pair of surrounding ``"`` or ``'``
-    so both env-delivery styles behave identically. Only a symmetric pair
-    is stripped, so a credential that legitimately contains a quote on one
-    side is left untouched.
+
+def _shown_setting(value: Any) -> str:
+    if not isinstance(value, str):
+        # A value from the code (ServiceApp(service_name=None)) is shown
+        # as written there: None, not the string 'None'.
+        text = repr(value)
+        return text if len(text) <= 80 else text[:77] + "..."
+    if _PLAIN_NUMBER.fullmatch(value):
+        return value
+    return repr(value[:80])
+
+
+# The rule the service_name field applies (pattern and length), for the
+# ServiceApp constructor's own check.
+_SERVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
+SERVICE_NAME_RULE = (
+    "a service name is 1 to 64 characters: letters, digits, '.', '_' and "
+    "'-', starting with a letter or digit"
+)
+
+
+def service_name_problem(value: Any) -> str | None:
+    """Why ``value`` cannot be a service name (the rule of the
+    ``service_name`` setting), or None."""
+    if not isinstance(value, str):
+        return f"the service name must be a string, got {type(value).__name__}"
+    if not 1 <= len(value) <= 64 or not _SERVICE_NAME.fullmatch(value):
+        return SERVICE_NAME_RULE
+    return None
+
+
+def describe_config_errors(error: ValidationError) -> str:
+    """The text of a configuration error, one part per problem, each
+    naming the setting to fix: the ``KBM_LEDSAS_*`` variable and the value
+    it holds (``KBM_LEDSAS_PREFETCH=5000: Input should be less than or
+    equal to 1000``), or ``ServiceApp(service_name=...)`` when the service
+    name came from the code. Connection values are never repeated."""
+    parts = []
+    for err in error.errors():
+        loc = err.get("loc", ())
+        msg = str(err.get("msg", "")).removeprefix("Value error, ")
+        field = str(loc[0]) if loc else ""
+        var = _FIELD_ENV_VARS.get(field)
+        if not field:
+            label = ""
+        elif var is None:
+            label = ".".join(str(p) for p in loc)
+        elif msg.startswith(var):
+            label = ""  # the message already names the variable
+        else:
+            raw = _read_env(var)
+            if raw is None or raw == "":
+                if field == "service_name":
+                    label = f"ServiceApp(service_name={_shown_setting(err.get('input', ''))})"
+                else:
+                    label = var
+            elif field in _SECRET_FIELDS:
+                label = var
+            else:
+                label = f"{var}={_shown_setting(raw)}"
+        if msg:
+            parts.append(f"{label}: {msg}" if label else msg)
+    return "; ".join(parts) if parts else str(error)
+
+
+# One host-name label: letters, digits and hyphens, not starting or ending
+# with a hyphen, 1..63 characters.
+_HOST_LABEL = re.compile(r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$")
+
+
+def _is_ipv6(value: str) -> bool:
+    try:
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv6Address)
+    except ValueError:
+        return False
+
+
+def _is_valid_bind_host(value: str) -> bool:
+    """True for an IPv4/IPv6 address or a syntactically valid host name.
+
+    A dotted all-digits value that is not a valid IPv4 address (for example
+    ``999.1.1.1``) is refused: it was meant as an address. So is an IPv6
+    address in brackets (``[::]``, the URL form): the server cannot bind to
+    it, it needs the plain address (``::``).
     """
-    if value is None:
-        return None
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-        return value[1:-1]
-    return value
+    if not isinstance(value, str) or not value or len(value) > 253:
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9.]+", value):
+        return False
+    labels = value[:-1].split(".") if value.endswith(".") else value.split(".")
+    return all(_HOST_LABEL.fullmatch(label) for label in labels)
 
 
 class SDKConfig(BaseModel):
@@ -165,7 +310,10 @@ class SDKConfig(BaseModel):
     )
     health_host: str = Field(
         "127.0.0.1",
-        description="Bind address for the health server (default: loopback only)",
+        description=(
+            "Bind address for the health server (default: loopback only): "
+            "an IPv4 or IPv6 address, or a host name"
+        ),
     )
     health_verbose: bool = Field(
         False,
@@ -176,6 +324,35 @@ class SDKConfig(BaseModel):
             '{"status":"healthy"|"unhealthy"} response only.'
         ),
     )
+
+    connect_timeout: int = Field(
+        15,
+        ge=1,
+        le=300,
+        description=(
+            "Seconds one connection attempt to the message broker may take " "(1..300, default 15)"
+        ),
+    )
+
+    @field_validator("health_host")
+    @classmethod
+    def validate_health_host(cls, v: str) -> str:
+        """An IP address or a host name (refused at load, like the other
+        settings, instead of failing to bind later)."""
+        if _is_valid_bind_host(v):
+            return v
+        inner = v[1:-1] if len(v) > 2 and v.startswith("[") and v.endswith("]") else None
+        if inner is not None and _is_ipv6(inner):
+            raise ValueError(
+                f"KBM_LEDSAS_HEALTH_HOST={v[:80]!r}: write an IPv6 address "
+                f"without brackets (:: for all interfaces, ::1 for loopback "
+                f"only)"
+            )
+        raise ValueError(
+            f"KBM_LEDSAS_HEALTH_HOST={v[:80]!r} is not an IP address or a "
+            f"host name (use 127.0.0.1 for loopback only, 0.0.0.0 for all "
+            f"interfaces)"
+        )
 
     @field_validator("log_level")
     @classmethod
@@ -220,9 +397,9 @@ class SDKConfig(BaseModel):
         # complaining about topology length on an uninitialized config).
         if self.service_name:
             check_topology_name_budget(self.service_name, self.tenant)
-        # Cleartext-AMQP check at config-load. Only fires when a URL
-        # is set; a None url is handled later by the factory's "SDK is
-        # not configured" path.
+        # Broker URL checks at config-load. Only fire when a URL is set; a
+        # None url is handled later by the factory's "SDK is not
+        # configured" path.
         if self.rabbitmq_url:
             check_transport_security(self.rabbitmq_url)
         return self
@@ -234,7 +411,8 @@ class SDKConfig(BaseModel):
 
         Args:
             service_name: Service name. ``KBM_LEDSAS_SERVICE_NAME`` env var
-                takes precedence over this argument when set.
+                takes precedence over this argument when set and not empty
+                (an empty or blank value is read as unset).
             tenant: Tenant name. ``KBM_LEDSAS_TENANT`` env var takes
                 precedence over this argument when set.
 
@@ -244,12 +422,12 @@ class SDKConfig(BaseModel):
             KBM_LEDSAS_RABBITMQ_URL: RabbitMQ connection URL (required)
             KBM_LEDSAS_BLOB_CONN_STRING: Azure Blob connection string (required)
             KBM_LEDSAS_CONTAINER: Default blob container (default: ``dev``)
-            KBM_LEDSAS_PREFETCH: Message prefetch count (default: 10)
-            KBM_LEDSAS_CONCURRENCY: Max concurrent handlers (default: 4)
+            KBM_LEDSAS_PREFETCH: Message prefetch count (default: 10; 1 to 1000)
+            KBM_LEDSAS_CONCURRENCY: Max concurrent handlers (default: 4; 1 to 100)
             KBM_LEDSAS_LOG_LEVEL: Log level (default: INFO)
             KBM_LEDSAS_LOG_FORMAT: Log format — json or text (default: json)
-            KBM_LEDSAS_HANDLER_TIMEOUT: Handler timeout in seconds, 0 to disable (default: 1800)
-            KBM_LEDSAS_MAX_RETRIES: Max retry attempts (default: 3)
+            KBM_LEDSAS_HANDLER_TIMEOUT: Handler timeout in seconds, 0 to disable (default: 1800; at most 86400)
+            KBM_LEDSAS_MAX_RETRIES: Max retry attempts (default: 3; 0 to 100)
             KBM_LEDSAS_GENERIC_ERRORS: Generic-error fallback (default: false)
             KBM_LEDSAS_HEALTH_PORT: HTTP port for /health and /ready (default: 8090; 0 disables)
             KBM_LEDSAS_HEALTH_HOST: Bind address for the health server (default: 127.0.0.1)
@@ -267,42 +445,63 @@ class SDKConfig(BaseModel):
             KBM_LEDSAS_DEBUG: If truthy, dump the full Python traceback
                 on configuration-error startup failures (default ``0``
                 shows just the actionable one-liner).
+            KBM_LEDSAS_CONNECT_TIMEOUT: Seconds one connection attempt to
+                the message broker may take (default 15, 1..300).
+
+        Every value is read the same way, however it was set: surrounding
+        whitespace and one matched pair of surrounding quotes are removed
+        (``docker run --env-file`` keeps quotes that a shell ``source``
+        removes).
 
         Boolean variables (GENERIC_ERRORS, HEALTH_VERBOSE,
         ALLOW_INSECURE_AMQP, DEBUG) accept ``1``, ``true``, ``yes``,
-        ``on``, ``t``, ``y`` (case-insensitive). Everything else —
-        including ``0``, ``false``, ``no``, ``off``, and the empty
-        string — is falsy. Security-sensitive flags (ALLOW_INSECURE_AMQP,
-        DEBUG) fail closed on unrecognized tokens.
+        ``on``, ``t``, ``y`` (true) and ``0``, ``false``, ``no``, ``off``,
+        ``f``, ``n`` (false), in any letter case; unset or empty is false.
+        Any other value is a configuration error naming the variable.
+
+        A value outside its range is a configuration error too; the
+        message names the variable and the value it holds (for example
+        ``KBM_LEDSAS_PREFETCH=5000: Input should be less than or equal to
+        1000``; see :func:`describe_config_errors`).
 
         Example:
             export KBM_LEDSAS_RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672/
             export KBM_LEDSAS_BLOB_CONN_STRING="..."
             config = SDKConfig.from_env("my_service")
         """
-        tenant_value = os.getenv("KBM_LEDSAS_TENANT", tenant or "")
+        tenant_value = _env("KBM_LEDSAS_TENANT", tenant or "")
         tenant_final = tenant_value if tenant_value else None
 
-        # Read RABBITMQ_URL and BLOB_CONN_STRING into the in-memory config;
-        # the SDK always needs them to reach RabbitMQ and Azure Blob.
-        # Surrounding quotes are stripped so the
+        # Retired env flags (v0.3.0): warn once if any leftover flag is
+        # set, then ignore it — nothing breaks for existing deployments.
+        _warn_legacy_mode_vars_once()
+
+        # KBM_LEDSAS_DEBUG is read when a startup error is reported; an
+        # unrecognized value is refused here, like every other setting.
+        parse_bool_env("KBM_LEDSAS_DEBUG")
+
+        # Connection settings. Surrounding quotes are stripped so the
         # ``docker run --env-file`` path (which does no quote stripping) and
         # the shell ``source .env`` path (which requires quotes around the
         # URL) both yield the same parsed value — and so the cleartext-AMQP
         # guard in the model validator can't be bypassed by a quoted scheme.
-        rabbitmq_url = _strip_surrounding_quotes(os.getenv("KBM_LEDSAS_RABBITMQ_URL"))
-        blob_conn_string = _strip_surrounding_quotes(os.getenv("KBM_LEDSAS_BLOB_CONN_STRING"))
+        rabbitmq_url = _env("KBM_LEDSAS_RABBITMQ_URL")
+        blob_conn_string = _env("KBM_LEDSAS_BLOB_CONN_STRING")
 
         return cls(
-            service_name=os.getenv("KBM_LEDSAS_SERVICE_NAME", service_name),
+            # An empty or blank KBM_LEDSAS_SERVICE_NAME (a placeholder line
+            # in a .env file, `docker run -e KBM_LEDSAS_SERVICE_NAME=`) is
+            # read as unset, like an empty KBM_LEDSAS_TENANT: the
+            # constructor's name applies.
+            service_name=_env("KBM_LEDSAS_SERVICE_NAME") or service_name,
             tenant=tenant_final,
             rabbitmq_url=rabbitmq_url,
             blob_conn_string=blob_conn_string,
-            blob_container=os.getenv("KBM_LEDSAS_CONTAINER", "dev"),
+            blob_container=_env("KBM_LEDSAS_CONTAINER", "dev"),
             prefetch=_int_env("KBM_LEDSAS_PREFETCH", "10"),
             concurrency=_int_env("KBM_LEDSAS_CONCURRENCY", "4"),
-            log_level=os.getenv("KBM_LEDSAS_LOG_LEVEL", "INFO"),
-            log_format=os.getenv("KBM_LEDSAS_LOG_FORMAT", "json"),
+            log_level=_env("KBM_LEDSAS_LOG_LEVEL", "INFO"),
+            log_format=_env("KBM_LEDSAS_LOG_FORMAT", "json"),
             handler_timeout=_int_env("KBM_LEDSAS_HANDLER_TIMEOUT", "1800"),
             max_retries=_int_env("KBM_LEDSAS_MAX_RETRIES", "3"),
             # All four bool knobs use the same
@@ -312,8 +511,9 @@ class SDKConfig(BaseModel):
             generic_errors=_bool_env("KBM_LEDSAS_GENERIC_ERRORS", "false"),
             max_payload_bytes=_int_env("KBM_LEDSAS_MAX_PAYLOAD_BYTES", str(16 * 1024 * 1024)),
             health_port=_int_env("KBM_LEDSAS_HEALTH_PORT", "8090"),
-            health_host=os.getenv("KBM_LEDSAS_HEALTH_HOST", "127.0.0.1"),
+            health_host=_env("KBM_LEDSAS_HEALTH_HOST", "127.0.0.1"),
             health_verbose=_bool_env("KBM_LEDSAS_HEALTH_VERBOSE", "false"),
+            connect_timeout=_int_env("KBM_LEDSAS_CONNECT_TIMEOUT", "15"),
         )
 
     @field_serializer("rabbitmq_url", "blob_conn_string", when_used="always")
@@ -325,6 +525,18 @@ class SDKConfig(BaseModel):
         # Attribute access (config.rabbitmq_url) stays unredacted for the
         # transport builders.
         return None if value is None else "**redacted**"
+
+    def __repr_args__(self) -> Any:
+        """The field list pydantic's display hooks use (``__rich_repr__`` for
+        rich.print and rich tracebacks, ``__pretty__`` for devtools,
+        ``__repr_str__``): the credentials are redacted there too, as in
+        ``repr()`` / ``str()`` / ``model_dump()``. Attribute access
+        (``config.rabbitmq_url``), ``dict(config)``, ``vars(config)`` and
+        pickling return the real values, as for any pydantic model."""
+        for name, value in super().__repr_args__():
+            if name in ("rabbitmq_url", "blob_conn_string") and value is not None:
+                value = "**redacted**"
+            yield name, value
 
     def __repr__(self) -> str:
         """Detailed representation for debugging (hide sensitive data)."""

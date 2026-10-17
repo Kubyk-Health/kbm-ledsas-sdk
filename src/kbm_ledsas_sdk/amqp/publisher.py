@@ -1,24 +1,33 @@
 """
 AMQP publisher for responses and status updates.
 
-Implements reliable publishing with publisher confirms for Direct transport mode.
+Publishes replies and status updates to RabbitMQ with publisher confirms.
 
 Each publish opens a fresh, short-lived AMQP channel so that a channel-level
 error (e.g. publishing to a `reply_to` exchange the caller forgot to declare)
 cannot leave a persistent publisher channel in a half-broken state. The
-underlying RobustConnection is shared across publishes.
+underlying connection is shared across publishes; the short-lived channels
+are plain (not "robust") channels, so a channel the broker closes is never
+reopened by the connection's automatic recovery.
 """
 
 import json
 import logging
+from collections.abc import Awaitable
+from typing import Any, TypeVar
 
+import aio_pika
 from aio_pika import DeliveryMode, Message
-from aio_pika.abc import AbstractConnection, AbstractExchange
+from aio_pika.abc import AbstractConnection, AbstractExchange, AbstractRobustConnection
 from aio_pika.exceptions import DeliveryError, PublishError
 
+from kbm_ledsas_sdk.amqp.consumer import BrokerShutdownGuard, is_broker_unreachable
+from kbm_ledsas_sdk.models.envelope import Envelope  # noqa: F401
 from kbm_ledsas_sdk.models.messages import Response, Status
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 def _is_unroutable_return(e: BaseException) -> bool:
@@ -49,6 +58,10 @@ def _classify_publish_error(e: BaseException) -> tuple[bool, str | None]:
 
     - ``ChannelNotFoundEntity`` — the caller's ``reply_to`` exchange does
       not exist on the broker. Normal operator misconfiguration.
+    - ``ChannelAccessRefused`` / ``ChannelPreconditionFailed`` — the broker
+      refused the publish and closed the channel: no write permission on
+      the exchange (or an internal exchange), or a message larger than the
+      broker's ``max_message_size``. A broker decision, not an SDK fault.
     - ``PublishError`` (DeliveryError subclass) — the exchange exists but
       the broker returned the mandatory publish (Basic.Return): no queue
       is bound for the routing key, so the message is unroutable. Normal
@@ -72,9 +85,20 @@ def _classify_publish_error(e: BaseException) -> tuple[bool, str | None]:
     name = type(e).__name__
     if name == "ChannelNotFoundEntity":
         return True, "reply_to exchange missing on broker"
+    if name == "ChannelAccessRefused":
+        return True, (
+            "broker refused the publish (ACCESS_REFUSED: no write permission "
+            "on the exchange, or it is an internal exchange)"
+        )
+    if name == "ChannelPreconditionFailed":
+        if "message size" in str(e):
+            return True, (
+                "broker refused the publish: the message is larger than its " "max_message_size"
+            )
+        return True, "broker refused the publish (PRECONDITION_FAILED)"
     if isinstance(e, DeliveryError):
         if _is_unroutable_return(e):
-            return True, "reply_to exchange has no bound queue (message unroutable)"
+            return True, ("reply_to exchange has no bound queue (message unroutable)")
         return True, "broker did not confirm the publish (Basic.Nack)"
     if isinstance(e, ValueError) and "Max length exceeded" in str(e):
         return True, "exchange name exceeds AMQP 127-byte protocol limit"
@@ -85,8 +109,8 @@ class AMQPPublisher:
     """
     Publishes responses and status updates to RabbitMQ.
 
-    This publisher is used in Direct transport mode (dev/testing).
-    It provides reliable message delivery using publisher confirms.
+    Publishes the replies and status updates of the commands this service
+    handles, with publisher confirms.
 
     Features:
     - Publisher confirms for guaranteed delivery
@@ -94,24 +118,90 @@ class AMQPPublisher:
     - Persistent messages (survive broker restart)
     - Routes to exchange specified in reply_to field
     - Fresh channel per publish, so a publish failure cannot poison a
-      persistent channel's state for subsequent publishes.
+      persistent channel's state for subsequent publishes. The channel is a
+      plain channel: when the broker closes it (missing exchange, refused
+      publish) nothing reopens it, so a refused publish leaves no channel
+      behind and nothing to redeclare after a reconnect.
 
     Attributes:
         connection: AMQP connection (shared); a transient channel is opened
             for each publish.
     """
 
-    def __init__(self, connection: AbstractConnection):
+    def __init__(
+        self,
+        connection: AbstractConnection,
+        shutdown_guard: BrokerShutdownGuard | None = None,
+    ):
         """
         Initialize publisher.
 
         Args:
             connection: AMQP connection. Each publish opens a transient
                 channel on this connection and closes it afterwards.
+            shutdown_guard: Optional guard shared with the transport. Once
+                the transport begins shutting down, every broker round trip
+                of a publish (channel open, exchange check, publish +
+                confirm, channel close) is bounded by it, so a broker that
+                stops answering cannot hold a command's reply, and with it
+                the shutdown, indefinitely. Without a guard, round trips are
+                awaited as before.
         """
         self.connection = connection
+        self._shutdown_guard = shutdown_guard
         self._confirms_enabled = False
         logger.info("AMQP publisher initialized")
+
+    async def _round_trip(self, awaitable: Awaitable[T]) -> T:
+        """Await one broker round trip, bounded by the guard if present."""
+        if self._shutdown_guard is None:
+            return await awaitable
+        return await self._shutdown_guard.round_trip(awaitable)
+
+    def _unreachable_at_shutdown(self, error: BaseException) -> bool:
+        """True when ``error`` means the broker could not be reached after
+        the transport began shutting down: the transport reports that
+        condition once, so this layer logs it at DEBUG only."""
+        guard = self._shutdown_guard
+        return guard is not None and guard.stopping and is_broker_unreachable(error)
+
+    def _skip_channel_close(self) -> bool:
+        """During shutdown with the broker known unreachable, the channel
+        is not closed here: closing the connection releases it locally."""
+        guard = self._shutdown_guard
+        return guard is not None and guard.fail_fast
+
+    async def _open_transient_channel(self) -> Any:
+        """Open the short-lived channel for one publish.
+
+        On a robust connection (the transport's) the channel is opened as a
+        plain ``aio_pika.Channel``, NOT through ``connection.channel()``:
+        that would return a robust channel, registered with the connection
+        for automatic recovery. When the broker then closed it (a missing
+        reply exchange, ACCESS_REFUSED, an oversized message), the robust
+        channel reopened itself and stayed registered: every refused publish
+        left one open channel behind until the connection hit the broker's
+        channel limit, and after a reconnect the connection re-ran the
+        channel's remembered passive exchange check, failing the whole
+        reconnect once that exchange was gone. A plain channel is never
+        recovered.
+
+        ``on_return_raises=True``: aio-pika does NOT raise on a returned
+        mandatory publish by default; it resolves normally with the
+        returned message, which would silently swallow an unroutable
+        response. With this flag a Basic.Return raises PublishError (a
+        DeliveryError subclass) so the failure chain fires.
+        """
+        connection = self.connection
+        if isinstance(connection, AbstractRobustConnection):
+            channel = aio_pika.Channel(
+                connection,
+                publisher_confirms=True,
+                on_return_raises=True,
+            )
+            await channel
+            return channel
+        return await connection.channel(on_return_raises=True)
 
     async def enable_confirms(self) -> None:
         """
@@ -179,29 +269,35 @@ class AMQPPublisher:
             },
         )
 
-        # on_return_raises=True: aio-pika does NOT raise on a returned
-        # mandatory publish by default — it resolves normally with the
-        # returned message, which would silently swallow an unroutable
-        # response. With this flag a Basic.Return raises PublishError
-        # (a DeliveryError subclass) so the failure chain fires.
-        channel = await self.connection.channel(on_return_raises=True)
+        # During shutdown with the broker known unreachable, fail fast
+        # (BrokerNotReachable) without opening a channel.
+        if self._shutdown_guard is not None:
+            self._shutdown_guard.check()
+
+        # A plain channel opened with on_return_raises=True (see
+        # _open_transient_channel).
+        channel = await self._round_trip(self._open_transient_channel())
         try:
             # Passive declare: only check existence, do NOT redeclare with our
             # own args. This lets the caller (orchestrator) own the exchange's
             # type/durability/etc. and prevents PRECONDITION_FAILED channel
             # closures from arg mismatches. The transient channel is the
             # blast-radius if the exchange is missing.
-            exchange: AbstractExchange = await channel.get_exchange(exchange_name, ensure=True)
+            exchange: AbstractExchange = await self._round_trip(
+                channel.get_exchange(exchange_name, ensure=True)
+            )
 
             # Publish mandatory and wait for confirm. If the exchange has
             # no queue bound for this routing key the broker returns the
             # message (Basic.Return) and aio-pika raises DeliveryError —
             # an unroutable response must surface as a failure (the caller
             # NACKs the command to DLQ) instead of vanishing silently.
-            await exchange.publish(
-                message=message,
-                routing_key=routing_key,
-                mandatory=True,
+            await self._round_trip(
+                exchange.publish(
+                    message=message,
+                    routing_key=routing_key,
+                    mandatory=True,
+                )
             )
 
             logger.info(
@@ -222,7 +318,14 @@ class AMQPPublisher:
             # underlying aio_pika → aiormq → pamqp traceback. Unknown
             # errors still get a full ERROR with exc_info.
             is_expected, reason = _classify_publish_error(e)
-            if is_expected:
+            if self._unreachable_at_shutdown(e):
+                logger.debug(
+                    "publish_response: AMQP broker not reachable during "
+                    "shutdown (%s); reply_to=%r (upper layer reports it)",
+                    type(e).__name__,
+                    exchange_name,
+                )
+            elif is_expected:
                 logger.debug(
                     "publish_response: %s; reply_to=%r " "(upper layer will log + DLQ)",
                     reason,
@@ -241,12 +344,12 @@ class AMQPPublisher:
                 )
             raise
         finally:
-            # Always close the transient channel, even on failure. A failed
-            # channel is closed by the broker; calling close() on it is a
-            # no-op and is safer than leaking a half-closed channel.
+            # Always close the transient channel, even on failure. A channel
+            # the broker closed (missing exchange, refused publish) is
+            # already closed and, being a plain channel, stays closed.
             try:
-                if not channel.is_closed:
-                    await channel.close()
+                if not self._skip_channel_close() and not channel.is_closed:
+                    await self._round_trip(channel.close())
             except Exception:
                 logger.debug("Transient publisher channel close failed (ignored)", exc_info=True)
 
@@ -300,22 +403,31 @@ class AMQPPublisher:
             },
         )
 
-        # on_return_raises=True: see publish_response() — required for a
-        # returned mandatory publish to raise instead of resolving.
-        channel = await self.connection.channel(on_return_raises=True)
+        # See publish_response(): fail fast during shutdown once the broker
+        # is known unreachable.
+        if self._shutdown_guard is not None:
+            self._shutdown_guard.check()
+
+        # A plain channel opened with on_return_raises=True (see
+        # _open_transient_channel).
+        channel = await self._round_trip(self._open_transient_channel())
         try:
             # Passive declare: only check existence, do NOT redeclare with our
             # own args. See publish_response() for rationale.
-            exchange: AbstractExchange = await channel.get_exchange(exchange_name, ensure=True)
+            exchange: AbstractExchange = await self._round_trip(
+                channel.get_exchange(exchange_name, ensure=True)
+            )
 
             # Publish mandatory so an unroutable status raises DeliveryError
             # just like responses do (parity across both publish sites).
             # Statuses remain best-effort: Transport.send_status swallows
             # the failure with a WARNING and a counter bump.
-            await exchange.publish(
-                message=message,
-                routing_key=routing_key,
-                mandatory=True,
+            await self._round_trip(
+                exchange.publish(
+                    message=message,
+                    routing_key=routing_key,
+                    mandatory=True,
+                )
             )
 
             logger.info(
@@ -333,7 +445,14 @@ class AMQPPublisher:
             # Transport.send_status logs the one operator-facing
             # WARNING with counter + context.
             is_expected, reason = _classify_publish_error(e)
-            if is_expected:
+            if self._unreachable_at_shutdown(e):
+                logger.debug(
+                    "publish_status: AMQP broker not reachable during "
+                    "shutdown (%s); reply_to=%r (upper layer reports it)",
+                    type(e).__name__,
+                    exchange_name,
+                )
+            elif is_expected:
                 logger.debug(
                     "publish_status: %s; reply_to=%r "
                     "(upper layer will log; status is best-effort)",
@@ -354,7 +473,7 @@ class AMQPPublisher:
             raise
         finally:
             try:
-                if not channel.is_closed:
-                    await channel.close()
+                if not self._skip_channel_close() and not channel.is_closed:
+                    await self._round_trip(channel.close())
             except Exception:
                 logger.debug("Transient publisher channel close failed (ignored)", exc_info=True)

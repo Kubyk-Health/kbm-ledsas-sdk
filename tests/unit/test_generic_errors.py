@@ -177,7 +177,9 @@ class TestGenericErrorsEnabled:
         # they have distinct retry semantics (Timeout is retryable;
         # DeadlineExceeded is terminal) and the caller-facing strings
         # now reflect that.
-        assert response.payload["error"]["message"] == "Request arrived too close to deadline"
+        # one text for both DeadlineExceeded cases (the
+        # deadline had passed on arrival, or passed while the handler ran).
+        assert response.payload["error"]["message"] == "Processing deadline exceeded"
 
     @pytest.mark.asyncio
     async def test_handler_not_found_shows_generic_message(self):
@@ -286,9 +288,7 @@ class TestUserMessageOverride:
         assert response.payload["error"]["message"] == "Please try again later"
 
     @pytest.mark.asyncio
-    async def test_internal_message_used_when_no_user_message_and_generic_disabled(
-        self,
-    ):
+    async def test_internal_message_used_when_no_user_message_and_generic_disabled(self):
         """Without user_message and generic_errors=False, the caller sees the internal message."""
         registry = HandlerRegistry(generic_errors=False)
 

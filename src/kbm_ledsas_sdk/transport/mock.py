@@ -74,8 +74,10 @@ class MockBlobOperations(BlobOperations):
         # the path-only form, not the versioned URI.
         path_key = f"azblob://{container}/{path}"
         if not overwrite and any(k.startswith(path_key) for k in self.blobs):
-            from azure.core.exceptions import ResourceExistsError
-
+            try:
+                from azure.core.exceptions import ResourceExistsError
+            except ImportError:  # azure-core is not a dependency of every install
+                raise FileExistsError(f"Blob {path_key} already exists") from None
             raise ResourceExistsError(message=f"Blob {path_key} already exists")
         self.blobs[uri] = data
         return BlobRef(uri=uri)

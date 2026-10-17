@@ -34,11 +34,9 @@ class TestSDKConfigDefaults:
         assert config.concurrency == 4
         assert config.log_level == "INFO"
         assert config.log_format == "json"
-        # Error-handling and retry defaults
         assert config.handler_timeout == 1800
         assert config.max_retries == 3
         assert config.generic_errors is False
-        # Health-host default is loopback only.
         assert config.health_host == "127.0.0.1"
 
     def test_config_with_all_fields(self):
@@ -78,7 +76,6 @@ class TestSDKConfigFromEnv:
             assert config.tenant is None
             assert config.log_level == "INFO"
             assert config.log_format == "json"
-            # Error-handling and retry defaults
             assert config.handler_timeout == 1800
             assert config.max_retries == 3
             assert config.generic_errors is False
@@ -105,7 +102,7 @@ class TestSDKConfigFromEnv:
             assert config.tenant is None
 
     def test_from_env_rabbitmq_url(self):
-        """KBM_LEDSAS_RABBITMQ_URL is read into the config."""
+        """KBM_LEDSAS_RABBITMQ_URL is read."""
         with patch.dict(
             os.environ,
             {"KBM_LEDSAS_RABBITMQ_URL": "amqp://localhost:5672"},
@@ -386,7 +383,7 @@ class TestSDKConfigRepr:
         assert "tenant=None" in repr_str
 
     def test_repr_full(self):
-        """Repr with full config surfaces the expected fields."""
+        """Repr with full config — and no retired dev_mode field."""
         config = SDKConfig(
             service_name="my_service",
             tenant="acme",
@@ -397,5 +394,7 @@ class TestSDKConfigRepr:
 
         assert "my_service" in repr_str
         assert "acme" in repr_str
+        # The retired dev_mode field must not leak into the repr.
+        assert "dev_mode" not in repr_str
         assert "concurrency=20" in repr_str
         assert "log_level=DEBUG" in repr_str

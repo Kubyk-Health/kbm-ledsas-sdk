@@ -2,13 +2,14 @@
 KeborMed LEDSAS SDK - Python client for Local External Data Sources Action Service.
 
 The SDK lets you build LEDSAS data-processing services in Python. A
-service registers handler functions, the SDK consumes commands from
-RabbitMQ, runs the handler, and (optionally) publishes the response
-back to the caller.
+service registers handler functions; the SDK
+consumes commands from RabbitMQ, runs the handler, and
+(optionally) publishes the response back to the caller.
 
 Quick Start:
     import logging
     from kbm_ledsas_sdk import ServiceApp, errors
+    from kbm_ledsas_sdk.models import BlobRef
 
     logging.basicConfig(level=logging.INFO)
 
@@ -26,22 +27,26 @@ Quick Start:
             )
 
         text = await ctx.blob.download_text(csv_uri)
-        container = csv_uri.replace("azblob://", "").split("/", 1)[0]
+        # Take the container from BlobRef, never from a hand-split string:
+        # with blob versioning enabled the URI carries a ?versionId= query.
+        container = BlobRef.from_uri(csv_uri).container
         out = await ctx.blob.upload_json(
             container=container,
             obj={"rows": len(text.splitlines()) - 1},
             # idempotency_key (not message_id) so a DLQ replay of the
             # same logical request overwrites the same blob. overwrite=True
             # is required for that pattern — without it, a replay would
-            # fail with BlobAlreadyExists.
+            # fail because the blob already exists.
             path=f"result-{ctx.idempotency_key}.json",
             overwrite=True,
         )
         return {"result_uri": out.uri}
 
     # Optional liveness / readiness hooks. The SDK already exposes
-    # sensible defaults; these layer on top.
-    @app.readiness_check("warmup_done")
+    # sensible defaults; these layer on top. Readiness only decides what
+    # /ready answers; it does not hold back commands, so do warm-up work
+    # (loading a model, ...) before app.run().
+    @app.liveness_check("worker_alive")
     def _():
         return True
 
@@ -56,7 +61,8 @@ Run with:
 The service also exposes liveness/readiness HTTP endpoints at
 ``http://127.0.0.1:${KBM_LEDSAS_HEALTH_PORT:-8090}/health`` and ``/ready``
 (loopback only by default; set ``KBM_LEDSAS_HEALTH_HOST=0.0.0.0`` to
-bind on all interfaces). See ``docs/SDK_API_REFERENCE.md`` for the full API.
+bind on all interfaces). See the release tarball's
+``SDK_API_REFERENCE.md`` for the full API.
 """
 
 from . import models
@@ -65,13 +71,13 @@ from .models import errors
 from .runtime.context import ExecutionContext
 from .utils.logging import json_log_formatter
 
-__version__ = "0.3.3"
+__version__ = "0.3.5"
 
 __all__ = [
-    "ExecutionContext",
     "ServiceApp",
-    "__version__",
+    "ExecutionContext",
+    "models",
     "errors",
     "json_log_formatter",
-    "models",
+    "__version__",
 ]

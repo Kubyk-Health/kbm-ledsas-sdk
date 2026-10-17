@@ -1,0 +1,210 @@
+"""Construct the direct transport (RabbitMQ + Azure Blob Storage).
+
+Imported lazily by :mod:`transport.factory`, so the RabbitMQ and Azure
+client libraries are only loaded when a service starts.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import TYPE_CHECKING
+
+from .base import Transport
+from .direct import DirectTransport
+
+if TYPE_CHECKING:
+    from ..runtime.config import SDKConfig
+
+logger = logging.getLogger(__name__)
+
+
+def warn_unknown_settings() -> None:
+    """One WARNING naming the ``KBM_LEDSAS_*`` environment variables that
+    are not settings of this SDK (a typo such as ``KBM_LEDSAS_PREFECH``
+    would otherwise be ignored without a word while the default applies),
+    each with the closest setting's name. The retired variables are left
+    to their own warning. Values are never logged."""
+    from ..runtime import config as config_module
+    from ..runtime.env_vars import (
+        describe_unknown_settings,
+        get_all_var_names,
+        unknown_settings,
+    )
+
+    known = set(get_all_var_names()) | set(config_module._LEGACY_MODE_VARS)
+    found = unknown_settings(os.environ, known)
+    if found:
+        logger.warning(
+            "Ignoring environment variable(s) that are not settings of " "this SDK: %s",
+            describe_unknown_settings(found),
+            extra={"unknown_variables": [name for name, _close in found]},
+        )
+
+
+# A parsed command body takes up to about this many times its size in
+# memory (measured: about 24x for a body of empty arrays or objects).
+_PARSED_BODY_FACTOR = 25
+# With KBM_LEDSAS_MAX_PAYLOAD_BYTES=0 the SDK sets no limit and a body is
+# bounded only by the broker's max_message_size, which the SDK cannot read:
+# the larger of RabbitMQ's defaults (128 MiB on 3.x; 16 MiB on 4.x) is
+# assumed.
+_BROKER_DEFAULT_MAX_MESSAGE_BYTES = 128 * 1024 * 1024
+# The smallest KBM_LEDSAS_MAX_PAYLOAD_BYTES the WARNING suggests.
+_SMALLEST_SUGGESTED_PAYLOAD_BYTES = 64 * 1024
+# Where the container's memory limit is read: cgroup v2, then cgroup v1.
+_CGROUP_MEMORY_LIMIT_FILES = (
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+)
+# A cgroup v1 limit at or above this means "no limit".
+_NO_LIMIT_BYTES = 1 << 60
+
+
+def container_memory_limit() -> int | None:
+    """The memory limit of the container the process runs in (bytes), read
+    from its cgroup, or None (no limit, or not in a container)."""
+    for path in _CGROUP_MEMORY_LIMIT_FILES:
+        try:
+            with open(path, encoding="ascii") as handle:
+                text = handle.read().strip()
+        except (OSError, ValueError):
+            continue
+        if text == "max":
+            return None
+        try:
+            limit = int(text)
+        except ValueError:
+            continue
+        return limit if 0 < limit < _NO_LIMIT_BYTES else None
+    return None
+
+
+def _mib(value: int) -> str:
+    if value >= 1 << 30:
+        return f"{value / (1 << 30):.1f} GiB"
+    return f"{value / (1 << 20):.0f} MiB"
+
+
+def _suggestion(limit: int, prefetch: int) -> tuple[int, int | None] | None:
+    """Settings that keep the worst case at half of ``limit`` or less: a
+    power-of-two ``KBM_LEDSAS_MAX_PAYLOAD_BYTES`` (at least 64 KiB) and,
+    when even that is too much for ``prefetch`` commands, a lower
+    ``KBM_LEDSAS_PREFETCH`` (else None). None when no such pair exists (a
+    limit below about 3 MiB)."""
+    budget = limit // 2
+    per_command = budget // (prefetch * _PARSED_BODY_FACTOR)
+    payload = max(
+        _SMALLEST_SUGGESTED_PAYLOAD_BYTES,
+        1 << max(0, per_command.bit_length() - 1),
+    )
+    if prefetch * payload * _PARSED_BODY_FACTOR <= budget:
+        return payload, None
+    fitting_prefetch = budget // (payload * _PARSED_BODY_FACTOR)
+    if fitting_prefetch < 1:
+        return None
+    return payload, fitting_prefetch
+
+
+def warn_memory_bound(config: SDKConfig) -> None:
+    """One WARNING when the command bodies this service may hold parsed at
+    once can exceed its container's memory limit.
+
+    Up to ``KBM_LEDSAS_PREFETCH`` commands are received and held parsed at
+    once, and a parsed body takes up to about 25 times its size, so the
+    worst case is ``PREFETCH x MAX_PAYLOAD_BYTES x 25`` (about 4 GiB with
+    the defaults). With ``KBM_LEDSAS_MAX_PAYLOAD_BYTES=0`` (no SDK limit)
+    128 MiB bodies are assumed, RabbitMQ 3.x's default max_message_size
+    (4.x's is 16 MiB). A service killed for memory gets the same messages
+    again after its restart, so this is said once at start, with settings
+    that keep the worst case at half the limit or less. Nothing is logged
+    outside a container with a memory limit."""
+    limit = container_memory_limit()
+    if limit is None:
+        return
+    max_body = config.max_payload_bytes or _BROKER_DEFAULT_MAX_MESSAGE_BYTES
+    worst = config.prefetch * max_body * _PARSED_BODY_FACTOR
+    if worst <= limit:
+        return
+    suggestion = _suggestion(limit, config.prefetch)
+    if suggestion is None:
+        advice = (
+            "Lower KBM_LEDSAS_MAX_PAYLOAD_BYTES and KBM_LEDSAS_PREFETCH to "
+            "what your service needs"
+        )
+    elif suggestion[1] is None:
+        advice = (
+            "Lower KBM_LEDSAS_MAX_PAYLOAD_BYTES to what your commands need "
+            f"(for example {suggestion[0]}, which keeps the worst case at "
+            "half the limit or less) or KBM_LEDSAS_PREFETCH"
+        )
+    else:
+        advice = (
+            "Lower KBM_LEDSAS_MAX_PAYLOAD_BYTES and KBM_LEDSAS_PREFETCH to "
+            "what your service needs (for example "
+            f"KBM_LEDSAS_MAX_PAYLOAD_BYTES={suggestion[0]} with "
+            f"KBM_LEDSAS_PREFETCH={suggestion[1]}, which keeps the worst "
+            "case at half the limit or less)"
+        )
+    if config.max_payload_bytes:
+        size_setting = f"KBM_LEDSAS_MAX_PAYLOAD_BYTES={config.max_payload_bytes}"
+    else:
+        size_setting = (
+            "KBM_LEDSAS_MAX_PAYLOAD_BYTES=0 sets no limit, so the broker's "
+            "max_message_size applies: 128 MiB is assumed, RabbitMQ 3.x's "
+            "default, while 4.x's is 16 MiB"
+        )
+    logger.warning(
+        "Up to KBM_LEDSAS_PREFETCH=%d command bodies of up to %s each "
+        "(%s) are held parsed at once, and a parsed body can take about %d "
+        "times its size: about %s in the worst case, above this container's "
+        "memory limit of %s. A service killed for memory gets the same "
+        "messages again after its restart. %s; send large data in a blob.",
+        config.prefetch,
+        _mib(max_body),
+        size_setting,
+        _PARSED_BODY_FACTOR,
+        _mib(worst),
+        _mib(limit),
+        advice,
+        extra={
+            "prefetch": config.prefetch,
+            "max_payload_bytes": config.max_payload_bytes,
+            "worst_case_bytes": worst,
+            "memory_limit_bytes": limit,
+        },
+    )
+
+
+def build_transport(config: SDKConfig) -> Transport:
+    """Construct DirectTransport, validating required connection env vars
+    (and warning once about ``KBM_LEDSAS_*`` variables that are not
+    settings, see :func:`warn_unknown_settings`, and about command bodies
+    that can exceed the container's memory limit, see
+    :func:`warn_memory_bound`)."""
+    warn_unknown_settings()
+    warn_memory_bound(config)
+    if not config.rabbitmq_url:
+        raise ValueError(
+            "This deployment requires a RabbitMQ connection URL. "
+            "Set KBM_LEDSAS_RABBITMQ_URL (e.g. "
+            "amqp://guest:guest@127.0.0.1:5672/). "
+            "See QUICKSTART_DIRECT_MODE.md section 3.1."
+        )
+    if not config.blob_conn_string:
+        raise ValueError(
+            "This deployment requires an Azure Blob connection string. "
+            "Set KBM_LEDSAS_BLOB_CONN_STRING. "
+            "See QUICKSTART_DIRECT_MODE.md section 3.1."
+        )
+
+    return DirectTransport(
+        rabbitmq_url=config.rabbitmq_url,
+        blob_conn_string=config.blob_conn_string,
+        service_name=config.service_name,
+        tenant=config.tenant,
+        prefetch_count=config.prefetch,
+        default_container=config.blob_container,
+        max_payload_bytes=config.max_payload_bytes,
+        connect_timeout=config.connect_timeout,
+    )

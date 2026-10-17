@@ -21,9 +21,7 @@ EXAMPLE = ROOT / "examples" / "hello_world_service"
 DOCKERFILE = EXAMPLE / "Dockerfile"
 REQUIREMENTS = EXAMPLE / "requirements.txt"
 BASE = "ghcr.io/kebormed/kbm-ledsas-base-direct"
-VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
-    "version"
-]
+VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 SDK_NAME = re.compile(r"kbm[-_.]ledsas[-_.]sdk", re.I)
 
 # The last root step, byte for byte.

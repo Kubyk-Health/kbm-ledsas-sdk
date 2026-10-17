@@ -156,7 +156,8 @@ class TestHandleCommand:
 
     @pytest.mark.asyncio
     async def test_handle_command_retryable_error(self, app, sample_command):
-        """Handle command with retryable error - NACKs with requeue."""
+        """Retryable error with retry budget left: NACK with requeue and NO
+        reply (v0.3.5: a command gets one reply, when it finishes)."""
 
         # Register handler that raises Retryable
         @app.handler("ProcessDataset", "1.0")
@@ -173,11 +174,8 @@ class TestHandleCommand:
         # Handle command
         await app._handle_command(sample_command, semaphore)
 
-        # Error response should be sent
-        assert len(mock_transport.sent_responses) == 1
-        response = mock_transport.sent_responses[0]
-        assert "error" in response.payload
-        assert response.payload["error"]["retryable"] is True
+        # No reply for an attempt that will be retried
+        assert mock_transport.sent_responses == []
 
         # Message should be NACKed with requeue
         assert len(mock_transport.nacked_messages) == 1
@@ -381,7 +379,7 @@ class TestConcurrencyControl:
     """Test concurrency limiting via semaphore."""
 
     @pytest.mark.skip(
-        reason="Deterministic concurrency-limit timing assertion not yet implemented for MockTransport"
+        reason="Concurrency testing complex with MockTransport timing - tested in integration tests"
     )
     @pytest.mark.asyncio
     async def test_concurrency_limit_respected(self, app):

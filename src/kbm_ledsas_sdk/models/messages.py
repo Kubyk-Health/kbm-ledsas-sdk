@@ -44,8 +44,7 @@ class Command(BaseModel):
 
     envelope: Envelope = Field(..., description="Message envelope metadata")
     payload: dict[str, Any] = Field(
-        ...,
-        description="Command-specific payload (deserialized to handler's request model)",
+        ..., description="Command-specific payload (deserialized to handler's request model)"
     )
 
     def __repr__(self) -> str:

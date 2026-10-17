@@ -274,17 +274,35 @@ class TestTimeoutIntegration:
         # Handle command - should timeout
         await app._handle_command(sample_command, semaphore)
 
-        # Error response should indicate timeout
-        assert len(mock_transport.sent_responses) == 1
-        response = mock_transport.sent_responses[0]
-        assert "error" in response.payload
-        assert response.payload["error"]["code"] == "Timeout"
-        assert response.payload["error"]["retryable"] is True
+        # Retry budget left: no reply for this attempt (v0.3.5)
+        assert mock_transport.sent_responses == []
 
         # Should be NACKed with requeue (retryable)
         assert len(mock_transport.nacked_messages) == 1
         message_id, requeue = mock_transport.nacked_messages[0]
         assert requeue is True
+
+    @pytest.mark.asyncio
+    async def test_timeout_replies_once_budget_spent(self, app, sample_command):
+        """With no retry budget the timeout is terminal: one Timeout reply,
+        then dead-letter."""
+
+        @app.handler("ProcessDataset", "1.0")
+        async def slow_handler(ctx, payload):
+            await asyncio.sleep(5)
+            return {"result": "success"}
+
+        mock_transport = MockTransport()
+        app.transport = mock_transport
+        app.config = create_mock_config(handler_timeout=1, max_retries=0)
+
+        await app._handle_command(sample_command, asyncio.Semaphore(1))
+
+        assert len(mock_transport.sent_responses) == 1
+        error = mock_transport.sent_responses[0].payload["error"]
+        assert error["code"] == "Timeout"
+        assert error["retryable"] is True  # transient class; budget spent
+        assert mock_transport.nacked_messages == [(sample_command.envelope.message_id, False)]
 
 
 class TestGenericErrorsIntegration:
@@ -302,7 +320,8 @@ class TestGenericErrorsIntegration:
         # Mock transport
         mock_transport = MockTransport()
         app.transport = mock_transport
-        app.config = create_mock_config(generic_errors=True, max_retries=3)
+        # max_retries=0: the failure is terminal, so the one reply is sent
+        app.config = create_mock_config(generic_errors=True, max_retries=0)
 
         # Apply config to registry (normally done in _run_async)
         app.registry._generic_errors = app.config.generic_errors

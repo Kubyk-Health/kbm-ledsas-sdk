@@ -5,7 +5,9 @@ The SDK runs a small aiohttp server alongside the message consumer so
 external orchestrators and monitoring tools can answer two questions:
 
 - /health  → is the process alive? (liveness)
-- /ready   → is the process ready to handle work? (readiness)
+- /ready   → should the instance be reported ready? (readiness; it only
+  decides what /ready answers and does not hold back command delivery,
+  so do warm-up work before app.run())
 
 Both endpoints return JSON:
 
@@ -27,8 +29,8 @@ Customers can layer additional checks via decorators on ``ServiceApp``:
     @app.liveness_check("db_alive")
     async def _(): return await db.ping()
 
-    @app.readiness_check("model_loaded")
-    def _(): return model is not None
+    @app.readiness_check("db_connected")
+    async def _(): return await db.ping()
 
 Set ``KBM_LEDSAS_HEALTH_PORT=0`` to disable the server entirely.
 """

@@ -12,6 +12,39 @@ from ..blob.operations import BlobOperations
 from ..models.messages import Command, Response, Status
 
 
+class TransportConnectionLost(ConnectionError):
+    """The transport's underlying connection died and cannot recover
+    in-process.
+
+    Raised from the subscribe iterator so the application exits promptly
+    (fail-fast) instead of consuming from a dead transport forever. The
+    process supervisor (container restart policy, orchestrator) is the
+    recovery mechanism: a fresh process reconnects and resubscribes.
+    """
+
+
+class DeliveryLost(ConnectionError):
+    """A command could not be settled (acknowledged, requeued or
+    dead-lettered) because the broker connection it arrived on was lost.
+
+    Nothing more can be done with that delivery: the broker returned the
+    command to its queue when the connection dropped and delivers it
+    again, so it runs again. The transport has already logged this once
+    (one WARNING, no traceback); the service lets the command go without
+    logging it again.
+    """
+
+
+class TransportUnavailable(ConnectionError):
+    """The transport could not connect at startup (endpoint unreachable,
+    or the connection was refused during setup).
+
+    The transport logs the cause once, as a single line; ``ServiceApp.run()``
+    then exits non-zero without a traceback so the process supervisor
+    restarts the service.
+    """
+
+
 class Transport(ABC):
     """
     Abstract transport for SDK <-> RabbitMQ + Azure Blob communication.

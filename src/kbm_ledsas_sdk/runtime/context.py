@@ -14,7 +14,7 @@ The context is scoped to a single command execution and is immutable after creat
 import logging
 from datetime import UTC, datetime
 
-from ..blob.operations import BlobOperations
+from ..blob.operations import BlobOperations, _find_lone_surrogate, _mark_non_retryable
 from ..models.envelope import Envelope
 from ..models.messages import Status
 from ..transport.base import Transport
@@ -143,13 +143,56 @@ class ExecutionContext:
             note: Optional human-readable note (e.g., "Downloading 15 MB dataset")
 
         Raises:
-            ValueError: If progress is not between 0.0 and 1.0
+            TypeError: If ``stage`` is not a ``str``, ``note`` is neither
+                ``None`` nor a ``str``, or progress is not a number
+                (``True`` / ``False`` are not numbers here)
+            ValueError: If progress is not between 0.0 and 1.0, or
+                ``stage`` / ``note`` holds a lone surrogate (text UTF-8
+                cannot encode, e.g. ``"\\ud800"`` from a JSON request)
+            Both are raised before anything is published. Uncaught, they
+            are replied as Permanent (not retried): the same call fails
+            the same way on every attempt.
 
         Example:
             await ctx.emit_status("downloading", 0.25, "Downloading input dataset")
         """
+        # stage and note are text: any other value (a number, a list, an
+        # object with no JSON form) is refused before the status is built,
+        # like an invalid progress: the same call fails the same way on
+        # every attempt, so it is one Permanent reply, not a retry.
+        for field, value, allowed in (
+            ("stage", stage, "a str"),
+            ("note", note, "None or a str"),
+        ):
+            if isinstance(value, str) or (field == "note" and value is None):
+                continue
+            err = TypeError(
+                f"emit_status() takes {field} as {allowed}, got " f"{type(value).__name__}"
+            )
+            _mark_non_retryable(err, str(err))
+            raise err
+
+        # bool is an int subclass: True / False are refused, as the
+        # envelope's priority refuses them.
+        if isinstance(progress, bool) or not isinstance(progress, (int, float)):
+            err = TypeError(
+                f"Progress must be a number between 0.0 and 1.0, got " f"{type(progress).__name__}"
+            )
+            _mark_non_retryable(err, str(err))
+            raise err
         if not 0.0 <= progress <= 1.0:
-            raise ValueError(f"Progress must be between 0.0 and 1.0, got {progress}")
+            err = ValueError(f"Progress must be between 0.0 and 1.0, got {progress}")
+            _mark_non_retryable(err, str(err))
+            raise err
+
+        # A lone surrogate would be written as an escape that strict JSON
+        # readers refuse (as in replies and upload_json).
+        for field, text in (("stage", stage), ("note", note)):
+            problem = _find_lone_surrogate(text, field) if text is not None else None
+            if problem is not None:
+                err = ValueError(f"emit_status() refused: {problem}")
+                _mark_non_retryable(err, str(err))
+                raise err
 
         payload = {"stage": stage, "progress": progress}
         if note is not None:

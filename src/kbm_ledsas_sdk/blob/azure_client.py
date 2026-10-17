@@ -1,30 +1,70 @@
 """
-Azure Blob Storage client wrapper for Direct transport mode.
+Azure Blob Storage client.
 
-Simplified blob client for development/testing scenarios.
-Supports true streaming for multi-GB file transfers with minimal memory footprint.
+Uploads and downloads blobs addressed by azblob:// URIs. Supports true
+streaming for multi-GB file transfers with minimal memory footprint.
 """
 
+import base64
+import binascii
 import logging
 import uuid
 from collections.abc import AsyncIterator, Callable
+from urllib.parse import urlsplit
 
+from azure.core import MatchConditions
 from azure.core.exceptions import (
+    AzureError,  # noqa: F401
+    ClientAuthenticationError,
     HttpResponseError,
     ResourceExistsError,
+    ResourceModifiedError,
     ResourceNotFoundError,
     ServiceRequestError,
     ServiceResponseError,
 )
-from azure.storage.blob.aio import BlobServiceClient
+from azure.storage.blob import ContentSettings
+from azure.storage.blob.aio import BlobServiceClient, ExponentialRetry
 
+from kbm_ledsas_sdk.blob.operations import (
+    _check_upload_path,
+    _mark_non_retryable,
+    _mark_retryable,
+)
 from kbm_ledsas_sdk.models.blob import BlobRef
+
+# Reason given when the blob a download_stream reads is overwritten during
+# the download (HTTP 412 of the ETag check below).
+BLOB_CHANGED_DURING_DOWNLOAD = (
+    "the blob changed while it was being downloaded (it was overwritten "
+    "during download_stream); a new attempt reads its new content"
+)
+
 
 # Default chunk size: 4MB (optimal for Azure blob storage performance)
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 
 # Type alias for progress callbacks
 ProgressCallback = Callable[[int, int], None]  # (bytes_transferred, total_bytes)
+
+# The storage client's own retry policy, per SDK call. Its library default
+# (15 s initial backoff growing to ~25 s, 3 retries, 20 s connect timeout)
+# made one call against unreachable storage block for about 85 s, and the
+# SDK retries the whole handler on top of that (KBM_LEDSAS_MAX_RETRIES), so
+# a caller waited 5-6 minutes for a reply. Bounded here: 2 retries after
+# ~3 s and ~5 s (1 s jitter), 10 s to open a connection and 10 s of
+# silence while waiting for an answer (the read timeout restarts with each
+# piece of the answer, so it bounds silence, not transfer time). One call
+# then gives up after about 10 s when storage refuses the connection, and
+# after about 40 s when storage does not answer at all (3 attempts of
+# 10 s plus the backoff; the library's 60 s read timeout made that about
+# 190 s). The handler-level retries still cover longer outages.
+STORAGE_RETRY_TOTAL = 2
+STORAGE_RETRY_INITIAL_BACKOFF_S = 1
+STORAGE_RETRY_INCREMENT_BASE = 2
+STORAGE_RETRY_JITTER_S = 1
+STORAGE_CONNECTION_TIMEOUT_S = 10
+STORAGE_READ_TIMEOUT_S = 10
 
 # HTTP status codes that mean "transient — retry would help".
 # Per Azure SDK guidance: 408 timeout, 429 throttling, 500/502/503/504.
@@ -91,6 +131,95 @@ def _short_azure_error(exc: BaseException) -> str:
     return " ".join(parts)
 
 
+# The reply a caller gets when the service's own storage credentials cannot
+# sign a request (see _credential_failure); the log record says what to fix.
+CREDENTIALS_CANNOT_SIGN = (
+    "blob storage access is misconfigured on the service (its storage "
+    "credentials cannot sign requests)"
+)
+
+
+def _credential_failure(exc: BaseException) -> str | None:
+    """The log text for a request the storage client could not sign with
+    the configured account key (``AzureSigningError``, raised before
+    anything is sent, so it has no HTTP status), or None.
+
+    It fails the same way on every attempt (the key is read once, at
+    start), so it is not worth a retry. The account key is never quoted.
+    """
+    if not isinstance(exc, ClientAuthenticationError):
+        return None
+    if isinstance(getattr(exc, "status_code", None), int):
+        return None  # a storage response (403 AuthenticationFailed): a 4xx
+    first = (str(exc).strip().splitlines() or [""])[0][:120]
+    detail = f"{type(exc).__name__}: {first}" if first else type(exc).__name__
+    return (
+        f"the storage credentials cannot sign requests ({detail}); check "
+        f"the AccountKey in KBM_LEDSAS_BLOB_CONN_STRING"
+    )
+
+
+def _not_found_message(exc: BaseException, streaming: bool = False) -> str:
+    """``Container not found`` or ``Blob not found`` (from the storage
+    error code), so a missing container is not reported as a missing
+    blob."""
+    what = "Container" if getattr(exc, "error_code", None) == "ContainerNotFound" else "Blob"
+    return f"{what} not found for streaming download" if streaming else f"{what} not found"
+
+
+def _connection_string_problem(connection_string: str, service_client) -> str | None:
+    """What makes a connection string the storage client accepted unusable,
+    or None. Checked at start, because the client itself only fails on
+    first use: a string without a credential (no AccountKey and no
+    SharedAccessSignature, or an empty one) gets every request refused
+    with HTTP 403, an AccountKey that is not base64 (a trailing ``=`` lost
+    in a copy) fails every request with a signing error, and a BlobEndpoint
+    without ``http://`` / ``https://`` is silently read as an https URL
+    (the local emulator speaks http). The value is never quoted."""
+    settings = {}
+    for part in connection_string.strip().rstrip(";").split(";"):
+        key, sep, value = part.partition("=")
+        if sep:
+            settings[key.strip().upper()] = value.strip()
+    endpoint = settings.get("BLOBENDPOINT")
+    if endpoint is not None:
+        try:
+            parts = urlsplit(endpoint)
+            host = parts.hostname
+        except ValueError:
+            host = None
+            parts = None
+        if parts is None or parts.scheme.lower() not in ("http", "https") or not host:
+            return "its BlobEndpoint is not an http:// or https:// URL with a host"
+    credential = getattr(service_client, "credential", None)
+    account_key = getattr(credential, "account_key", None)
+    url = getattr(service_client, "url", None)
+    if credential is None and isinstance(url, str) and not urlsplit(url).query:
+        # Neither an AccountKey nor a SharedAccessSignature (the client
+        # carries a SAS in its URL): the client would send every request
+        # without credentials, and storage refuses them (HTTP 403).
+        return (
+            "it carries no credential: neither an AccountKey nor a "
+            "SharedAccessSignature, so storage would refuse every request "
+            "with HTTP 403"
+        )
+    if isinstance(account_key, str) and not account_key.strip():
+        return (
+            "its AccountKey or SharedAccessSignature is empty, so storage "
+            "would refuse every request with HTTP 403"
+        )
+    if isinstance(account_key, str):
+        try:
+            # The decoding the client uses to sign each request.
+            base64.b64decode(account_key.encode("utf-8"))
+        except (binascii.Error, ValueError):
+            return (
+                "its AccountKey is not valid base64; a trailing '=' or '==' "
+                "may have been cut off when it was copied"
+            )
+    return None
+
+
 def build_blob_uri(container: str, path: str, version_id: str | None = None) -> str:
     """
     Build Azure Blob URI with optional version ID.
@@ -146,7 +275,37 @@ class AzureBlobClient:
         if not connection_string:
             raise ValueError("Blob storage connection string required")
 
-        self.service_client = BlobServiceClient.from_connection_string(connection_string)
+        try:
+            self.service_client = BlobServiceClient.from_connection_string(
+                connection_string,
+                retry_policy=ExponentialRetry(
+                    initial_backoff=STORAGE_RETRY_INITIAL_BACKOFF_S,
+                    increment_base=STORAGE_RETRY_INCREMENT_BASE,
+                    retry_total=STORAGE_RETRY_TOTAL,
+                    random_jitter_range=STORAGE_RETRY_JITTER_S,
+                ),
+                connection_timeout=STORAGE_CONNECTION_TIMEOUT_S,
+                read_timeout=STORAGE_READ_TIMEOUT_S,
+            )
+        except ValueError as e:
+            # The client library's text ("Connection string is either
+            # blank or malformed.") does not say which setting to fix.
+            # The value itself is never repeated (it holds the account key).
+            reason = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+            raise ValueError(
+                f"KBM_LEDSAS_BLOB_CONN_STRING is not a usable storage "
+                f"connection string ({reason[:200]}). Use the connection "
+                f"string from the storage account's access keys, or the "
+                f"local storage emulator's string from .env.example."
+            ) from None
+        problem = _connection_string_problem(connection_string, self.service_client)
+        if problem is not None:
+            raise ValueError(
+                f"KBM_LEDSAS_BLOB_CONN_STRING is not a usable storage "
+                f"connection string ({problem}). Use the connection "
+                f"string from the storage account's access keys, or the "
+                f"local storage emulator's string from .env.example."
+            )
         self.default_container = default_container
 
         logger.info(
@@ -206,13 +365,14 @@ class AzureBlobClient:
 
             return data
 
-        except ResourceNotFoundError:
+        except ResourceNotFoundError as e:
             logger.warning(
-                "Blob not found",
+                _not_found_message(e),
                 extra={
                     "container": container,
                     "path": path,
                     "version_id": version_id,
+                    "error_code": getattr(e, "error_code", None),
                 },
             )
             raise
@@ -220,11 +380,21 @@ class AzureBlobClient:
         except Exception as e:
             # Client-side 4xx (InvalidResourceName,
             # AuthenticationFailed, etc.) → single WARNING with short
-            # summary, no XML body, no traceback. 5xx / transport →
-            # ERROR + traceback as before.
+            # summary, no XML body, no traceback. Transient (transport,
+            # 408/429/500/502/503/504) → INFO, no traceback. Anything
+            # else (e.g. 501/505/507) → ERROR + traceback.
+            credential = _credential_failure(e)
             client_4xx = _is_client_4xx(e)
             transient = is_transient_azure_error(e)
-            if client_4xx:
+            if credential is not None:
+                # Not worth a retry, and its stack adds nothing: one line.
+                _mark_non_retryable(e, CREDENTIALS_CANNOT_SIGN)
+                logger.warning(
+                    "Failed to download blob: %s",
+                    credential,
+                    extra={"container": container, "path": path},
+                )
+            elif client_4xx:
                 logger.warning(
                     "Failed to download blob (client error)",
                     extra={
@@ -233,14 +403,30 @@ class AzureBlobClient:
                         "error": _short_azure_error(e),
                     },
                 )
-            else:
-                logger.error(
-                    "Failed to download blob",
-                    exc_info=not transient,
+            elif transient:
+                # A transient storage failure (unreachable, timeout,
+                # throttling, 500/502/503/504): INFO, no traceback. If the
+                # handler lets it propagate, the SDK logs the attempt once
+                # (WARNING) and retries the command.
+                logger.info(
+                    "Failed to download blob (transient storage error)",
                     extra={
                         "container": container,
                         "path": path,
-                        "transient": transient,
+                        "transient": True,
+                        "error": (
+                            _short_azure_error(e) if isinstance(e, HttpResponseError) else str(e)
+                        ),
+                    },
+                )
+            else:
+                logger.error(
+                    "Failed to download blob",
+                    exc_info=True,
+                    extra={
+                        "container": container,
+                        "path": path,
+                        "transient": False,
                         "error": (
                             _short_azure_error(e) if isinstance(e, HttpResponseError) else str(e)
                         ),
@@ -255,6 +441,8 @@ class AzureBlobClient:
         path: str | None = None,
         metadata: dict[str, str] | None = None,
         overwrite: bool = False,
+        content_type: str | None = None,
+        auto_suffix: str = ".bin",
     ) -> BlobRef:
         """
         Upload blob with optional metadata.
@@ -262,11 +450,16 @@ class AzureBlobClient:
         Args:
             container: Container name
             data: Blob data
-            path: Optional blob path (auto-generated if not provided)
+            path: Optional blob path (auto-generated if not provided:
+                ``<uuid><auto_suffix>``)
             metadata: Optional blob metadata
             overwrite: If True, replace existing blob at ``path``. Default
                 False to refuse to clobber an existing blob (use True for
                 the idempotency-key replay pattern).
+            content_type: The blob's stored Content-Type (what a browser
+                or a download tool sees). None stores the storage
+                service's default, ``application/octet-stream``.
+            auto_suffix: Extension of an auto-generated path.
 
         Returns:
             BlobRef with URI including version ID
@@ -275,12 +468,16 @@ class AzureBlobClient:
             ResourceExistsError: If ``overwrite=False`` and ``path`` exists.
             Exception: If upload fails for other reasons.
         """
+        # Refuse a path the returned URI could not represent before
+        # anything is written (see _check_upload_path).
+        _check_upload_path(path)
+
         # Generate path if not provided.
         # UUID supplies the uniqueness; the prior ``{timestamp}_``
         # prefix only leaked server time into blob listings without
         # adding collision resistance. Bare UUID is enough.
         if not path:
-            path = f"{uuid.uuid4()}.bin"
+            path = f"{uuid.uuid4()}{auto_suffix}"
 
         # Strip leading / for Azure SDK
         path_clean = path.lstrip("/")
@@ -300,11 +497,15 @@ class AzureBlobClient:
             # Get blob client
             blob_client = self.service_client.get_blob_client(container=container, blob=path_clean)
 
-            # Upload with metadata
+            # Upload with metadata (and the content type, when given)
+            upload_kwargs = {}
+            if content_type is not None:
+                upload_kwargs["content_settings"] = ContentSettings(content_type=content_type)
             result = await blob_client.upload_blob(
                 data=data,
                 metadata=metadata or {},
                 overwrite=overwrite,
+                **upload_kwargs,
             )
 
             # Get version ID from result
@@ -341,10 +542,20 @@ class AzureBlobClient:
         except Exception as e:
             # Real upload failure (network, auth, permissions, …).
             # Classify transient vs client-4xx vs definitive so log
-            # noise scales with actionability. See M6 in download_blob.
+            # noise scales with actionability (same classification as
+            # download_blob).
+            credential = _credential_failure(e)
             client_4xx = _is_client_4xx(e)
             transient = is_transient_azure_error(e)
-            if client_4xx:
+            if credential is not None:
+                # Not worth a retry, and its stack adds nothing: one line.
+                _mark_non_retryable(e, CREDENTIALS_CANNOT_SIGN)
+                logger.warning(
+                    "Failed to upload blob: %s",
+                    credential,
+                    extra={"container": container, "path": path_clean},
+                )
+            elif client_4xx:
                 logger.warning(
                     "Failed to upload blob (client error)",
                     extra={
@@ -353,14 +564,30 @@ class AzureBlobClient:
                         "error": _short_azure_error(e),
                     },
                 )
-            else:
-                logger.error(
-                    "Failed to upload blob",
-                    exc_info=not transient,
+            elif transient:
+                # A transient storage failure (unreachable, timeout,
+                # throttling, 500/502/503/504): INFO, no traceback. If the
+                # handler lets it propagate, the SDK logs the attempt once
+                # (WARNING) and retries the command.
+                logger.info(
+                    "Failed to upload blob (transient storage error)",
                     extra={
                         "container": container,
                         "path": path_clean,
-                        "transient": transient,
+                        "transient": True,
+                        "error": (
+                            _short_azure_error(e) if isinstance(e, HttpResponseError) else str(e)
+                        ),
+                    },
+                )
+            else:
+                logger.error(
+                    "Failed to upload blob",
+                    exc_info=True,
+                    extra={
+                        "container": container,
+                        "path": path_clean,
+                        "transient": False,
                         "error": (
                             _short_azure_error(e) if isinstance(e, HttpResponseError) else str(e)
                         ),
@@ -403,13 +630,20 @@ class AzureBlobClient:
         """
         Download blob as streaming async iterator.
 
-        Uses Azure SDK's StorageStreamDownloader.chunks() for true streaming
-        without loading entire blob into memory. Memory usage is bounded by
-        chunk_size regardless of blob size.
+        Reads the blob with one ranged request per chunk, so every yielded
+        chunk is exactly ``chunk_size`` bytes (the last one may be shorter)
+        and memory use is bounded by ``chunk_size`` regardless of blob
+        size. Without a version ID, every range request is conditioned on
+        the ETag read at the start, so a blob that is overwritten while it
+        is being streamed fails the download (ResourceModifiedError, HTTP
+        412) instead of mixing old and new content. That error is marked
+        worth retrying: uncaught in a handler, the command is retried and
+        the new attempt reads the new content.
 
         Args:
             blob_ref: BlobRef with container, path, and optional version ID
-            chunk_size: Chunk size in bytes (default 4MB for Azure optimal performance)
+            chunk_size: Size of each yielded chunk in bytes (default 4 MiB);
+                must be at least 1
             progress_callback: Optional callback(bytes_downloaded, total_size)
 
         Yields:
@@ -423,6 +657,12 @@ class AzureBlobClient:
             >>> async for chunk in client.download_blob_stream(blob_ref):
             ...     await file.write(chunk)
         """
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1:
+            # Invalid argument: fails the same way on every attempt.
+            err = ValueError(f"chunk_size must be a positive integer, got {chunk_size!r}")
+            _mark_non_retryable(err, str(err))
+            raise err
+
         container = blob_ref.container
         path = blob_ref.path.lstrip("/")
         version_id = blob_ref.version_id
@@ -437,6 +677,7 @@ class AzureBlobClient:
             },
         )
 
+        bytes_downloaded = 0
         try:
             blob_client = self.service_client.get_blob_client(container=container, blob=path)
 
@@ -449,19 +690,31 @@ class AzureBlobClient:
             total_size = properties.size
             bytes_downloaded = 0
 
-            # Get download stream
+            # One ranged read per chunk: the client library's own chunk
+            # iterator ignores the caller's chunk size and buffers its
+            # first (up to 32 MiB) request, so it neither honors
+            # chunk_size nor bounds memory by it.
             if version_id:
-                download_stream = await blob_client.download_blob(
-                    version_id=version_id,
-                    max_concurrency=1,  # Sequential for true streaming
-                )
+                pinned = {"version_id": version_id}
             else:
-                download_stream = await blob_client.download_blob(
-                    max_concurrency=1,
-                )
+                pinned = {
+                    "etag": properties.etag,
+                    "match_condition": MatchConditions.IfNotModified,
+                }
 
-            # Use chunks() iterator - this is true streaming, no buffering
-            async for chunk in download_stream.chunks():
+            while bytes_downloaded < total_size:
+                length = min(chunk_size, total_size - bytes_downloaded)
+                downloader = await blob_client.download_blob(
+                    offset=bytes_downloaded,
+                    length=length,
+                    max_concurrency=1,
+                    **pinned,
+                )
+                chunk = await downloader.readall()
+                if not chunk:
+                    # Blob shrank under a versioned read: stop instead of
+                    # looping on empty ranges.
+                    break
                 bytes_downloaded += len(chunk)
 
                 if progress_callback:
@@ -484,21 +737,51 @@ class AzureBlobClient:
                 },
             )
 
-        except ResourceNotFoundError:
+        except ResourceNotFoundError as e:
             logger.warning(
-                "Blob not found for streaming download",
+                _not_found_message(e, streaming=True),
                 extra={
                     "container": container,
                     "path": path,
                     "version_id": version_id,
+                    "error_code": getattr(e, "error_code", None),
+                },
+            )
+            raise
+
+        except ResourceModifiedError as e:
+            if version_id:
+                raise
+            # The ETag check above: the blob was overwritten during the
+            # download. Not a refusal of the request: a new attempt reads
+            # the new content, so the error is marked worth retrying.
+            # INFO, no traceback; if the handler lets it propagate, the SDK
+            # logs the attempt once (WARNING) and retries the command.
+            _mark_retryable(e, BLOB_CHANGED_DURING_DOWNLOAD)
+            logger.info(
+                "Streaming download stopped: the blob changed while it was " "being downloaded",
+                extra={
+                    "container": container,
+                    "path": path,
+                    "bytes_downloaded": bytes_downloaded,
+                    "error": _short_azure_error(e),
                 },
             )
             raise
 
         except Exception as e:
+            credential = _credential_failure(e)
             client_4xx = _is_client_4xx(e)
             transient = is_transient_azure_error(e)
-            if client_4xx:
+            if credential is not None:
+                # Not worth a retry, and its stack adds nothing: one line.
+                _mark_non_retryable(e, CREDENTIALS_CANNOT_SIGN)
+                logger.warning(
+                    "Streaming download failed: %s",
+                    credential,
+                    extra={"container": container, "path": path},
+                )
+            elif client_4xx:
                 logger.warning(
                     "Streaming download failed (client error)",
                     extra={
@@ -507,10 +790,26 @@ class AzureBlobClient:
                         "error": _short_azure_error(e),
                     },
                 )
+            elif transient:
+                # A transient storage failure (unreachable, timeout,
+                # throttling, 500/502/503/504): INFO, no traceback. If the
+                # handler lets it propagate, the SDK logs the attempt once
+                # (WARNING) and retries the command.
+                logger.info(
+                    "Streaming download failed (transient storage error)",
+                    extra={
+                        "container": container,
+                        "path": path,
+                        "transient": True,
+                        "error": (
+                            _short_azure_error(e) if isinstance(e, HttpResponseError) else str(e)
+                        ),
+                    },
+                )
             else:
                 logger.error(
                     "Streaming download failed",
-                    exc_info=not transient,
+                    exc_info=True,
                     extra={
                         "container": container,
                         "path": path,
@@ -556,7 +855,9 @@ class AzureBlobClient:
             ...             yield chunk
             >>> blob_ref = await client.upload_blob_stream("data", file_stream())
         """
-        # Generate path if not provided (bare UUID, see upload_blob).
+        _check_upload_path(path)
+
+        # Generate path if not provided (bare UUID, as in upload_blob).
         if not path:
             path = f"{uuid.uuid4()}.bin"
 
@@ -621,9 +922,18 @@ class AzureBlobClient:
             raise
 
         except Exception as e:
+            credential = _credential_failure(e)
             client_4xx = _is_client_4xx(e)
             transient = is_transient_azure_error(e)
-            if client_4xx:
+            if credential is not None:
+                # Not worth a retry, and its stack adds nothing: one line.
+                _mark_non_retryable(e, CREDENTIALS_CANNOT_SIGN)
+                logger.warning(
+                    "Streaming upload failed: %s",
+                    credential,
+                    extra={"container": container, "path": path_clean},
+                )
+            elif client_4xx:
                 logger.warning(
                     "Streaming upload failed (client error)",
                     extra={
@@ -632,14 +942,30 @@ class AzureBlobClient:
                         "error": _short_azure_error(e),
                     },
                 )
-            else:
-                logger.error(
-                    "Streaming upload failed",
-                    exc_info=not transient,
+            elif transient:
+                # A transient storage failure (unreachable, timeout,
+                # throttling, 500/502/503/504): INFO, no traceback. If the
+                # handler lets it propagate, the SDK logs the attempt once
+                # (WARNING) and retries the command.
+                logger.info(
+                    "Streaming upload failed (transient storage error)",
                     extra={
                         "container": container,
                         "path": path_clean,
-                        "transient": transient,
+                        "transient": True,
+                        "error": (
+                            _short_azure_error(e) if isinstance(e, HttpResponseError) else str(e)
+                        ),
+                    },
+                )
+            else:
+                logger.error(
+                    "Streaming upload failed",
+                    exc_info=True,
+                    extra={
+                        "container": container,
+                        "path": path_clean,
+                        "transient": False,
                         "error": (
                             _short_azure_error(e) if isinstance(e, HttpResponseError) else str(e)
                         ),
