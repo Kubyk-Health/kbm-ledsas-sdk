@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kbm-ledsas-sdk"
-version = "0.3.3"
+version = "0.3.5"
 description = "KeborMed LEDSAS SDK - Python client for building Local External Data Sources Action Service (LEDSAS) data-processing services"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,13 +27,16 @@ classifiers = [
 ]
 dependencies = [
     "pydantic>=2.5.0,<3.0",
-    "aio-pika>=9.4.0,<10.0",
+    "aio-pika>=9.4.0,<11.0",
     "azure-storage-blob>=12.19.0,<13.0",
-    "aiohttp>=3.8.0,<4.0",
+    # Health server + azure-storage-blob async transport. Security floor:
+    # 3.14.3 fixes CVE-2026-69244.
+    "aiohttp>=3.14.3,<4.0",
     # Security floor: cryptography arrives transitively via azure-storage-blob
-    # (which imposes no upper bound). Pinning the floor keeps every install off
-    # versions flagged by security scans; it resolves cleanly to the latest patch.
-    "cryptography>=48.0.1",
+    # (which imposes no upper bound). 50.0.0 fixes CVE-2026-69247
+    # (GHSA-g6cj-pr64-35w5); pinning the floor keeps every install off the
+    # vulnerable releases and resolves cleanly to the latest patch.
+    "cryptography>=50.0.0",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +46,7 @@ dev = [
     # Upper bounds on the formatters/linters so a future release can't reformat
     # the tree or add rules and break `black --check` / `ruff check` on an
     # unrelated PR. Bump deliberately.
-    "ruff>=0.5,<0.15",
+    "ruff>=0.5,<0.18",
     "black>=26.3.1,<27",
     "mypy>=1.10",
     "build>=1.2",
@@ -101,8 +104,11 @@ ignore = ["E501", "B008"]
 
 [tool.ruff.lint.per-file-ignores]
 # C408: dict(...) literals are fine in test fixtures; UP031: one test deliberately
-# exercises %-formatting to prove credential redaction.
-"tests/**" = ["B011", "B017", "C408", "UP031"]
+# exercises %-formatting to prove credential redaction. B018 (a bare expression
+# evaluated for its side effect, such as reading a property that must raise),
+# B007 / F841 (loop variables and locals kept for readability) and C416 (a
+# comprehension kept for symmetry with its neighbours) are test idioms.
+"tests/**" = ["B007", "B011", "B017", "B018", "C408", "C416", "F841", "UP031"]
 
 [tool.coverage.run]
 source = ["kbm_ledsas_sdk"]

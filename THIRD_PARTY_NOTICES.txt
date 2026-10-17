@@ -1,4 +1,8 @@
-LEDSAS SDK v0.3.3 - THIRD-PARTY SOFTWARE NOTICES
+LEDSAS SDK v0.3.5 - THIRD-PARTY SOFTWARE NOTICES
+
+The LEDSAS SDK itself is licensed under the Apache License, Version 2.0
+(see LICENSE at the root of this repository). The notices below are for the
+third-party software it depends on, each under its own license.
 
 This software includes the following third-party components:
 
@@ -19,30 +23,64 @@ This software includes the following third-party components:
    Copyright: Copyright (c) 2023 Samuel Colvin
    URL: https://github.com/pydantic/pydantic
 
-4. aiohttp (v3.8.0+)
+4. aiohttp (v3.14.3+)
    License: Apache License 2.0
    Copyright: Copyright (c) 2013-2023 aiohttp contributors
    URL: https://github.com/aio-libs/aiohttp
 
-5. Python Runtime (3.11+)
+5. cryptography (v50.0.0+)
+   License: Apache License 2.0 OR BSD 3-Clause License (dual-licensed)
+   Copyright: Copyright (c) Individual contributors
+   URL: https://github.com/pyca/cryptography
+   Note: declared directly in the SDK's metadata as a security floor;
+   the SDK does not import it (azure-core uses it).
+
+6. Python Runtime (3.11+)
    License: Python Software Foundation License
    Copyright: Copyright (c) 2001-2024 Python Software Foundation
    URL: https://www.python.org/
 
 ============================================================================
 
-The SDK itself does not redistribute the binaries of the listed
-third-party packages — they are pulled at install time by `pip install`
-from PyPI and ship with their own LICENSE files inside the install
-directory (e.g. `venv/lib/python3.11/site-packages/aio_pika-*.dist-info/LICENSE`).
-The URLs above link to each project's source, which also carries the
-full license text.
+The SDK's wheel and source distribution do not contain the listed
+third-party packages:
+`pip install` pulls them from PyPI, and each ships its own LICENSE file
+inside the install directory (e.g.
+`venv/lib/python3.11/site-packages/aio_pika-*.dist-info/LICENSE`). The
+URLs above link to each project's source, which also carries the full
+license text.
 
-Indirect (transitive) dependencies pulled in by the four direct deps
+Container images are different: the LEDSAS base image
+`ghcr.io/kebormed/kbm-ledsas-base-direct` (see the README, "Container
+base image") contains the SDK with all of these packages already
+installed, so an image built on it redistributes them. Their license files are inside the image, under the
+Python site-packages directory (`<pkg>-*.dist-info/`); keep them when
+you ship an image, and include this notice with it.
+
+This notice covers only the SDK's Python packages. The base image also
+contains an operating system (Alpine Linux) with its own packages, the
+Python runtime, and Python's own packaging tools (setuptools, wheel,
+packaging), each under its own license; several of the OS packages are
+under GPL or LGPL licenses (for example busybox, the shell and core
+utilities, GPL-2.0-only), whose terms on source availability apply
+when you redistribute an image. They are not listed here. To list what
+an image contains, with each package's license, run:
+
+  docker run --rm --entrypoint sh <your image> -c 'apk list --installed'
+
+for the OS packages (each line names the package's license in parentheses),
+and look in the site-packages `*.dist-info/` directories for the Python
+packages; a software bill of materials tool (for example syft) lists
+both. Alpine's package sources are published by the Alpine Linux
+project. Open an issue in this repository if you need a notice for the
+base image.
+
+Indirect (transitive) dependencies pulled in by the direct dependencies
 above, annotated with the path that pulls each one:
 
   azure-core            (via azure-storage-blob)
-  cryptography          (via azure-storage-blob -> azure-core)
+  cryptography          (via azure-storage-blob -> azure-core; also
+                        declared directly, see 5. above)
   cffi                  (via cryptography)
   pycparser             (via cffi)
   isodate               (via azure-storage-blob -> azure-core)
@@ -50,12 +88,20 @@ above, annotated with the path that pulls each one:
   urllib3               (via requests)
   certifi               (via requests)  — License: MPL-2.0 (Mozilla Public
                         License 2.0). This is the only non-permissive
-                        (weak file-level copyleft) license in the
-                        dependency tree; all others are Apache-2.0 / MIT /
-                        BSD / PSF. The SDK does not modify or redistribute
-                        certifi (pip pulls it at install time as above), so
-                        unmodified use imposes no MPL source-disclosure
-                        obligation.
+                        (weak file-level copyleft) license among the
+                        SDK's Python dependencies listed here; all
+                        others are Apache-2.0 / MIT / BSD / PSF (the base
+                        image's operating-system packages are not part
+                        of this list; see above). The SDK wheel does not contain certifi
+                        (pip pulls it at install time as above). An image
+                        built on the base image does redistribute it,
+                        unmodified, inside the base image, with its license
+                        file (`certifi-*.dist-info/`) and its source (the
+                        `.py` files themselves). Distributing unmodified
+                        MPL-2.0 files that way, with the license notice
+                        kept, needs no further action; the MPL's
+                        source-disclosure terms apply only to modified
+                        certifi files.
   charset_normalizer    (via requests)
   idna                  (via requests, yarl)
 
@@ -80,4 +126,4 @@ Each ships its own license file in the install directory (e.g.
 
 All third-party software is used in accordance with their respective licenses.
 
-Last Updated: 2026-06-10
+Last Updated: 2026-10-16
