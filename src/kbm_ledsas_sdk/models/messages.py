@@ -14,12 +14,12 @@ Message types:
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import ConfigDict, Field
 
-from .envelope import Envelope
+from .envelope import Envelope, _ValidatedCopyModel
 
 
-class Command(BaseModel):
+class Command(_ValidatedCopyModel):
     """
     Command message from Orchestrator to LEDSAS.
 
@@ -42,6 +42,10 @@ class Command(BaseModel):
         }
     """
 
+    # Frozen (fields cannot be reassigned; the payload dict itself is
+    # the handler's to read).
+    model_config = ConfigDict(frozen=True)
+
     envelope: Envelope = Field(..., description="Message envelope metadata")
     payload: dict[str, Any] = Field(
         ..., description="Command-specific payload (deserialized to handler's request model)"
@@ -52,7 +56,7 @@ class Command(BaseModel):
         return f"Command(name={self.envelope.name!r}, message_id={self.envelope.message_id!r})"
 
 
-class Response(BaseModel):
+class Response(_ValidatedCopyModel):
     """
     Response message from LEDSAS to Orchestrator.
 
@@ -88,6 +92,10 @@ class Response(BaseModel):
         }
     """
 
+    # Frozen (fields cannot be reassigned; the payload dict itself is
+    # the handler's to read).
+    model_config = ConfigDict(frozen=True)
+
     envelope: Envelope = Field(..., description="Message envelope metadata")
     payload: dict[str, Any] = Field(
         ..., description="Response payload (success result or error details)"
@@ -99,7 +107,7 @@ class Response(BaseModel):
         return f"Response(name={self.envelope.name!r}, has_error={has_error}, message_id={self.envelope.message_id!r})"
 
 
-class Status(BaseModel):
+class Status(_ValidatedCopyModel):
     """
     Status update message from LEDSAS to Orchestrator.
 
@@ -130,6 +138,10 @@ class Status(BaseModel):
         - done: Processing complete
         - error: Error occurred
     """
+
+    # Frozen (fields cannot be reassigned; the payload dict itself is
+    # the handler's to read).
+    model_config = ConfigDict(frozen=True)
 
     envelope: Envelope = Field(..., description="Message envelope metadata")
     payload: dict[str, Any] = Field(

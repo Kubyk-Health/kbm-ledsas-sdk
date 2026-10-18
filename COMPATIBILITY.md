@@ -31,26 +31,46 @@ newer interpreters as they are released. CI runs the test suite on 3.11, 3.12, a
 
 | kbm-ledsas-sdk | Python | AMQP envelope schema | Upgrade from previous |
 |----------------|--------|----------------------|-----------------------|
-| **0.3.5**      | 3.11–3.13 | `1.0` | From 0.3.3: no public method or parameter removed or renamed, but several behaviors change and some invalid input that used to be accepted is now refused — read [UPGRADING.md](UPGRADING.md#upgrading-to-035-from-033) |
-| 0.3.4          | — | — | Not published to PyPI (an internal release line; no changes to this distribution) |
+| **0.3.6**      | 3.11–3.13 | `1.0` | From 0.3.3: no public method or parameter removed or renamed, but several behaviors change and some invalid input that used to be accepted is now refused — read [UPGRADING.md](UPGRADING.md#upgrading-to-036-from-033) |
+| 0.3.5          | — | — | Not released; number skipped, no changes |
+| 0.3.4          | — | — | Not released; number skipped, no changes |
 | 0.3.3          | 3.11–3.13 | `1.0` | Drop-in from 0.3.2 — one behavioral change for *misconfigured* reply routing (see [UPGRADING.md](UPGRADING.md)) |
 | 0.3.2          | 3.11–3.13 | `1.0` | First public release |
 
 ## Container base image
 
-The LEDSAS base image `ghcr.io/kebormed/kbm-ledsas-base-direct` comes with the SDK
-and its runtime dependencies installed. Its tag is the SDK version it carries.
+The LEDSAS base image `ghcr.io/kebormed/kbm-ledsas-base-direct` (published under
+the KeborMed GitHub organization) is the official Python 3.11 Alpine Linux image
+with the SDK and its runtime dependencies installed. Its tag is the SDK version it
+carries. What it contains:
 
-| Image tag | kbm-ledsas-sdk | Python | OS | Platforms |
-|-----------|----------------|--------|----|-----------|
-| `0.3.5`   | 0.3.5 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` |
-| `latest`  | the newest release | | | |
+- **Python 3.11** (the latest 3.11.x patch release of the official
+  `python:3.11-alpine` image when the image was built) on **Alpine Linux** (musl
+  libc), for `linux/amd64` and `linux/arm64`;
+- **`kbm-ledsas-sdk`** of the tag's version, installed from PyPI with its
+  runtime dependencies (the ranges in "Runtime dependencies" above, resolved
+  when the image was built);
+- **a pip constraints file**, `PIP_CONSTRAINT=/etc/kbm-ledsas-pip-constraints.txt`
+  (also `UV_CONSTRAINT`), which pins `kbm-ledsas-sdk` to the tag's version and
+  keeps the `cryptography` security floor, so a requirement for another SDK
+  version fails the build;
+- **the non-root user `kbmuser` (uid 1000)** and the working directory `/app`.
 
-There is no image for a version that was not published to PyPI (no `0.3.4`).
-`latest` moves with every release: build on a version tag, and pin the digest for
-a reproducible build. See the [README](README.md#container-base-image) and
-[`examples/hello_world_service/`](examples/hello_world_service/) for how to build
-a service on it.
+The image is rebuilt from the same recipe to pick up Alpine and Python security
+patches; a rebuild keeps the tag and changes the digest, so pin the digest you
+tested (`docker buildx imagetools inspect ghcr.io/kebormed/kbm-ledsas-base-direct:<tag>`
+prints it).
+
+| Image tag | kbm-ledsas-sdk | Python | OS | Platforms | Digest at release |
+|-----------|----------------|--------|----|-----------|-------------------|
+| `0.3.6`   | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | listed here when the image is published |
+| `latest`  | the newest release | | | | |
+
+There is no image for a version number that was not released (no `0.3.4` or
+`0.3.5`). `latest` moves with every release: build on a version tag, and pin the
+digest for a reproducible build. See the [README](README.md#container-base-image)
+and [`examples/hello_world_service/`](examples/hello_world_service/) for how to
+build a service on it.
 
 ## Backwards-compatibility policy
 
@@ -75,12 +95,34 @@ are not broken in a minor/patch release; any exception is called out in
   backwards-compatible defaults; no previously-valid configuration is rejected by a
   minor upgrade.
 
-**Exception in 0.3.5:** input that was never valid but used to be accepted silently
+**Exception in 0.3.6:** input that was never valid but used to be accepted silently
 is now refused with a clear error — for example a handler name a command cannot
 carry, a handler that is not `async def`, a malformed blob URI, a broker URL that
 is not `amqp://` / `amqps://`, a storage connection string without a credential,
-or a boolean setting with a value that is not a boolean. The full list, with what
-to do for each, is in [UPGRADING.md](UPGRADING.md#upgrading-to-035-from-033).
+a broker URL whose `no_verify_ssl` turns certificate verification off (any value
+except `0`; unless `KBM_LEDSAS_ALLOW_INSECURE_AMQP=1` acknowledges it), or a boolean setting with a value that is not a boolean. Some
+changes are visible on the wire, in the configuration or in the public API:
+
+- **one reply per command**: an attempt that will be retried sends no reply; the
+  one reply comes when the command has finished;
+- **strict envelope types**: `sent_at` and `deadline` must be ISO 8601 text and
+  `priority` an integer, or the command is dead-lettered;
+- **a `reply_to` naming a service's own `cmd.…` or `dlq.…` exchange, or a
+  reserved broker exchange (`amq.…`), is refused** (the command is dead-lettered
+  before its handler runs);
+- **version fields are ASCII digits, 1 to 4 on each side of the dot**
+  (`schema_version`, `message_version`, the `@app.handler` version);
+- **the SDK asks the broker for a 15-second heartbeat** (new
+  `KBM_LEDSAS_HEARTBEAT`; 0.3.3 set none of its own, so the AMQP client library's
+  default of 60 seconds applied):
+  blocking code that holds the event loop for more than about 30 seconds now loses
+  the broker connection;
+- **`Envelope`, `Command`, `Response` and `Status` are read-only**: assigning a
+  field raises `ValidationError` (build a changed copy with `model_copy(update=...)`);
+- **a health port that cannot be bound stops the service at start**.
+
+The full list, with what to do for each, is in
+[UPGRADING.md](UPGRADING.md#upgrading-to-036-from-033).
 
 ## Interoperability with callers
 

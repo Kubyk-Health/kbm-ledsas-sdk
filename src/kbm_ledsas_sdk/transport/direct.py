@@ -10,6 +10,7 @@ import inspect
 import logging
 import re
 from collections.abc import AsyncIterator
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import aio_pika
 import aiormq.exceptions
@@ -35,6 +36,7 @@ from kbm_ledsas_sdk.runtime.security import (
     scrub_url_credentials as _scrub_url_credentials,
 )
 from kbm_ledsas_sdk.transport.base import DeliveryLost, Transport, TransportUnavailable
+from kbm_ledsas_sdk.utils import amqp_text as _amqp_text
 from kbm_ledsas_sdk.utils.logging import _command_fields, masked_logger
 
 logger = masked_logger(__name__)
@@ -55,6 +57,29 @@ _URL_USERINFO = re.compile(r"(\w+://)[^/\s@]+@")
 # at 0x10a7d9860> closed') when a publish meets a closed connection: it
 # holds the broker URL (user name included) and a memory address.
 _OBJECT_REPR = re.compile(r"<([A-Za-z_][\w.]*)(?::[^<>]*?)?\s+at\s+0x[0-9a-fA-F]+>")
+
+
+def url_with_heartbeat(url: str, heartbeat: int | None) -> str:
+    """``url`` with ``heartbeat=<heartbeat>`` added to its query, unless
+    the URL sets ``heartbeat`` itself (the URL wins) or ``heartbeat`` is
+    None. The rest of the URL (credentials included) is kept as written.
+
+    The client library reads its connection options from the URL's query
+    only, by the exact key (letter case counts): a key spelled otherwise
+    (``HEARTBEAT=``) is ignored by it, so the setting is added then too,
+    rather than leaving the library's own default in force.
+    """
+    if heartbeat is None:
+        return url
+    parts = urlsplit(url)
+    if any(key == "heartbeat" for key, _ in parse_qsl(parts.query, keep_blank_values=True)):
+        return url
+    query = (
+        f"{parts.query}&heartbeat={int(heartbeat)}"
+        if parts.query
+        else f"heartbeat={int(heartbeat)}"
+    )
+    return urlunsplit(parts._replace(query=query))
 
 
 def _publish_error_text(error: BaseException) -> str:
@@ -125,7 +150,7 @@ def _setup_refusal_hint(reason: str) -> str:
 
     ``PRECONDITION_FAILED - inequivalent arg ...`` means a queue or
     exchange the service declares already exists on the broker with other
-    settings (typically created by an older release or another tool, or
+    settings (typically declared by hand or by another tool, or
     left in a reused local broker volume). Re-declaring cannot change
     them; deleting the object once lets the service re-create it.
     """
@@ -218,6 +243,7 @@ class DirectTransport(Transport):
         default_container: str = "dev",
         max_payload_bytes: int = 16 * 1024 * 1024,
         connect_timeout: float = 15.0,
+        heartbeat: int | None = 15,
     ):
         """
         Initialize Direct transport.
@@ -238,8 +264,18 @@ class DirectTransport(Transport):
                 of after the operating system's own connect timeout (75 s
                 to over 2 minutes), which an orchestrator's liveness probe
                 may not wait for.
+            heartbeat: AMQP heartbeat interval in seconds requested from
+                the broker (KBM_LEDSAS_HEARTBEAT; 0 turns heartbeats off),
+                used unless ``rabbitmq_url`` sets ``?heartbeat=`` itself.
+                A broker that stops answering (frozen, or a network path
+                that silently drops packets) is then detected within
+                about 3 x (this interval + 1) s, the client library's
+                bound: about 50 s at the default 15, instead of about 3
+                minutes with the library's own 60 s default. ``None``
+                leaves the URL unchanged.
         """
         self.rabbitmq_url = rabbitmq_url
+        self.heartbeat = heartbeat
         self.blob_conn_string = blob_conn_string
         self.service_name = service_name
         self.tenant = tenant
@@ -319,6 +355,9 @@ class DirectTransport(Transport):
         """
         logger.info("Starting DirectTransport")
 
+        # The setup step running when the broker refuses one (named in the
+        # error record).
+        step = "connecting"
         try:
             # Refuse cleartext AMQP to non-loopback hosts unless
             # explicitly opted in. Raises ValueError on misuse.
@@ -332,6 +371,11 @@ class DirectTransport(Transport):
                 _scrub_url_credentials(self.rabbitmq_url),
                 self.connect_timeout,
             )
+            # A message property that is not UTF-8 must not stop the
+            # consumer (see kbm_ledsas_sdk.utils.amqp_text): the tolerant
+            # decoders go in when the service starts, before its first
+            # frame is decoded, not when the package is imported.
+            _amqp_text.install()
             # The connection object being made, so a start that is given
             # up while it connects can close it (see below).
             connecting: list = []
@@ -340,7 +384,7 @@ class DirectTransport(Transport):
                 # later reconnects; a first attempt that times out fails
                 # the start (TransportUnavailable below).
                 self.connection = await aio_pika.connect_robust(
-                    self.rabbitmq_url,
+                    url_with_heartbeat(self.rabbitmq_url, self.heartbeat),
                     timeout=self.connect_timeout,
                     connection_class=_recorded_connection_class(connecting),
                 )
@@ -382,12 +426,14 @@ class DirectTransport(Transport):
             self._watch_connection_state(self.connection)
 
             # Create the consumer/topology channel.
+            step = "opening a channel"
             self.channel = await self.connection.channel()
             logger.debug("RabbitMQ consumer channel created")
             # Name a close of it by the broker at its consumer_timeout.
             self._watch_consumer_channel(self.channel)
 
             # Declare topology (exchanges, queues) on the consumer channel
+            step = "declaring the service's exchanges and queues"
             topology = await declare_topology(
                 channel=self.channel,
                 service_name=self.service_name,
@@ -405,10 +451,12 @@ class DirectTransport(Transport):
             # opens its own short-lived channel. The guard bounds its broker
             # round trips once shutdown begins.
             self.publisher = AMQPPublisher(self.connection, shutdown_guard=self._shutdown_guard)
+            step = "enabling publisher confirms"
             await self.publisher.enable_confirms()
             logger.debug("Publisher initialized (transient-channel mode)")
 
             # Initialize consumer
+            step = f"starting to consume from {topology.cmd_queue}"
             self.consumer = AMQPConsumer(
                 topology.cmd_queue_obj,
                 self.prefetch_count,
@@ -469,10 +517,10 @@ class DirectTransport(Transport):
             if hint:
                 reason = f"{reason}. {hint}"
             logger.error(
-                "AMQP broker refused the startup sequence (declaring the "
-                "service's exchanges and queues): %s",
+                "AMQP broker refused the startup sequence (%s): %s",
+                step,
                 reason,
-                extra={"error": reason},
+                extra={"error": reason, "startup_step": step},
             )
             await self.stop()
             raise TransportUnavailable(f"AMQP broker refused the startup sequence: {reason}") from e

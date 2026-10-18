@@ -8,8 +8,8 @@ Streaming operations support multi-GB files with minimal memory footprint.
 import json
 import math
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable
-from typing import Any
+from collections.abc import AsyncIterable, AsyncIterator, Callable
+from typing import Any, Union
 
 from ..models.blob import (
     LONE_SURROGATE,
@@ -21,6 +21,12 @@ from ..models.blob import (
 
 # Default chunk size: 4MB (optimal for Azure blob storage performance)
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
+
+# A JSON document as download_json returns it and upload_json takes it:
+# an object or an array.
+JSONValue = Union[dict[str, Any], list[Any]]  # noqa: UP007
+# The data an upload takes: any bytes-like object.
+BytesLike = Union[bytes, bytearray, memoryview]  # noqa: UP007
 
 # Type aliases for progress callbacks
 DownloadProgressCallback = Callable[[int, int], None]  # (bytes_downloaded, total_bytes)
@@ -383,7 +389,7 @@ class BlobOperations(ABC):
         """
 
     @abstractmethod
-    async def download_json(self, blob_ref: str | BlobRef) -> dict:
+    async def download_json(self, blob_ref: str | BlobRef) -> JSONValue:
         """
         Download blob contents and parse as JSON.
 
@@ -391,7 +397,7 @@ class BlobOperations(ABC):
             blob_ref: Reference to the blob to download (BlobRef or azblob:// URI string)
 
         Returns:
-            Parsed JSON as dict
+            The parsed JSON document (a dict or a list)
 
         Raises:
             ValueError: If ``blob_ref`` is not a valid azblob:// URI, or the
@@ -415,7 +421,7 @@ class BlobOperations(ABC):
     async def upload_bytes(
         self,
         container: str,
-        data: bytes,
+        data: BytesLike,
         path: str | None = None,
         overwrite: bool = False,
     ) -> BlobRef:
@@ -439,7 +445,8 @@ class BlobOperations(ABC):
                 uncaught, is replied as Permanent (not retried).
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         Raises:
             TypeError: If ``data`` is not bytes-like (``bytes``,
@@ -464,7 +471,7 @@ class BlobOperations(ABC):
     async def upload_json(
         self,
         container: str,
-        obj: dict,
+        obj: JSONValue,
         path: str | None = None,
         overwrite: bool = False,
     ) -> BlobRef:
@@ -473,13 +480,14 @@ class BlobOperations(ABC):
 
         Args:
             container: Container name
-            obj: Dict to serialize as JSON
+            obj: dict or list to serialize as JSON
             path: Optional blob path (auto-generated if not provided)
             overwrite: See :meth:`upload_bytes` (default False; set True
                 for the idempotency-key replay pattern).
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         NaN and Infinity, which have no JSON form, are written as ``null``
         (as in replies), so the blob is standard JSON (RFC 8259).
@@ -515,7 +523,8 @@ class BlobOperations(ABC):
             overwrite: See :meth:`upload_bytes` (default False).
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         Raises:
             TypeError: If ``text`` is not a string, or ``container`` is
@@ -559,7 +568,7 @@ class BlobOperations(ABC):
     async def upload_stream(
         self,
         container: str,
-        stream: AsyncIterator[bytes],
+        stream: AsyncIterable[BytesLike],
         path: str | None = None,
         progress_callback: UploadProgressCallback | None = None,
         overwrite: bool = False,
@@ -582,7 +591,8 @@ class BlobOperations(ABC):
             progress_callback: Optional callback(bytes_uploaded) for progress reporting
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         Raises:
             TypeError: If ``stream`` is not an async iterable, or
@@ -616,7 +626,7 @@ class BlobOperations(ABC):
         """
 
     @abstractmethod
-    async def download_stream(
+    def download_stream(
         self,
         blob_ref: str | BlobRef,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -624,6 +634,9 @@ class BlobOperations(ABC):
     ) -> AsyncIterator[bytes]:
         """
         Download blob contents as true streaming async iterator.
+
+        Not a coroutine: call it and iterate the result with ``async
+        for`` (implementations are async generators).
 
         Transfers the blob without loading it into memory: chunks of at
         most ``chunk_size`` bytes are yielded as they arrive, so memory

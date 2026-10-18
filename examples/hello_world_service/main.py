@@ -7,7 +7,7 @@ every ``SayHello`` command published on its command exchange
 
 This file is the entire service. The container image gets the SDK from the
 base image the Dockerfile builds FROM; a local venv installs it with
-``pip install kbm-ledsas-sdk==0.3.5``. The SDK talks straight to RabbitMQ +
+``pip install kbm-ledsas-sdk==0.3.6``. The SDK connects to RabbitMQ and
 Azurite using ``KBM_LEDSAS_RABBITMQ_URL`` / ``KBM_LEDSAS_BLOB_CONN_STRING``.
 See README "Run it locally".
 

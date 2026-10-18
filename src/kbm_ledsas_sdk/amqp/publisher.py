@@ -12,7 +12,6 @@ reopened by the connection's automatic recovery.
 """
 
 import json
-import logging  # noqa: F401
 from collections.abc import Awaitable
 from typing import Any, TypeVar
 
@@ -22,7 +21,6 @@ from aio_pika.abc import AbstractConnection, AbstractExchange, AbstractRobustCon
 from aio_pika.exceptions import DeliveryError, PublishError
 
 from kbm_ledsas_sdk.amqp.consumer import BrokerShutdownGuard, is_broker_unreachable
-from kbm_ledsas_sdk.models.envelope import Envelope  # noqa: F401
 from kbm_ledsas_sdk.models.messages import Response, Status
 from kbm_ledsas_sdk.utils.logging import _command_fields, masked_logger
 

@@ -28,10 +28,35 @@ updates:
         patterns:
           - "*"
 
-  # The example service's base image tag (the tag is the SDK version).
-  - package-ecosystem: docker
+  # The hash-pinned release toolchain (.github/release-requirements.txt and
+  # .github/sbom-requirements.txt).
+  - package-ecosystem: pip
+    directory: "/.github"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+      - ci
+    groups:
+      release-toolchain:
+        patterns:
+          - "*"
+
+  # The example service's own requirements.txt.
+  - package-ecosystem: pip
     directory: "/examples/hello_world_service"
     schedule:
       interval: weekly
     labels:
       - dependencies
+
+  # The images of the example's local stack (RabbitMQ, Azurite).
+  - package-ecosystem: docker-compose
+    directory: "/examples/hello_world_service/deploy/local"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+
+  # No docker entry for examples/hello_world_service/Dockerfile: its base image
+  # tag is the SDK version and moves with each release of this repository.

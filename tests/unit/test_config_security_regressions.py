@@ -21,11 +21,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kbm_ledsas_sdk.amqp.consumer import AMQPConsumer
-from kbm_ledsas_sdk.runtime.config import SDKConfig, _strip_surrounding_quotes
+from kbm_ledsas_sdk.runtime.config import SDKConfig
+from kbm_ledsas_sdk.runtime.security import _strip_surrounding_quotes
 
 
 # ---------------------------------------------------------------------------
-# SECURITY-1: credential redaction on str()/f-string, not just repr()
+# Credential redaction on str()/f-string, not just repr()
 # ---------------------------------------------------------------------------
 class TestConfigStrDoesNotLeakCredentials:
     _SECRET_URL = "amqp://user:topsecret@127.0.0.1:5672/"
@@ -36,7 +37,6 @@ class TestConfigStrDoesNotLeakCredentials:
             service_name="svc",
             rabbitmq_url=self._SECRET_URL,
             blob_conn_string=self._SECRET_CONN,
-            dev_mode=True,
         )
 
     def test_str_hides_broker_password_and_account_key(self):
@@ -59,7 +59,7 @@ class TestConfigStrDoesNotLeakCredentials:
         assert str(cfg) == repr(cfg)
 
     def test_logging_percent_s_does_not_leak(self):
-        # The footgun in the finding: logger.info("cfg: %s", config)
+        # The footgun: logger.info("cfg: %s", config)
         cfg = self._cfg()
         rendered = "loaded config: %s" % cfg
         assert "topsecret" not in rendered
@@ -67,7 +67,7 @@ class TestConfigStrDoesNotLeakCredentials:
 
 
 # ---------------------------------------------------------------------------
-# DOCS-2: surrounding-quote stripping for env-delivered connection settings
+# Surrounding-quote stripping for env-delivered connection settings
 # ---------------------------------------------------------------------------
 class TestStripSurroundingQuotes:
     def test_strips_matched_double_quotes(self):
@@ -92,7 +92,6 @@ class TestStripSurroundingQuotes:
 class TestFromEnvStripsQuotes:
     def test_quoted_rabbitmq_url_is_parsed_as_amqp(self, monkeypatch):
         # Simulate docker --env-file delivering the quoted .env value verbatim.
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", '"amqp://guest:guest@127.0.0.1:5672/"')
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", '"AccountKey=k;"')
         cfg = SDKConfig.from_env("svc")
@@ -101,7 +100,6 @@ class TestFromEnvStripsQuotes:
 
     def test_quoted_cleartext_nonlocal_url_still_refused(self, monkeypatch):
         # The guard must fire on the stripped value, not be bypassed by quotes.
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", '"amqp://user:pass@10.255.255.1:5672/"')
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", '"AccountKey=k;"')
         with pytest.raises(ValueError):
@@ -109,7 +107,7 @@ class TestFromEnvStripsQuotes:
 
 
 # ---------------------------------------------------------------------------
-# ADVERSARIAL-1: non-UTF-8 body dead-letters cleanly with no traceback
+# Non-UTF-8 body dead-letters cleanly with no traceback
 # ---------------------------------------------------------------------------
 def _make_message(body: bytes):
     msg = MagicMock()

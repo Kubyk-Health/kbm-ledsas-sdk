@@ -1,0 +1,16 @@
+# Kept out of the image build context: local settings (credentials), virtual
+# environments, caches, and files the image does not need.
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/
+deploy/
+scripts/
+conftest.py
+pytest.ini
+.git/

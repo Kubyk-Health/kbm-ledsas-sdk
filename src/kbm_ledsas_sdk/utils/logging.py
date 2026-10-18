@@ -235,7 +235,7 @@ _CONTROL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 # The same, except the newline (kept between the lines of a traceback).
 _CONTROL_CHARS_BUT_NEWLINE = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029]")
 # Plain values that need no quotes in a key=value pair.
-_PLAIN_VALUE = re.compile(r"^[A-Za-z0-9_.:/@+-]+$")
+_PLAIN_VALUE = re.compile(r"[A-Za-z0-9_.:/@+-]+")  # used with fullmatch
 
 
 def _escape_control(match: "re.Match[str]") -> str:
@@ -264,7 +264,7 @@ def _format_value(value: Any) -> str:
             text = json.dumps(value, default=_safe_repr)
         except Exception:
             text = _safe_repr(value)
-    if _PLAIN_VALUE.match(text):
+    if _PLAIN_VALUE.fullmatch(text):
         return text
     return json.dumps(text)
 
@@ -352,19 +352,42 @@ class TextFormatter(logging.Formatter):
 # connection string or SAS URL ("AccountKey=...", "SharedAccessSignature=...",
 # "sig=..."). Masked by redact_secrets().
 # A user info already masked ("***@", "***:***@") is left as it is.
-_URL_USERINFO = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]*://)(?!\*\*\*(?::\*\*\*)?@)[^\s/@'\"<>]+@")
+# Any URL quoted in a text (up to a space, a quote or an angle bracket);
+# its user info is found like a broker URL's (see _userinfo_end_any).
+_ANY_URL = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)([^\s'\"<>]+)")
 # A value already masked ("password=***" in a broker URL's query, possibly
 # followed by its masked fragment "#***" and by the punctuation that ends
 # the sentence, as in "...?password=***)." ) is left as it is: it is not
 # taken for the start of a value running to the next ";", which would drop
 # that punctuation.
 _ALREADY_MASKED_VALUE = r"(?!\*\*\*(?:#\*\*\*)?[.,:!?)\]}]*(?:[&;\s'\"<>]|$))"
+_SECRET_KEYS = r"AccountKey|SharedAccessSignature|SharedAccessKey|Password|Pwd|account_key"
 _CONNECTION_STRING_SECRET = re.compile(
-    r"(?i)\b(AccountKey|SharedAccessSignature|SharedAccessKey|Password|Pwd)="
-    + _ALREADY_MASKED_VALUE
-    + r"[^;\s'\"]+"
+    r"(?i)\b(" + _SECRET_KEYS + r")=" + _ALREADY_MASKED_VALUE + r"[^;\s'\"]+"
 )
-_SAS_SIGNATURE = re.compile(r"(?i)([?&]sig=)" + _ALREADY_MASKED_VALUE + r"[^&\s'\"]+")
+# The same keys with a quoted value, in any of the forms a configuration
+# dump or a repr shows them: AccountKey="...", 'account_key': '...',
+# "AccountKey": "...".
+_QUOTED_SECRET = re.compile(
+    r"(?i)\b(" + _SECRET_KEYS + r")([\"']?\s*[=:]\s*)([\"'])(?!\*\*\*\3)[^\"'\n]*\3"
+)
+# A bearer token: any token after an "Authorization:" header's "Bearer"
+# ("Authorization: Bearer eyJ..."), and elsewhere a "Bearer" followed by
+# something shaped like a token (at least 16 token characters, or a JWT's
+# dotted form), so prose ("the bearer of bad news") is left alone.
+_BEARER_TOKEN_CHARS = r"[A-Za-z0-9\-._~+/]+=*"
+_BEARER_HEADER_TOKEN = re.compile(
+    r"(?i)\b(Authorization[\"']?\s*[:=]\s*[\"']?Bearer\s+)(?!\*\*\*)" + _BEARER_TOKEN_CHARS
+)
+_BEARER_TOKEN = re.compile(
+    r"(?i)\b(Bearer\s+)(?!\*\*\*)"
+    r"(?=[A-Za-z0-9\-._~+/]{16}|[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.)" + _BEARER_TOKEN_CHARS
+)
+# Query parameters that carry a credential in a URL of any scheme: a SAS
+# signature, an OAuth code or token.
+_SAS_SIGNATURE = re.compile(
+    r"(?i)([?&](?:sig|code|access_token|token)=)" + _ALREADY_MASKED_VALUE + r"[^&\s'\"]+"
+)
 # A broker URL quoted in a text (up to a space, a quote or an angle bracket).
 _BROKER_URL = re.compile(r"(?i)\bamqps?://[^\s'\"<>]+")
 # Punctuation that ends a sentence rather than the URL it follows.
@@ -427,6 +450,39 @@ def _userinfo_end(rest: str) -> int:
     return at
 
 
+# A host and port ("127.0.0.1:10000", "acct.blob.core.windows.net:443",
+# "[::1]:10000"): the authority of a URL without user info.
+_HOST_AND_PORT = re.compile(r"(?:\[[0-9A-Fa-f:.]*\]|[A-Za-z0-9.\-]+):\d*")
+
+
+def _userinfo_end_any(rest: str) -> int:
+    """The index of the ``@`` that ends the user info of ``rest`` (a URL
+    of any scheme after its ``scheme://``), or -1: the last ``@`` before
+    the first ``/``; else, when the text before the first ``/`` holds a
+    ``:`` (a password with an unencoded ``/``: ``https://svc:pa/ss@host/``),
+    the last ``@`` before the query and the fragment. A ``@`` in the path
+    of a URL without user info (``https://host/a@b``) is left alone, as is
+    one in the path of a URL with a port (``http://host:10000/c/a@b``):
+    when the text before the first ``/`` is a host and a port, the ``@`` is
+    taken for the end of a user info only when no other ``/`` comes
+    between (``https://svc:12/34@host/``)."""
+    slash = rest.find("/")
+    at = rest.rfind("@", 0, len(rest) if slash == -1 else slash)
+    if at == -1 and slash != -1 and ":" in rest[:slash]:
+        at = rest.rfind("@", 0, _query_or_fragment_start(rest))
+        if at != -1 and _HOST_AND_PORT.fullmatch(rest[:slash]) and "/" in rest[slash + 1 : at]:
+            at = -1
+    return at
+
+
+def _mask_any_url_userinfo(match: "re.Match[str]") -> str:
+    scheme, rest = match.group(1), match.group(2)
+    at = _userinfo_end_any(rest)
+    if at <= 0:
+        return match.group(0)
+    return f"{scheme}{_masked_userinfo(rest[:at])}@{rest[at + 1:]}"
+
+
 def mask_url_secrets(url: str) -> str:
     """``url`` with what may carry a secret masked, read as text (it works
     on a URL no parser accepts):
@@ -476,17 +532,27 @@ def redact_secrets(text: str) -> str:
     """``text`` with the secrets it may quote masked: the user name and
     password of a URL (``amqp://***:***@host``), the query values and the
     fragment of a broker URL (``amqp://host/?password=***``, see
-    :func:`mask_url_secrets`), and the values of ``AccountKey=``,
+    :func:`mask_url_secrets`), the user info of a URL of any other scheme
+    (up to the last ``@`` before the host, so a password holding ``@`` or
+    ``/`` is masked whole), the values of ``AccountKey=``,
     ``SharedAccessSignature=``, ``SharedAccessKey=``, ``Password=`` /
-    ``Pwd=`` and of a ``sig=`` query parameter (``***``). Used on texts the
+    ``Pwd=`` and ``account_key=`` (quoted or not), of a ``Bearer`` token
+    and of the ``sig=``, ``code=``, ``access_token=`` and ``token=`` query
+    parameters (``***``). Used on texts the
     SDK logs or serves that come from code it does not control, such as the
     exception a health check raised."""
     if not isinstance(text, str):
         return text
     if "://" in text:
         text = _BROKER_URL.sub(_mask_broker_url, text)
-    text = _URL_USERINFO.sub(r"\1***:***@", text)
+    if "://" in text:
+        text = _ANY_URL.sub(_mask_any_url_userinfo, text)
+    text = _QUOTED_SECRET.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}***{m.group(3)}", text
+    )
     text = _CONNECTION_STRING_SECRET.sub(lambda m: f"{m.group(1)}=***", text)
+    text = _BEARER_HEADER_TOKEN.sub(r"\1***", text)
+    text = _BEARER_TOKEN.sub(r"\1***", text)
     return _SAS_SIGNATURE.sub(r"\1***", text)
 
 
@@ -815,9 +881,12 @@ def json_log_formatter(datefmt: str | None = None) -> logging.Formatter:
         logging.basicConfig(level=logging.INFO, handlers=[handler])
 
     Args:
-        datefmt: Optional strftime format for the ``timestamp`` field. By
-            default the timestamp is UTC ISO 8601 with milliseconds
-            (``2026-10-14T05:43:15.123Z``).
+        datefmt: Optional strftime format for the ``timestamp`` field.
+            It overrides the default UTC ISO 8601 format with
+            milliseconds and a ``Z`` suffix (``2026-10-14T05:43:15.123Z``):
+            the timestamp is then formatted by ``logging.Formatter``
+            (local time, no milliseconds unless the format asks for
+            them). Leave it unset to keep UTC timestamps.
 
     Returns:
         A ``logging.Formatter`` that emits one JSON object per record,

@@ -274,7 +274,7 @@ class TestTimeoutIntegration:
         # Handle command - should timeout
         await app._handle_command(sample_command, semaphore)
 
-        # Retry budget left: no reply for this attempt (v0.3.5)
+        # Retry budget left: no reply for this attempt (v0.3.6)
         assert mock_transport.sent_responses == []
 
         # Should be NACKed with requeue (retryable)

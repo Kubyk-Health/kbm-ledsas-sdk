@@ -8,10 +8,16 @@ consumes commands from RabbitMQ, runs the handler, and
 
 Quick Start:
     import logging
+    import kbm_ledsas_sdk
     from kbm_ledsas_sdk import ServiceApp, errors
     from kbm_ledsas_sdk.models import BlobRef
 
-    logging.basicConfig(level=logging.INFO)
+    # Your own log records in the SDK's JSON format, extra= fields
+    # included. The SDK writes its own records itself, in
+    # KBM_LEDSAS_LOG_FORMAT (JSON by default), once app.run() starts.
+    handler = logging.StreamHandler()
+    handler.setFormatter(kbm_ledsas_sdk.json_log_formatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
 
     app = ServiceApp(service_name="csv-processor")
 
@@ -54,28 +60,34 @@ Quick Start:
         app.run()
 
 Run with:
+    # Local RabbitMQ and the Azurite storage emulator: Azurite's documented
+    # development account (devstoreaccount1) and its well-known public key,
+    # not a secret (it only works against the emulator). For a real
+    # storage account, use the connection string from its access keys.
     export KBM_LEDSAS_RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672/
-    export KBM_LEDSAS_BLOB_CONN_STRING="DefaultEndpointsProtocol=http;..."
+    export KBM_LEDSAS_BLOB_CONN_STRING="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
     python my_service.py
 
 The service also exposes liveness/readiness HTTP endpoints at
 ``http://127.0.0.1:${KBM_LEDSAS_HEALTH_PORT:-8090}/health`` and ``/ready``
 (loopback only by default; set ``KBM_LEDSAS_HEALTH_HOST=0.0.0.0`` to
-bind on all interfaces). See the release tarball's
-``SDK_API_REFERENCE.md`` for the full API.
+bind on all interfaces). See the SDK API reference
+(https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/docs/SDK_API_REFERENCE.md) for the full API.
 """
 
 from . import models
 from .app import ServiceApp
+from .blob.operations import BlobOperations
 from .models import errors
 from .runtime.context import ExecutionContext
 from .utils.logging import json_log_formatter
 
-__version__ = "0.3.5"
+__version__ = "0.3.6"
 
 __all__ = [
     "ServiceApp",
     "ExecutionContext",
+    "BlobOperations",
     "models",
     "errors",
     "json_log_formatter",

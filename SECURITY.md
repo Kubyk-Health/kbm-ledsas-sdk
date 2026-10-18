@@ -15,13 +15,11 @@ always running the most recent release.
 **Please do not report security vulnerabilities through public GitHub issues,
 discussions, or pull requests.**
 
-Instead, use one of the following private channels:
-
-1. **GitHub Private Vulnerability Reporting** (preferred): open the repository's
-   **Security** tab → **Report a vulnerability**. This opens a private advisory
-   visible only to maintainers.
-2. **Email**: send details to **security@kebormed.com**. Encrypt with our PGP
-   key if the report is sensitive (available on request).
+Instead, use **GitHub Private Vulnerability Reporting**: open the repository's
+**Security** tab → **Report a vulnerability**. This opens a private advisory,
+visible only to you and the maintainers, in which we discuss the report, prepare
+the fix and publish the advisory. If you cannot use GitHub, email
+**security@kebormed.com** and we will open the private advisory for you.
 
 Please include, where possible:
 
@@ -33,7 +31,11 @@ Please include, where possible:
 
 - **Acknowledgement** of your report within **3 business days**.
 - An initial **assessment and severity triage** within **10 business days**.
-- Coordinated disclosure: we will work with you on a fix and a public advisory,
-  and credit you (if you wish) once a patched release is available.
+- **A fix or a documented mitigation within 90 days** of the report (sooner for
+  critical issues), released as a patch release of the latest minor version.
+- **Coordinated disclosure:** we publish the advisory (with a CVE where one
+  applies) when the fixed release is available, or at 90 days if no fix is
+  possible by then, and credit you if you wish. Please do not disclose the issue
+  publicly before that.
 
 Thank you for helping keep the KeborMed LEDSAS SDK and its users safe.

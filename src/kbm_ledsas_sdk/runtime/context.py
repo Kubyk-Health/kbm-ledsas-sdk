@@ -6,7 +6,6 @@ The ExecutionContext provides all the APIs a handler needs to:
 - Download/upload blobs
 - Emit status updates
 - Access structured logging
-- Access SDK configuration
 
 The context is scoped to a single command execution and is immutable after creation.
 """
@@ -14,14 +13,27 @@ The context is scoped to a single command execution and is immutable after creat
 import enum
 import logging
 from datetime import UTC, datetime
+from typing import Any
 
 from ..blob.operations import BlobOperations, _find_lone_surrogate, _mark_non_retryable
 from ..models.envelope import Envelope
 from ..models.messages import Status
 from ..transport.base import Transport
+from ..utils.logging import masked_logger
 
 
-def _status_text(field: str, value: object, allowed: str):
+def _handler_logger(command_name: str) -> logging.Logger:
+    """``ctx.logger``: the stdlib logger ``handler.<command_name>``, as in
+    earlier releases (outside the ``kbm_ledsas_sdk`` hierarchy, so its
+    records propagate to the application's root handlers and follow the
+    application's levels), with the SDK's secret mask attached. Created on
+    the first ``ctx.logger`` access only: the handler code that accesses it
+    runs only for registered command names, so a sender choosing new names
+    creates no loggers."""
+    return masked_logger(f"handler.{command_name}")
+
+
+def _status_text(field: str, value: object, allowed: str) -> str | None:
     """``value`` as the text ``emit_status`` sends for ``field``: a ``str``
     as it is (a ``str`` Enum included), ``None`` for ``note``, an ``Enum``
     member whose value is a ``str`` as that value. Anything else raises
@@ -44,15 +56,17 @@ class ExecutionContext:
     - payload: Command payload (dict — same dict as the ``req``
       argument the handler receives; exposed here for convenience
       when the payload also needs to be referenced via ``ctx``)
-    - blob: BlobOperations interface for download/upload
-    - logger: stdlib logger pre-configured with command name
-      (``handler.<envelope.name>``). NOTE: this is a vanilla
-      :class:`logging.Logger`; structured fields go in ``extra={...}``,
-      not as keyword arguments.
+    - blob: the blob storage interface for download/upload
+      (:class:`kbm_ledsas_sdk.BlobOperations`, for type annotations)
+    - logger: the stdlib :class:`logging.Logger` ``handler.<command name>``
+      (configured by the application, not the SDK: its records propagate
+      to the root logger; secrets in them are masked). Structured fields
+      go in ``extra={...}``, not as keyword arguments.
     - message_id: Unique message identifier (UUID, equivalent to
       ``ctx.envelope.message_id``)
     - correlation_id: Correlation ID for distributed tracing
-    - trace_id: W3C traceparent for distributed tracing
+    - trace_id: opaque distributed-tracing id (URL-safe;
+      ``[A-Za-z0-9_.:-]+``)
     - idempotency_key: Idempotency key for replay safety
     - deadline: Handler deadline (or None if no deadline)
     - job_id: Optional business-level job identifier (or None)
@@ -76,8 +90,8 @@ class ExecutionContext:
         self,
         transport: Transport,
         envelope: Envelope,
-        payload: dict,
-    ):
+        payload: "dict[str, Any]",
+    ) -> None:
         """
         Initialize execution context.
 
@@ -90,26 +104,32 @@ class ExecutionContext:
         self._envelope = envelope
         self._payload = payload
         self._blob_ops = transport.get_blob_operations()
-        self._logger = logging.getLogger(f"handler.{envelope.name}")
+        self._logger: logging.Logger | None = None
 
     @property
     def envelope(self) -> Envelope:
-        """Get the current command envelope (read-only)."""
+        """Get the current command envelope (read-only: the envelope is
+        frozen, so assigning one of its fields raises
+        ``pydantic.ValidationError``)."""
         return self._envelope
 
     @property
-    def payload(self) -> dict:
+    def payload(self) -> "dict[str, Any]":
         """Get the command payload (read-only)."""
         return self._payload
 
     @property
     def blob(self) -> BlobOperations:
-        """Get blob operations interface for download/upload."""
+        """Get the blob storage interface (``kbm_ledsas_sdk.BlobOperations``)
+        for download/upload."""
         return self._blob_ops
 
     @property
     def logger(self) -> logging.Logger:
-        """Get structured logger pre-configured with command name."""
+        """Get the handler logger, ``handler.<command name>`` (a plain
+        stdlib logger that propagates to the application's root handlers)."""
+        if self._logger is None:
+            self._logger = _handler_logger(self._envelope.name)
         return self._logger
 
     @property
@@ -130,7 +150,8 @@ class ExecutionContext:
 
     @property
     def trace_id(self) -> str:
-        """Get W3C traceparent for distributed tracing."""
+        """Get the opaque distributed-tracing id (URL-safe;
+        ``[A-Za-z0-9_.:-]+``)."""
         return self._envelope.trace_id
 
     @property
@@ -148,7 +169,12 @@ class ExecutionContext:
         """Get optional job ID for business-level tracking (or None if not set)."""
         return self._envelope.job_id
 
-    async def emit_status(self, stage: str, progress: float, note: str | None = None) -> None:
+    async def emit_status(
+        self,
+        stage: "str | enum.Enum",
+        progress: float,
+        note: "str | enum.Enum | None" = None,
+    ) -> None:
         """
         Emit a status update during handler execution.
 
@@ -206,7 +232,7 @@ class ExecutionContext:
                 _mark_non_retryable(err, str(err))
                 raise err
 
-        payload = {"stage": stage, "progress": progress}
+        payload: dict[str, Any] = {"stage": stage, "progress": progress}
         if note is not None:
             payload["note"] = note
 

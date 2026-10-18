@@ -72,6 +72,10 @@ def container_name_problem(name: Any) -> str | None:
     return None
 
 
+# Longest blob name the storage service accepts (characters).
+BLOB_NAME_MAX = 1024
+
+
 def blob_name_problem(name: str) -> str | None:
     """Why ``name`` (a blob name inside its container, without the ``/``
     that follows the container in a URI) is not a name the SDK writes or
@@ -308,9 +312,12 @@ class BlobRef(BaseModel):
                 # before validate_uri_format runs, with a message that
                 # does not say what is wrong ("unable to parse raw data as
                 # a unicode string"): refused here, by the same rule.
-                refused = refused_character(uri)
-                if refused is not None and refused[1] == LONE_SURROGATE:
-                    raise ValueError(_lone_surrogate_in_uri(refused[0]))
+                # Looked for on its own (not only as the first refused
+                # character), so a control character before it does not
+                # bring the opaque message back.
+                surrogate = next((ord(c) for c in uri if 0xD800 <= ord(c) <= 0xDFFF), None)
+                if surrogate is not None:
+                    raise ValueError(_lone_surrogate_in_uri(surrogate))
         return data
 
     @model_validator(mode="wrap")
@@ -505,6 +512,11 @@ class BlobRef(BaseModel):
         # blob than the one read or written: .path would not be the name
         # read, so a check on it (a prefix, say) would not hold.
         name_problem = blob_name_problem(parsed.path[1:])
+        if name_problem is None and len(parsed.path[1:]) > BLOB_NAME_MAX:
+            name_problem = (
+                f"is longer than {BLOB_NAME_MAX} characters, the longest "
+                f"blob name storage accepts"
+            )
         if name_problem == "is empty":
             raise ValueError(f"URI missing blob path: {_shown_uri(v)}")
         if name_problem is not None:

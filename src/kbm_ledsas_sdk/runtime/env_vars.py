@@ -9,7 +9,7 @@ Usage:
 
     # Get spec for a variable
     spec = get_env_var("KBM_LEDSAS_LOG_LEVEL")
-    print(spec.description)  # "Logging verbosity (DEBUG/INFO/WARNING/ERROR)"
+    print(spec.description)  # "Logging level"
     print(spec.default)      # "INFO"
 """
 
@@ -43,9 +43,6 @@ class EnvVarSpec:
     deprecated: bool = False
     """Whether this variable is deprecated and should not be used"""
 
-    deprecated_by: str | None = None
-    """If deprecated, what to use instead (e.g., 'KBM_LEDSAS_CONTAINER')"""
-
     valid_values: list[str] | None = None
     """List of valid values, or None if any string is valid"""
 
@@ -61,11 +58,6 @@ BOOLEAN_RULE = (
 
 
 # Canonical registry of customer-facing SDK environment variables.
-#
-# Retired variables are intentionally absent: they no longer
-# configure anything and are accepted but ignored (config.from_env logs a
-# one-time warning when one is set). Deployment tooling that enumerates
-# ENV_VAR_REGISTRY should not nudge operators toward a retired knob.
 ENV_VAR_REGISTRY: list[EnvVarSpec] = [
     EnvVarSpec(
         name="KBM_LEDSAS_SERVICE_NAME",
@@ -227,6 +219,32 @@ ENV_VAR_REGISTRY: list[EnvVarSpec] = [
         required=False,
     ),
     EnvVarSpec(
+        name="KBM_LEDSAS_HEARTBEAT",
+        description=(
+            "AMQP heartbeat interval in seconds the SDK asks the broker "
+            "for, so a broker or network path that stops answering is "
+            "detected within about 3 x (this interval + 1) s, about 50 s "
+            "at the default 15. Used unless the "
+            "broker URL sets its own ?heartbeat=. Range 0-600; 0 turns "
+            "heartbeats off. Default 15."
+        ),
+        default="15",
+        required=False,
+    ),
+    EnvVarSpec(
+        name="KBM_LEDSAS_DEPLOYMENT_ID",
+        description=(
+            "Identifier of the deployed build, reported as deployment_id "
+            "in the health responses. Optional. KBM_LASTCOMMITID, the "
+            "same identifier under another name, is read when "
+            "KBM_LEDSAS_DEPLOYMENT_ID is unset or blank. Surrounding "
+            "quotes and whitespace are removed; unset or blank on both "
+            "omits deployment_id."
+        ),
+        default=None,
+        required=False,
+    ),
+    EnvVarSpec(
         name="KBM_LEDSAS_DEBUG",
         description=(
             "If true, configuration-error startup failures dump the "
@@ -306,29 +324,18 @@ def _service_link_names(environ: "Iterable[str]") -> "set":
     }
 
 
-def _retired_settings() -> "set":
-    """The retired variables of this build (they configure nothing; their
-    own WARNING asks to remove them), read where they are defined."""
-    from . import config as config_module
-
-    return set(getattr(config_module, "_LEGACY_MODE_VARS", ()))
-
-
 def unknown_settings(
     environ: "Mapping[str, str]", known: "Iterable[str]"
 ) -> "list[tuple[str, str | None]]":
     """The variables in ``environ`` whose name starts with ``KBM_LEDSAS_``
     (in any letter case) but that are not in ``known``, sorted, each with
     the closest known name (or None): ``[("KBM_LEDSAS_PREFECH",
-    "KBM_LEDSAS_PREFETCH")]``. A retired variable is never the closest
-    name (it configures nothing, and its own WARNING asks to remove it):
-    ``KBM_LEDSAS_TRANSPORT_MODE`` gets no suggestion rather than a retired
-    one. The variables Kubernetes sets for a Service in the namespace
+    "KBM_LEDSAS_PREFETCH")]``.
+    The variables Kubernetes sets for a Service in the namespace
     (``KBM_LEDSAS_<NAME>_SERVICE_HOST`` and the rest of its group) are not
     settings anyone set and are left out. Values are never read."""
     known_names = sorted(set(known))
-    retired = _retired_settings()
-    candidates = [name for name in known_names if name not in retired]
+    candidates = known_names
     service_links = _service_link_names(environ)
     found = []
     for name in environ:

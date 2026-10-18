@@ -1,7 +1,7 @@
 # The LEDSAS SDK and its runtime dependencies come pre-installed in this base
 # image, and the base image tag IS the SDK version. Do not install the SDK again.
 # To move the service to another SDK release, change the tag.
-FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.5
+FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6
 
 # An image inherits the labels of the image it is built from, and the base
 # image's labels describe the base image (its name, version, license and

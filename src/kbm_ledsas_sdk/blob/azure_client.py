@@ -7,14 +7,12 @@ streaming for multi-GB file transfers with minimal memory footprint.
 
 import base64
 import binascii
-import logging  # noqa: F401
 import uuid
 from collections.abc import AsyncIterator, Callable
 from urllib.parse import urlsplit
 
 from azure.core import MatchConditions
 from azure.core.exceptions import (
-    AzureError,  # noqa: F401
     ClientAuthenticationError,
     HttpResponseError,
     ResourceExistsError,
@@ -184,6 +182,19 @@ def _not_found_message(exc: BaseException, streaming: bool = False) -> str:
     return f"{what} not found for streaming download" if streaming else f"{what} not found"
 
 
+# Hosts an http:// storage endpoint may name without a warning (this machine).
+_LOOPBACK_STORAGE_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+# How to fix an unusable KBM_LEDSAS_BLOB_CONN_STRING, self-contained (the
+# reader may have only the installed package).
+_CONN_STRING_HINT = (
+    "Use the connection string from the storage account's access keys or, "
+    "for the local storage emulator (Azurite), the development connection "
+    "string the emulator documents (its well-known account and key)."
+)
+
+
 def _connection_string_problem(connection_string: str, service_client) -> str | None:
     """What makes a connection string the storage client accepted unusable,
     or None. Checked at start, because the client itself only fails on
@@ -192,12 +203,26 @@ def _connection_string_problem(connection_string: str, service_client) -> str | 
     with HTTP 403, an AccountKey that is not base64 (a trailing ``=`` lost
     in a copy) fails every request with a signing error, and a BlobEndpoint
     without ``http://`` / ``https://`` is silently read as an https URL
-    (the local emulator speaks http). The value is never quoted."""
+    (the local emulator speaks http). An AccountKey that decodes to no
+    bytes at all (a placeholder such as ``...``) and an AccountKey or
+    BlobEndpoint with whitespace inside (an inline ``# comment``) are
+    refused too. The value is never quoted."""
     settings = {}
     for part in connection_string.strip().rstrip(";").split(";"):
         key, sep, value = part.partition("=")
         if sep:
             settings[key.strip().upper()] = value.strip()
+    for key, name in (("ACCOUNTKEY", "AccountKey"), ("BLOBENDPOINT", "BlobEndpoint")):
+        value = settings.get(key)
+        if value is not None and any(c.isspace() for c in value):
+            if "#" in value:
+                return (
+                    f"its {name} contains whitespace; it looks like it "
+                    "carries an inline '# comment', which docker run "
+                    "--env-file passes through verbatim, so put comments on "
+                    "their own line"
+                )
+            return f"its {name} contains whitespace"
     endpoint = settings.get("BLOBENDPOINT")
     if endpoint is not None:
         try:
@@ -226,15 +251,46 @@ def _connection_string_problem(connection_string: str, service_client) -> str | 
             "would refuse every request with HTTP 403"
         )
     if isinstance(account_key, str):
+        key = account_key.strip().encode("utf-8")
         try:
-            # The decoding the client uses to sign each request.
-            base64.b64decode(account_key.encode("utf-8"))
+            # The decoding the client uses to sign each request: it skips
+            # characters outside the base64 alphabet.
+            decoded = base64.b64decode(key)
+        except (binascii.Error, ValueError):
+            decoded = None
+        if decoded is not None and not decoded:
+            # A placeholder ("...", "!!!!", "=====") decodes to nothing.
+            return (
+                "its AccountKey is empty or a placeholder, so storage would "
+                "refuse every request (HTTP 403)"
+            )
+        try:
+            base64.b64decode(key, validate=True)
         except (binascii.Error, ValueError):
             return (
                 "its AccountKey is not valid base64; a trailing '=' or '==' "
                 "may have been cut off when it was copied"
             )
     return None
+
+
+def _cleartext_storage_host(service_client) -> str | None:
+    """The host of the storage endpoint when it is reached over ``http://``
+    and is not this machine (the account key or SAS then travels in
+    cleartext), else None."""
+    url = getattr(service_client, "url", None)
+    if not isinstance(url, str):
+        return None
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return None
+    if parts.scheme.lower() != "http" or host in _LOOPBACK_STORAGE_HOSTS:
+        return None
+    if host.startswith("127."):
+        return None
+    return host
 
 
 def build_blob_uri(container: str, path: str, version_id: str | None = None) -> str:
@@ -311,17 +367,23 @@ class AzureBlobClient:
             reason = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
             raise ValueError(
                 f"KBM_LEDSAS_BLOB_CONN_STRING is not a usable storage "
-                f"connection string ({reason[:200]}). Use the connection "
-                f"string from the storage account's access keys, or the "
-                f"local storage emulator's string from .env.example."
+                f"connection string ({reason[:200]}). {_CONN_STRING_HINT}"
             ) from None
         problem = _connection_string_problem(connection_string, self.service_client)
         if problem is not None:
             raise ValueError(
                 f"KBM_LEDSAS_BLOB_CONN_STRING is not a usable storage "
-                f"connection string ({problem}). Use the connection "
-                f"string from the storage account's access keys, or the "
-                f"local storage emulator's string from .env.example."
+                f"connection string ({problem}). {_CONN_STRING_HINT}"
+            )
+        cleartext_host = _cleartext_storage_host(self.service_client)
+        if cleartext_host is not None:
+            logger.warning(
+                "KBM_LEDSAS_BLOB_CONN_STRING reaches storage at %s over "
+                "http://: the requests, signed with the account key or SAS, "
+                "travel in cleartext. Use https:// (DefaultEndpointsProtocol="
+                "https) for any storage that is not on this machine.",
+                cleartext_host,
+                extra={"storage_host": cleartext_host},
             )
         self.default_container = default_container
 

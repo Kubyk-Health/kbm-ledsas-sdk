@@ -7,11 +7,13 @@ Supports true streaming for multi-GB file transfers with minimal memory footprin
 import json
 import logging
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 
 from kbm_ledsas_sdk.blob.azure_client import DEFAULT_CHUNK_SIZE, AzureBlobClient
 from kbm_ledsas_sdk.blob.operations import (
     BlobOperations,
+    BytesLike,
+    JSONValue,
     _check_container,
     _check_overwrite,
     _check_upload_data,
@@ -109,7 +111,7 @@ class DirectBlobOperations(BlobOperations):
         )
         return data
 
-    async def download_json(self, blob_ref: str | BlobRef) -> dict | list:
+    async def download_json(self, blob_ref: str | BlobRef) -> JSONValue:
         """
         Download blob contents and parse as JSON.
 
@@ -192,7 +194,7 @@ class DirectBlobOperations(BlobOperations):
     async def upload_bytes(
         self,
         container: str,
-        data: bytes,
+        data: BytesLike,
         path: str | None = None,
         overwrite: bool = False,
     ) -> BlobRef:
@@ -205,10 +207,12 @@ class DirectBlobOperations(BlobOperations):
             path: Optional blob path (auto-generated if not provided)
             overwrite: If True, replace an existing blob at ``path``.
                 Default False; set True for the idempotency-key replay
-                pattern (see QUICKSTART_DIRECT_MODE.md §3.5).
+                pattern (see it in the SDK API reference,
+                https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/docs/SDK_API_REFERENCE.md).
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         Raises:
             TypeError: If ``data`` is not bytes-like, ``container`` is
@@ -247,7 +251,7 @@ class DirectBlobOperations(BlobOperations):
     async def upload_json(
         self,
         container: str,
-        obj: dict,
+        obj: JSONValue,
         path: str | None = None,
         overwrite: bool = False,
     ) -> BlobRef:
@@ -256,12 +260,13 @@ class DirectBlobOperations(BlobOperations):
 
         Args:
             container: Container name
-            obj: Dict to serialize as JSON
+            obj: dict or list to serialize as JSON
             path: Optional blob path (auto-generated if not provided)
             overwrite: See :meth:`upload_bytes`.
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         Raises:
             TypeError: If obj cannot be serialized to JSON (ValueError for
@@ -282,8 +287,9 @@ class DirectBlobOperations(BlobOperations):
             data = json_str.encode("utf-8")
         except (TypeError, ValueError) as e:
             # The argument is the problem, so a retry fails the same way:
-            # one ERROR line (no traceback) and the non-retryable marker.
-            logger.error("Failed to serialize object to JSON: %s", e, extra={"error": str(e)})
+            # the non-retryable marker, and the handler layer's one ERROR
+            # for the command (it carries this text); DEBUG here.
+            logger.debug("Failed to serialize object to JSON: %s", e, extra={"error": str(e)})
             text = str(e)
             # Text with a lone surrogate has a JSON form (UTF-8 cannot encode
             # it): its refusal names the problem itself, said once.
@@ -333,7 +339,8 @@ class DirectBlobOperations(BlobOperations):
             overwrite: See :meth:`upload_bytes`.
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         Raises:
             TypeError: If text is not a string
@@ -425,7 +432,7 @@ class DirectBlobOperations(BlobOperations):
     async def upload_stream(
         self,
         container: str,
-        stream: AsyncIterator[bytes],
+        stream: AsyncIterable[BytesLike],
         path: str | None = None,
         progress_callback: Callable[[int], None] | None = None,
         overwrite: bool = False,
@@ -446,7 +453,8 @@ class DirectBlobOperations(BlobOperations):
             progress_callback: Optional callback(bytes_uploaded) for progress reporting
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         Raises:
             TypeError: If ``stream`` is not an async iterable or

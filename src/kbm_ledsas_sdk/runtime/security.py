@@ -11,7 +11,7 @@ preceding the actual ERROR.
 from __future__ import annotations
 
 import os
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from kbm_ledsas_sdk.utils.logging import mask_url_secrets, masked_logger
 
@@ -142,11 +142,11 @@ def check_url_userinfo_encoding(url: str) -> None:
     ``@``, ``#`` or ``?``.
 
     In a URL these characters end the user info (``@``) or start the
-    fragment / query (``#``, ``?``), so ``amqp://guest:p@ss#word@host/``
-    parses with host ``ss``: the connection goes to the wrong place and
-    any message naming the host would quote part of the password. The
-    error names the problem and the fix without repeating any part of
-    the URL.
+    fragment / query (``#``, ``?``), so a password ``p@ss#word`` written
+    unencoded into the URL makes the parser read the host as ``ss``: the
+    connection goes to the wrong place and any message naming the host
+    would quote part of the password. The error names the problem and
+    the fix without repeating any part of the URL.
     """
     rest = url.split("://", 1)[1] if "://" in url else ""
     if not rest:
@@ -216,17 +216,66 @@ def check_broker_url_shape(url: str) -> None:
         raise ValueError(
             "KBM_LEDSAS_RABBITMQ_URL must start with amqp:// (a broker on "
             "this machine) or amqps:// (TLS), e.g. "
-            "amqps://user:password@broker.example.com:5671/." + hint
+            "amqps://broker.example.com:5671/ (put user:password@ before "
+            "the host)." + hint
         )
     if not host:
         raise ValueError(
             "KBM_LEDSAS_RABBITMQ_URL names no host after the scheme, e.g. "
-            "amqp://guest:guest@127.0.0.1:5672/." + hint
+            "amqp://127.0.0.1:5672/." + hint
         )
     if port == 0:
         raise ValueError(
             "KBM_LEDSAS_RABBITMQ_URL has port 0; use the broker's port "
             "(5672 for amqp://, 5671 for amqps://)."
+        )
+
+
+# The broker URL query option of the client library that turns off TLS
+# certificate verification. The library reads it as it reads all its
+# options: the first value of the key spelled exactly ``no_verify_ssl``
+# (letter case counts); verification stays on when that value is "0" or
+# the key is absent, and is off for any other value (even "false", or an
+# empty value).
+_NO_VERIFY_SSL_OPTION = "no_verify_ssl"
+_no_verify_acknowledged = False
+
+
+def _verification_turned_off(query: str) -> bool:
+    """True when the client library would not verify the broker's TLS
+    certificate for a URL with this query string (the same rule as the
+    library's: ``query.get("no_verify_ssl", "0") != "0"``)."""
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        if key == _NO_VERIFY_SSL_OPTION:
+            return value != "0"
+    return False
+
+
+def _check_tls_verification(query: str, allow_insecure: bool) -> None:
+    """Refuse a broker URL whose query turns off TLS certificate
+    verification (``no_verify_ssl`` with any value except ``0``: the
+    client library then accepts any certificate, so a machine in the
+    path can read the credentials and the messages), unless
+    KBM_LEDSAS_ALLOW_INSECURE_AMQP acknowledges it: then one WARNING per
+    process names the option. ``no_verify_ssl=0`` keeps verification on
+    and is accepted."""
+    global _no_verify_acknowledged
+    if not _verification_turned_off(query):
+        return
+    if not allow_insecure:
+        raise ValueError(
+            "KBM_LEDSAS_RABBITMQ_URL sets no_verify_ssl to a value other "
+            "than 0, which turns off the verification of the broker's TLS "
+            "certificate. Remove it (trust a private certificate authority "
+            f"with ?cafile=<path> instead), or set {ALLOW_INSECURE_AMQP_ENV}=1 "
+            "to accept an unverified broker."
+        )
+    if not _no_verify_acknowledged:
+        _no_verify_acknowledged = True
+        logger.warning(
+            "KBM_LEDSAS_RABBITMQ_URL sets no_verify_ssl: the broker's TLS "
+            "certificate is not verified. %s acknowledged; proceeding.",
+            ALLOW_INSECURE_AMQP_ENV,
         )
 
 
@@ -243,6 +292,8 @@ def check_transport_security(url: str) -> None:
     parse to the wrong host. Then the URL's shape is checked (see
     :func:`check_broker_url_shape`): only ``amqp://`` and ``amqps://``
     with a host are accepted, so no other spelling can bypass this check.
+    A URL whose query sets ``no_verify_ssl`` to any value except ``0`` (TLS
+    certificate verification off) needs the same acknowledgment (see :func:`_check_tls_verification`).
     """
     # The acknowledgment is read (and an unrecognized value refused) on
     # every check, not only when it is needed.
@@ -250,6 +301,7 @@ def check_transport_security(url: str) -> None:
     check_url_userinfo_encoding(url)
     check_broker_url_shape(url)
     parsed = urlparse(url)
+    _check_tls_verification(parsed.query, allow_insecure)
     if parsed.scheme.lower() != "amqp":
         return  # amqps://: TLS
     host = (parsed.hostname or "").lower()

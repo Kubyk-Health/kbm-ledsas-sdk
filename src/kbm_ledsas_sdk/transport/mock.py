@@ -11,9 +11,9 @@ Use this in unit tests to test SDK logic without real infrastructure.
 """
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 
-from ..blob.operations import BlobOperations
+from ..blob.operations import BlobOperations, BytesLike, JSONValue
 from ..models.blob import BlobRef
 from ..models.messages import Command, Response, Status
 from .base import Transport
@@ -49,7 +49,7 @@ class MockBlobOperations(BlobOperations):
             raise FileNotFoundError(f"Blob not found: {blob_ref.uri}")
         return self.blobs[blob_ref.uri]
 
-    async def download_json(self, blob_ref: BlobRef) -> dict:
+    async def download_json(self, blob_ref: BlobRef) -> JSONValue:
         """Download and parse JSON from mock storage."""
         import json
 
@@ -59,7 +59,7 @@ class MockBlobOperations(BlobOperations):
     async def upload_bytes(
         self,
         container: str,
-        data: bytes,
+        data: BytesLike,
         path: str | None = None,
         overwrite: bool = False,
     ) -> BlobRef:
@@ -85,7 +85,7 @@ class MockBlobOperations(BlobOperations):
     async def upload_json(
         self,
         container: str,
-        obj: dict,
+        obj: JSONValue,
         path: str | None = None,
         overwrite: bool = False,
     ) -> BlobRef:
@@ -114,7 +114,7 @@ class MockBlobOperations(BlobOperations):
     async def upload_stream(
         self,
         container: str,
-        stream: AsyncIterator[bytes],
+        stream: AsyncIterable[BytesLike],
         path: str | None = None,
         progress_callback=None,
         overwrite: bool = False,
@@ -126,13 +126,23 @@ class MockBlobOperations(BlobOperations):
         data = b"".join(chunks)
         return await self.upload_bytes(container, data, path, overwrite=overwrite)
 
-    async def download_stream(self, blob_ref: BlobRef) -> AsyncIterator[bytes]:
+    async def download_stream(
+        self,
+        blob_ref: str | BlobRef,
+        chunk_size: int = 4096,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> AsyncIterator[bytes]:
         """Download blob as async stream from mock storage."""
+        if isinstance(blob_ref, str):
+            blob_ref = BlobRef.from_uri(blob_ref)
         data = await self.download_bytes(blob_ref)
-        # Yield in chunks (4KB default)
-        chunk_size = 4096
+        done = 0
         for i in range(0, len(data), chunk_size):
-            yield data[i : i + chunk_size]
+            chunk = data[i : i + chunk_size]
+            done += len(chunk)
+            if progress_callback is not None:
+                progress_callback(done, len(data))
+            yield chunk
 
 
 class MockTransport(Transport):

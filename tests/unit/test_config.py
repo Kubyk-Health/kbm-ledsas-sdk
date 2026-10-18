@@ -383,7 +383,7 @@ class TestSDKConfigRepr:
         assert "tenant=None" in repr_str
 
     def test_repr_full(self):
-        """Repr with full config — and no retired dev_mode field."""
+        """Repr with full config carries the configured fields."""
         config = SDKConfig(
             service_name="my_service",
             tenant="acme",
@@ -394,7 +394,5 @@ class TestSDKConfigRepr:
 
         assert "my_service" in repr_str
         assert "acme" in repr_str
-        # The retired dev_mode field must not leak into the repr.
-        assert "dev_mode" not in repr_str
         assert "concurrency=20" in repr_str
         assert "log_level=DEBUG" in repr_str

@@ -8,6 +8,8 @@ These error types control retry behavior and DLQ routing:
   is in the past, so a retry would just exceed it again; goes to DLQ)
 """
 
+__all__ = ["SDKError", "Retryable", "Permanent", "DeadlineExceeded"]
+
 
 def _checked_user_message(user_message: object) -> "str | None":
     """``user_message`` as given, or a TypeError: a caller-facing message
@@ -58,7 +60,7 @@ class Retryable(SDKError):
 
     def __init__(self, message: str, user_message: str | None = None):
         super().__init__(message)
-        self.user_message = _checked_user_message(user_message)
+        self.user_message: str | None = _checked_user_message(user_message)
 
 
 class Permanent(SDKError):
@@ -89,7 +91,7 @@ class Permanent(SDKError):
 
     def __init__(self, message: str, user_message: str | None = None):
         super().__init__(message)
-        self.user_message = _checked_user_message(user_message)
+        self.user_message: str | None = _checked_user_message(user_message)
 
 
 class DeadlineExceeded(SDKError):
@@ -124,4 +126,4 @@ class DeadlineExceeded(SDKError):
 
     def __init__(self, message: str = "", user_message: str | None = None):
         super().__init__(message)
-        self.user_message = _checked_user_message(user_message)
+        self.user_message: str | None = _checked_user_message(user_message)

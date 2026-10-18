@@ -1,10 +1,5 @@
-# Code owners for the KeborMed LEDSAS SDK.
-#
-# These owners are automatically requested for review when someone opens a pull
-# request that modifies matching files. Requires the referenced GitHub team to
-# exist in the Kubyk-Health org (create @Kubyk-Health/ledsas-maintainers and add
-# the maintainers before enabling "Require review from Code Owners" in branch
-# protection).
+# Code owners for kbm-ledsas-sdk; automatically requested for review on pull
+# requests that modify matching files.
 
 # Default owners for everything in the repo.
 *                       @Kubyk-Health/ledsas-maintainers

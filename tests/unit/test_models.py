@@ -141,7 +141,7 @@ class TestEnvelope:
             "sent_at": "2025-01-15T12:34:56Z",
             "deadline": "2025-01-15T12:39:56Z",
             "trace_id": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-            "reply_to": "resp.dev.kebormed_orchestrator.v1",
+            "reply_to": "resp.dev.example_orchestrator.v1",
         }
 
     def test_valid_envelope(self):
@@ -243,7 +243,7 @@ class TestMessages:
                 "sent_at": "2025-01-15T12:34:56Z",
                 "deadline": "2025-01-15T12:39:56Z",
                 "trace_id": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-                "reply_to": "resp.dev.kebormed_orchestrator.v1",
+                "reply_to": "resp.dev.example_orchestrator.v1",
             },
             "payload": {
                 "dataset_uri": "azblob://dev/input/dataset-123.json?versionId=abc",
@@ -264,7 +264,7 @@ class TestMessages:
                 "idempotency_key": "a6f6d1e7-6c8a-4f6b-9c4b-4c2f8dbf1d99",
                 "sent_at": "2025-01-15T12:35:41Z",
                 "trace_id": "00-4bf92f3577b34da6a3ce929d0e0e4736-11f067aa0ba902b7-01",
-                "reply_to": "resp.dev.kebormed_orchestrator.v1",
+                "reply_to": "resp.dev.example_orchestrator.v1",
             },
             "payload": {"result_uri": "azblob://dev/results/report-123.json?versionId=def"},
         }
@@ -282,7 +282,7 @@ class TestMessages:
                 "idempotency_key": "a6f6d1e7-6c8a-4f6b-9c4b-4c2f8dbf1d99",
                 "sent_at": "2025-01-15T12:35:41Z",
                 "trace_id": "00-4bf92f3577b34da6a3ce929d0e0e4736-22f067aa0ba902b7-01",
-                "reply_to": "resp.dev.kebormed_orchestrator.v1",
+                "reply_to": "resp.dev.example_orchestrator.v1",
             },
             "payload": {
                 "error": {
@@ -306,7 +306,7 @@ class TestMessages:
                 "idempotency_key": "a6f6d1e7-6c8a-4f6b-9c4b-4c2f8dbf1d99",
                 "sent_at": "2025-01-15T12:35:10Z",
                 "trace_id": "00-4bf92f3577b34da6a3ce929d0e0e4736-33f067aa0ba902b7-01",
-                "reply_to": "resp.dev.kebormed_orchestrator.v1",
+                "reply_to": "resp.dev.example_orchestrator.v1",
             },
             "payload": {"stage": "downloading", "progress": 0.25},
         }
@@ -389,7 +389,7 @@ class TestJSONSerialization:
                 "idempotency_key": "a6f6d1e7-6c8a-4f6b-9c4b-4c2f8dbf1d99",
                 "sent_at": "2025-01-15T12:34:56+00:00",
                 "trace_id": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-                "reply_to": "resp.dev.kebormed_orchestrator.v1",
+                "reply_to": "resp.dev.example_orchestrator.v1",
             },
             "payload": {"test": "data"},
         }

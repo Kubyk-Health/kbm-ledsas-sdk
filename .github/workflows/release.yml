@@ -1,19 +1,24 @@
 name: Release
 
 # Two ways to run:
-#   1. Publish a GitHub Release  -> builds, generates the SBOM, publishes to
-#      PyPI, then attaches the sdist, the wheel and the SBOM to the Release.
-#   2. Run manually (workflow_dispatch) -> builds, generates the SBOM and
-#      publishes to TestPyPI only (a dry-run to rehearse the whole flow before
-#      a real release).
+#   1. Publish a GitHub Release  -> checks the tag, tests, builds, generates the
+#      SBOM, publishes to PyPI, checks that PyPI holds exactly the built files,
+#      then attaches the sdist, the wheel and the SBOM to the Release.
+#   2. Run manually (workflow_dispatch) on main -> the same build with a
+#      ".devN" version, published to TestPyPI only (a rehearsal of the whole
+#      flow; every run gets a new version, so it can be repeated).
 #
 # The SBOM is generated BEFORE anything is uploaded: a failure there stops the
-# run before PyPI or TestPyPI receives a file.
+# run before PyPI or TestPyPI receives a file. Every tool is installed from the
+# hash-pinned .github/*-requirements.txt files (pip --require-hashes).
 #
 # Both use PyPI Trusted Publishing (OIDC) — NO API token is stored in the repo.
-# One-time setup:
-#   - PyPI:     add a trusted publisher for this repo + workflow, env "pypi".
-#   - TestPyPI: add a trusted publisher on test.pypi.org, env "testpypi".
+# One-time setup (see CONTRIBUTING.md, "Releases"):
+#   - PyPI:     a trusted publisher for this repo + workflow, environment "pypi"
+#               (with required reviewers).
+#   - TestPyPI: a trusted publisher on test.pypi.org, environment "testpypi"
+#               (deployment branches: main only).
+#   - Tag protection: only maintainers can create v* tags.
 
 on:
   release:
@@ -25,31 +30,81 @@ permissions:
 
 jobs:
   build:
-    name: Build distribution
+    name: Check, test and build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
-      - name: Build sdist + wheel
-        run: |
-          python -m pip install --upgrade pip build
-          python -m build
-      - name: Verify version matches tag
+      - name: Install the pinned release toolchain
+        run: python -m pip install --require-hashes -r .github/release-requirements.txt
+      - name: Check the tag (on main, version matches)
         if: github.event_name == 'release'
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          PKG_VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
-          if [ "$PKG_VERSION" != "${TAG#v}" ]; then
-            echo "::error::pyproject version ($PKG_VERSION) does not match release tag ($TAG)"
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::the release tag $TAG ($GITHUB_SHA) is not on main"
             exit 1
           fi
-      - name: Check metadata
+          PKG_VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          SRC_VERSION="$(PYTHONPATH=src python -c 'import kbm_ledsas_sdk; print(kbm_ledsas_sdk.__version__)')"
+          if [ "$PKG_VERSION" != "${TAG#v}" ] || [ "$SRC_VERSION" != "${TAG#v}" ]; then
+            echo "::error::pyproject version ($PKG_VERSION) or kbm_ledsas_sdk.__version__ ($SRC_VERSION) does not match the release tag ($TAG)"
+            exit 1
+          fi
+      - name: Rehearsal version (TestPyPI)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          python -m pip install twine
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::rehearse from main only (this run is on $GITHUB_REF)"
+            exit 1
+          fi
+          BASE="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          DEV="${BASE}.dev$((RUN_NUMBER * 100 + RUN_ATTEMPT))"
+          sed -i "s/^version = \"${BASE}\"$/version = \"${DEV}\"/" pyproject.toml
+          sed -i "s/^__version__ = \"${BASE}\"$/__version__ = \"${DEV}\"/" src/kbm_ledsas_sdk/__init__.py
+          grep -q "^version = \"${DEV}\"$" pyproject.toml
+          grep -q "^__version__ = \"${DEV}\"$" src/kbm_ledsas_sdk/__init__.py
+          echo "rehearsal version: ${DEV}"
+      - name: Tests
+        run: python -m pytest -q -m "not integration"
+      - name: Point the package page's links at the release tag
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          sed -i "s#/blob/main/#/blob/${TAG}/#g; s#/tree/main/#/tree/${TAG}/#g" README.md pyproject.toml
+      - name: Build sdist + wheel
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          python -m build --no-isolation
+          sha256sum dist/*
+      - name: Check metadata
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
           twine check dist/*
+          if [ "$EVENT" = "release" ]; then
+            if unzip -p dist/*.whl '*.dist-info/METADATA' | grep -n '/blob/main/\|/tree/main/'; then
+              echo "::error::the wheel's METADATA links to main instead of the release tag"
+              exit 1
+            fi
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
@@ -61,6 +116,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist
@@ -79,18 +137,21 @@ jobs:
           fi
           WHEEL="${wheels[0]}"
           VERSION="$(basename "$WHEEL" | cut -d- -f2)"
-          # Resolve the wheel's runtime dependency closure in a clean venv and
-          # drop the venv's own seed tooling (pip / setuptools / wheel are not
-          # SDK dependencies), then describe that environment. The SBOM tool
-          # runs from a venv of its own, kept out of the described environment.
+          # The environment the SBOM describes: the wheel's runtime dependency
+          # closure as pip resolves it for a user (not hash-pinned on purpose;
+          # the install report records the hash of every file installed), without
+          # the venv's own seed tooling (pip / setuptools are not SDK dependencies).
           python -m venv /tmp/sdkenv
-          /tmp/sdkenv/bin/pip install --quiet "$WHEEL"
+          /tmp/sdkenv/bin/pip install --quiet --report /tmp/install-report.json "$WHEEL"
           /tmp/sdkenv/bin/pip uninstall --quiet -y pip setuptools wheel || true
+          # The SBOM tool, hash-pinned, in a venv of its own.
           python -m venv /tmp/sbomtool
-          /tmp/sbomtool/bin/pip install --quiet "cyclonedx-bom==7.5.0"
+          /tmp/sbomtool/bin/pip install --quiet --require-hashes -r .github/sbom-requirements.txt
           /tmp/sbomtool/bin/cyclonedx-py environment /tmp/sdkenv/bin/python \
-            --of JSON --sv 1.6 -o "kbm_ledsas_sdk-${VERSION}.cdx.json"
-          ls -l "kbm_ledsas_sdk-${VERSION}.cdx.json"
+            --pyproject pyproject.toml --mc-type library \
+            --of JSON --sv 1.6 -o /tmp/raw.cdx.json
+          /tmp/sbomtool/bin/python .github/scripts/finish_sbom.py /tmp/raw.cdx.json \
+            /tmp/install-report.json "$WHEEL" "$VERSION" "kbm_ledsas_sdk-${VERSION}.cdx.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom
@@ -116,12 +177,44 @@ jobs:
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           # A re-run after a partial upload skips the files PyPI already has
-          # instead of failing on them (PyPI files are immutable).
+          # (PyPI files are immutable); the next step then fails the run unless
+          # PyPI holds exactly the files built in this run.
           skip-existing: true
+      - name: Check that PyPI holds exactly these files
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, sys, time, urllib.request
+
+          version = os.environ["TAG"].removeprefix("v")
+          local = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path("dist").iterdir()}
+          url = f"https://pypi.org/pypi/kbm-ledsas-sdk/{version}/json"
+          remote = {}
+          for attempt in range(12):  # the JSON API can lag the upload by a few minutes
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      remote = {u["filename"]: u["digests"]["sha256"] for u in json.load(response)["urls"]}
+              except Exception as exc:  # noqa: BLE001 - retried, reported below
+                  print(f"attempt {attempt + 1}: {exc}")
+              if set(local) <= set(remote):
+                  break
+              time.sleep(30)
+          bad = sorted(n for n in local if remote.get(n) != local[n])
+          extra = sorted(set(remote) - set(local))
+          for n in bad:
+              print(f"::error::{n}: built sha256 {local[n]}, PyPI {remote.get(n, 'missing')}")
+          for n in extra:
+              print(f"::error::PyPI has {n}, which this run did not build")
+          if bad or extra:
+              sys.exit(1)
+          print(f"PyPI {version} holds exactly the {len(local)} files built in this run")
+          PY
 
   publish-testpypi:
-    name: Publish to TestPyPI (dry-run)
-    if: github.event_name == 'workflow_dispatch'
+    name: Publish to TestPyPI (rehearsal)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     needs: [build, sbom]
     runs-on: ubuntu-latest
     environment:
@@ -142,6 +235,8 @@ jobs:
   attach-release-assets:
     name: Attach dist + SBOM to GitHub Release
     if: github.event_name == 'release'
+    # After publish-pypi, whose last step proves PyPI holds exactly these files:
+    # --clobber then only ever replaces an asset with the file PyPI has.
     needs: publish-pypi
     runs-on: ubuntu-latest
     permissions:

@@ -40,15 +40,19 @@ import random
 import re
 import signal
 import sys
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
 from .health.checks import CheckResult, HealthCheckRegistry
-from .health.server import HealthServer, HealthServerStartFailure, _host_port
+from .health.server import HealthServer, HealthServerStartFailure, _deployment_id, _host_port
 from .models.messages import Command
 from .runtime.config import SDKConfig, _shown_setting, describe_config_errors, service_name_problem
 from .runtime.context import ExecutionContext
-from .runtime.handler import HandlerFunc, HandlerRegistry, _command_fields
+
+# HandlerFunc stays importable from this module (it has always been).
+from .runtime.handler import HandlerFunc, HandlerRegistry, _command_fields  # noqa: F401
 from .runtime.security import _is_truthy, _read_env
 from .transport.base import ERROR_REPLY_SENT, REPLY_UNCONFIRMED, DeliveryLost, Transport
 from .transport.factory import create_transport
@@ -334,6 +338,12 @@ def _quiet_noisy_libraries() -> None:
         masked_logger(name)
 
 
+# The function a decorator returns unchanged (a handler: an async function;
+# a health check: a function taking no arguments).
+H = TypeVar("H", bound=Callable[..., Awaitable[Any]])
+C = TypeVar("C", bound=Callable[[], object])
+
+
 class ServiceApp:
     """
     Main application class for LEDSAS SDK services.
@@ -353,6 +363,11 @@ class ServiceApp:
             return {"result": "success"}
 
         app.run()
+
+    The public API is the constructor, the ``handler`` /
+    ``liveness_check`` / ``readiness_check`` decorators, ``run()`` and the
+    ``service_name`` attribute. Attributes other than ``service_name`` are
+    internal and may change.
     """
 
     def __init__(self, service_name: str):
@@ -379,15 +394,15 @@ class ServiceApp:
         if problem is not None:
             error_class = TypeError if not isinstance(service_name, str) else ValueError
             raise error_class(f"ServiceApp(service_name={_shown_setting(service_name)}): {problem}")
-        self.service_name = service_name
-        self.registry = HandlerRegistry()
+        self.service_name: str = service_name
+        self.registry: HandlerRegistry = HandlerRegistry()
         self.config: SDKConfig | None = None
         self.transport: Transport | None = None
-        self.liveness_checks = HealthCheckRegistry()
-        self.readiness_checks = HealthCheckRegistry()
+        self.liveness_checks: HealthCheckRegistry = HealthCheckRegistry()
+        self.readiness_checks: HealthCheckRegistry = HealthCheckRegistry()
         self.health_server: HealthServer | None = None
-        self._shutdown_event = asyncio.Event()
-        self._running = False
+        self._shutdown_event: asyncio.Event = asyncio.Event()
+        self._running: bool = False
         # Set when the execution loop stops taking commands (shutdown, or the
         # transport connection is gone): a command still waiting for a
         # worker is then given back at once instead of being started
@@ -438,7 +453,7 @@ class ServiceApp:
         else:
             self._stop_starting_event.clear()
 
-    def handler(self, command_name: str, version: str = "1.0"):
+    def handler(self, command_name: str, version: str = "1.0") -> Callable[[H], H]:
         """
         Decorator to register a command handler.
 
@@ -456,13 +471,13 @@ class ServiceApp:
                 return {"result": "success"}
         """
 
-        def decorator(func: HandlerFunc):
+        def decorator(func: H) -> H:
             self.registry.register(command_name, version, func)
             return func
 
         return decorator
 
-    def liveness_check(self, name: str, timeout: float | None = None):
+    def liveness_check(self, name: str, timeout: float | None = None) -> Callable[[C], C]:
         """
         Register a liveness check. Decorate a sync or async callable that
         returns truthy when the process is alive and able to make progress.
@@ -482,13 +497,13 @@ class ServiceApp:
                 return not main_loop.is_blocked()
         """
 
-        def decorator(func):
+        def decorator(func: C) -> C:
             self.liveness_checks.register(name, func, timeout=timeout)
             return func
 
         return decorator
 
-    def readiness_check(self, name: str, timeout: float | None = None):
+    def readiness_check(self, name: str, timeout: float | None = None) -> Callable[[C], C]:
         """
         Register a readiness check. Decorate a sync or async callable that
         returns truthy when the service should be reported ready.
@@ -512,13 +527,13 @@ class ServiceApp:
                 return await db.ping()
         """
 
-        def decorator(func):
+        def decorator(func: C) -> C:
             self.readiness_checks.register(name, func, timeout=timeout)
             return func
 
         return decorator
 
-    def run(self):
+    def run(self) -> None:
         """
         Start the service (blocks until shutdown).
 
@@ -552,8 +567,8 @@ class ServiceApp:
             logger.info("Received KeyboardInterrupt, shutting down...")
         except (ValueError, ValidationError) as e:
             # Configuration-class error: the SDK already raised with a
-            # clean actionable message (e.g. "Set KBM_LEDSAS_RABBITMQ_URL
-            # ... See QUICKSTART_DIRECT_MODE.md §3.1"). Log just that
+            # clean actionable message (e.g. "KBM_LEDSAS_RABBITMQ_URL is
+            # not set. Set it to the broker URL ..."). Log just that
             # message and exit non-zero. Do NOT re-raise — propagating
             # would dump 30+ lines of asyncio/factory/pydantic internals
             # on top of the clean error and bury the actionable line.
@@ -561,9 +576,8 @@ class ServiceApp:
             # ValidationError wraps the field-validator's message in
             # pydantic boilerplate ("1 validation error for SDKConfig",
             # "[type=value_error, input_value=...]", a docs URL).
-            # Unwrap it to the underlying human messages so the customer
-            # sees the same one-liner the QUICKSTART troubleshooting
-            # section advertises.
+            # Unwrap it to the underlying human messages so the operator
+            # sees one actionable line per problem.
             #
             # Set KBM_LEDSAS_DEBUG=1 to keep the full traceback for
             # development.
@@ -676,11 +690,21 @@ class ServiceApp:
         - Graceful shutdown
         """
         # Install the SDK log handler before reading the environment, so a
-        # warning raised while it is read (a retired variable is set, the
-        # cleartext-AMQP acknowledgment) uses KBM_LEDSAS_LOG_FORMAT (JSON
+        # warning raised while it is read (the cleartext-AMQP acknowledgment) uses KBM_LEDSAS_LOG_FORMAT (JSON
         # by default) instead of Python's bare fallback text. It is
         # reconfigured from the loaded config right below.
         self._ensure_sdk_logging()
+
+        # Stop signals are handled from the very start: a SIGTERM / SIGINT
+        # that arrives before the transport starts (while the settings are
+        # read or the transport is built) stops the service with a log line
+        # and exit code 0, instead of the default action killing the
+        # process silently (exit 143). While the transport is connecting, a
+        # stop signal stops the start (a broker that does not answer would
+        # otherwise hold the process until the connect timeout, and
+        # Python's own Ctrl+C handling left the connection's reconnect
+        # loop running).
+        self._setup_signal_handlers()
 
         # Load configuration
         self.config = SDKConfig.from_env(service_name=self.service_name)
@@ -718,12 +742,20 @@ class ServiceApp:
                 self.service_name,
             )
 
-        start_fields = {
+        from . import __version__
+
+        start_fields: dict[str, object] = {
             "log_level": self.config.log_level,
             "log_format": self.config.log_format,
             "concurrency": self.config.concurrency,
+            "sdk_version": __version__,
         }
+        # The deployed build's id (as in the health responses), so a log
+        # search can tell which build started.
         start_fields["prefetch"] = self.config.prefetch
+        deployment_id = _deployment_id()
+        if deployment_id:
+            start_fields["deployment_id"] = deployment_id
         logger.info(
             f"Starting {self.config.service_name} service",
             extra=start_fields,
@@ -747,13 +779,12 @@ class ServiceApp:
             self.transport.set_handled_commands(
                 sorted({name for name, _version in self.registry.list_handlers()})
             )
-        # Stop signals are handled from here on, the start included: a
-        # SIGTERM / SIGINT that arrives while the transport is still
-        # connecting stops the start (a broker that does not answer would
-        # otherwise hold the process until the connect timeout, and
-        # Python's own Ctrl+C handling left the connection's reconnect
-        # loop running).
-        self._setup_signal_handlers()
+        # A stop signal handled while the transport was being built: stop
+        # before connecting at all.
+        await asyncio.sleep(0)
+        if self._shutdown_event.is_set():
+            self._log_stopped_before_start()
+            return
         if not await self._start_transport():
             return
         logger.info("Transport started successfully")
@@ -783,6 +814,12 @@ class ServiceApp:
             # Shutdown
             await self._shutdown()
 
+    def _log_stopped_before_start(self) -> None:
+        logger.info(
+            "Stopped before the service started (a stop signal "
+            "arrived while the transport was starting); exiting"
+        )
+
     async def _start_transport(self) -> bool:
         """Start the transport. False when a stop signal stopped the start
         (the transport has closed what it opened; nothing else to stop)."""
@@ -792,10 +829,7 @@ class ServiceApp:
             await start
         except asyncio.CancelledError:
             if start.cancelled() and self._stop_signals:
-                logger.info(
-                    "Stopped before the service started (a stop signal "
-                    "arrived while the transport was starting); exiting"
-                )
+                self._log_stopped_before_start()
                 return False
             raise
         finally:
@@ -1248,6 +1282,7 @@ class ServiceApp:
             command: Command to handle
             semaphore: Concurrency limiter
         """
+        assert self.transport is not None, "the transport is built before commands arrive"
         async with self._worker_slot(semaphore) as has_worker:
             envelope = command.envelope
 
@@ -1311,6 +1346,7 @@ class ServiceApp:
                         command,
                         timeout_seconds=timeout_seconds,
                         final_attempt=final_attempt,
+                        attempt=(attempts_used + 1 if isinstance(attempts_used, int) else None),
                     )
                 finally:
                     if this_task is not None:
@@ -1754,9 +1790,7 @@ class ServiceApp:
                 detail="" if ready else "transport not connected",
             )
 
-        # Report the deployed-service id (deployment_id, sourced from
-        # KBM_LASTCOMMITID) when the SDK is the deployment's own health
-        # surface.
+        # deployment_id (KBM_LEDSAS_DEPLOYMENT_ID, else KBM_LASTCOMMITID) in /health and /ready.
         emit_deployment_id = True
 
         self.health_server = HealthServer(

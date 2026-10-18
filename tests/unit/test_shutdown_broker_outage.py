@@ -1,6 +1,6 @@
-"""Bounded shutdown while the broker is down (fixed in 0.3.5).
+"""Bounded shutdown while the broker is down (fixed in 0.3.6).
 
-Before 0.3.5, ``DirectTransport.stop()`` -> ``AMQPConsumer.stop()`` ->
+Before 0.3.6, ``DirectTransport.stop()`` -> ``AMQPConsumer.stop()`` ->
 ``queue.cancel()`` on aio-pika's robust channel waited for the connection to
 come back (``RobustChannel.get_underlay_channel()`` awaits
 ``connection.ready()``) and so never returned during a broker outage: SIGTERM
@@ -149,7 +149,7 @@ def _transport(
     transport = DirectTransport(
         rabbitmq_url="amqp://guest:guest@127.0.0.1:5672/",
         blob_conn_string=AZURITE_CONN,
-        service_name="issue014-svc",
+        service_name="shutdown-svc",
     )
     transport.SHUTDOWN_STEP_TIMEOUT_S = step  # instance override
     transport.consumer = consumer
@@ -561,7 +561,7 @@ class TestServiceAppShutdownBrokerOutage:
     ) -> None:
         connection, channel, queue = _robust_outage_queue(channel_looks_open=True)
         transport = _transport(consumer=_consumer(queue), channel=channel, connection=connection)
-        app = ServiceApp("issue014-svc")
+        app = ServiceApp("shutdown-svc")
         app.transport = transport
         app._running = True
 
@@ -582,7 +582,7 @@ class TestServiceAppShutdownBrokerOutage:
 # Commands in flight when shutdown begins (the drain before transport.stop())
 # ---------------------------------------------------------------------------
 
-REPLY_EXCHANGE = "issue014.reply.v1"
+REPLY_EXCHANGE = "shutdown.reply.v1"
 UNDELIVERED = "not confirmed: AMQP broker not reachable during shutdown"
 
 
@@ -594,7 +594,7 @@ def _envelope(type_: str, *, name: str = "Slow") -> Envelope:
         message_version="1.0",
         message_id=str(uuid.uuid4()),
         correlation_id=str(uuid.uuid4()),
-        idempotency_key="idem-issue014",
+        idempotency_key="idem-shutdown",
         sent_at=datetime.now(UTC),
         trace_id="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
         reply_to=REPLY_EXCHANGE,
@@ -1016,7 +1016,7 @@ class _Drainable:
         )
         self.transport.publisher._confirms_enabled = True
 
-        self.app = ServiceApp("issue014-svc")
+        self.app = ServiceApp("shutdown-svc")
         self.app.transport = self.transport
         self.app.config = Mock(
             concurrency=4, handler_timeout=1800, max_retries=3, generic_errors=False
@@ -1102,7 +1102,7 @@ class TestServiceAppDrainDuringShutdown:
     async def test_reply_failure_without_unreachable_flag_still_dead_letters(self) -> None:
         """Transports without the flag (or a False flag) keep the existing
         "reply publish failed -> dead-letter" behavior."""
-        app = ServiceApp("issue014-svc")
+        app = ServiceApp("shutdown-svc")
         app.config = Mock(concurrency=1, handler_timeout=1800, max_retries=3, generic_errors=False)
 
         @app.handler("Slow", "1.0")
@@ -1126,7 +1126,7 @@ class TestServiceAppDrainDuringShutdown:
     async def test_reply_undelivered_at_shutdown_is_left_unacknowledged(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        app = ServiceApp("issue014-svc")
+        app = ServiceApp("shutdown-svc")
         app.config = Mock(concurrency=1, handler_timeout=1800, max_retries=3, generic_errors=False)
 
         @app.handler("Slow", "1.0")
@@ -1148,7 +1148,7 @@ class TestServiceAppDrainDuringShutdown:
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
     async def test_begin_shutdown_hook_sync_async_or_absent(self) -> None:
-        app = ServiceApp("issue014-svc")
+        app = ServiceApp("shutdown-svc")
         sync_transport = MagicMock()
         app.transport = sync_transport
         await app._begin_transport_shutdown()
@@ -1521,7 +1521,7 @@ class TestServiceAppSettlementDuringShutdown:
         assert [r for r in _records(caplog, logging.ERROR)] == []
 
     async def test_backoff_outside_shutdown_waits_the_full_delay(self) -> None:
-        app = ServiceApp("issue014-svc")
+        app = ServiceApp("shutdown-svc")
         t0 = time.monotonic()
         await app._backoff_unless_shutdown(3 * STEP)
         assert time.monotonic() - t0 >= 3 * STEP - 0.02
@@ -1547,7 +1547,7 @@ class TestServiceAppSettlementDuringShutdown:
         """Only a ConnectionError (the consumer's BrokerNotReachable) while
         the transport reports the broker unreachable at shutdown skips the
         existing "uncaught exception -> dead-letter" path."""
-        app = ServiceApp("issue014-svc")
+        app = ServiceApp("shutdown-svc")
         app.config = Mock(concurrency=1, handler_timeout=1800, max_retries=3, generic_errors=False)
 
         @app.handler("Slow", "1.0")
@@ -1570,7 +1570,7 @@ class TestServiceAppSettlementDuringShutdown:
     async def test_catch_all_leaves_command_when_settlement_hit_the_outage(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        app = ServiceApp("issue014-svc")
+        app = ServiceApp("shutdown-svc")
         app.config = Mock(concurrency=1, handler_timeout=1800, max_retries=3, generic_errors=False)
 
         @app.handler("Slow", "1.0")

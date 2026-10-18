@@ -13,8 +13,9 @@ actual aio-pika/aiormq semantics, guarding against aio-pika/aiormq version drift
 - reply_to exchange missing                        -> returns False,
   ``reply_unroutable_failures`` NOT bumped (path unchanged).
 
-All tests are marked ``@pytest.mark.integration`` and skip cleanly if
-the Docker stack (RabbitMQ + Azurite) isn't available.
+All tests are marked ``@pytest.mark.integration`` and skip cleanly when
+no RabbitMQ answers on 127.0.0.1:5672 (the tests never touch blob storage;
+the connection string only satisfies the transport's constructor).
 """
 
 from __future__ import annotations
@@ -51,14 +52,14 @@ def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
         return False
 
 
-_STACK_UP = _port_open(RABBITMQ_HOST, RABBITMQ_PORT) and _port_open("127.0.0.1", 10000)
+_STACK_UP = _port_open(RABBITMQ_HOST, RABBITMQ_PORT)
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
         not _STACK_UP,
         reason=(
-            "RabbitMQ/Azurite not reachable on loopback — start the stack: "
+            "RabbitMQ not reachable on 127.0.0.1:5672 — start the local stack: "
             "docker compose -f examples/hello_world_service/deploy/local/docker-compose.yml up -d"
         ),
     ),

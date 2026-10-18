@@ -9,8 +9,10 @@ Tests include:
 - Error handling
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
 
+import pydantic
 import pytest
 
 from kbm_ledsas_sdk.models import Envelope
@@ -96,7 +98,8 @@ class TestExecutionContextInitialization:
 
         # Logger should have the handler name
         assert ctx.logger is not None
-        assert "ProcessDataset" in ctx.logger.name
+        assert ctx.logger.name == "handler.ProcessDataset"
+        assert isinstance(ctx.logger, logging.Logger)
 
     @pytest.mark.asyncio
     async def test_context_deadline_none(self, mock_transport, sample_payload):
@@ -274,6 +277,18 @@ class TestExecutionContextProperties:
         assert ctx.correlation_id is not None
         assert ctx.trace_id is not None
         assert ctx.idempotency_key is not None
+
+        # The envelope is frozen: assigning a field raises instead of
+        # changing the ids the SDK acknowledges and replies with.
+        for field, value in (
+            ("message_id", "11111111-1111-4111-8111-111111111111"),
+            ("reply_to", "resp.other.v1"),
+            ("correlation_id", "22222222-2222-4222-8222-222222222222"),
+        ):
+            with pytest.raises(pydantic.ValidationError):
+                setattr(ctx.envelope, field, value)
+        with pytest.raises(AttributeError):
+            ctx.envelope = sample_envelope  # type: ignore[misc]
 
     @pytest.mark.asyncio
     async def test_message_id_matches_envelope(

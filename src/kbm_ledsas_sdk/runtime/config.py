@@ -7,7 +7,6 @@ settings from ``KBM_LEDSAS_*`` environment variables. See
 """
 
 import ipaddress
-import logging  # noqa: F401
 import os
 import re
 from typing import Any
@@ -25,7 +24,6 @@ from pydantic import (
 from kbm_ledsas_sdk.runtime.security import (
     _is_truthy,
     _read_env,
-    _strip_surrounding_quotes,  # noqa: F401
     check_topology_name_budget,
     check_transport_security,
     parse_bool_env,
@@ -33,32 +31,6 @@ from kbm_ledsas_sdk.runtime.security import (
 from kbm_ledsas_sdk.utils.logging import masked_logger
 
 _logger = masked_logger(__name__)
-
-# Retired env vars (they no longer configure anything). They
-# are accepted but ignored; from_env warns once if any is present.
-_LEGACY_MODE_VARS = ("KBM_LEDSAS_MODE", "KBM_LEDSAS_DEV")
-_legacy_mode_warned = False
-
-
-def _warn_legacy_mode_vars_once() -> None:
-    """Warn once per process if any retired env var is set.
-
-    These variables no longer configure anything, so they are
-    accepted but ignored — nothing breaks for existing deployments. A
-    single warning lists whichever are present so operators can drop them.
-    """
-    global _legacy_mode_warned
-    if _legacy_mode_warned:
-        return
-    present = [v for v in _LEGACY_MODE_VARS if os.getenv(v) not in (None, "")]
-    if present:
-        _legacy_mode_warned = True
-        _logger.warning(
-            "%s no longer used: this package always runs "
-            "its built-in transport. Remove the variable(s) from your "
-            "environment.",
-            " / ".join(present),
-        )
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -126,6 +98,7 @@ _FIELD_ENV_VARS = {
     "health_host": "KBM_LEDSAS_HEALTH_HOST",
     "health_verbose": "KBM_LEDSAS_HEALTH_VERBOSE",
     "connect_timeout": "KBM_LEDSAS_CONNECT_TIMEOUT",
+    "heartbeat": "KBM_LEDSAS_HEARTBEAT",
 }
 # Fields whose value is never repeated in a message.
 _SECRET_FIELDS = frozenset({"rabbitmq_url", "blob_conn_string"})
@@ -390,6 +363,17 @@ class SDKConfig(BaseModel):
         ),
     )
 
+    heartbeat: int = Field(
+        15,
+        ge=0,
+        le=600,
+        description=(
+            "AMQP heartbeat interval in seconds requested from the broker "
+            "unless the broker URL sets ?heartbeat= (0..600, 0 = off, "
+            "default 15)"
+        ),
+    )
+
     @field_validator("health_host")
     @classmethod
     def validate_health_host(cls, v: str) -> str:
@@ -517,6 +501,11 @@ class SDKConfig(BaseModel):
                 shows just the actionable one-liner).
             KBM_LEDSAS_CONNECT_TIMEOUT: Seconds one connection attempt to
                 the message broker may take (default 15, 1..300).
+            KBM_LEDSAS_HEARTBEAT: AMQP heartbeat interval in seconds
+                (default 15, 0..600, 0 = off) used unless the broker URL
+                sets ``?heartbeat=``; a broker that stops answering is
+                detected within about 3 x (this interval + 1) s, about
+                50 s at the default 15.
 
         Every value is read the same way, however it was set: surrounding
         whitespace and one matched pair of surrounding quotes are removed
@@ -535,16 +524,14 @@ class SDKConfig(BaseModel):
         1000``; see :func:`describe_config_errors`).
 
         Example:
+            # Azurite's development account and well-known public key:
+            # not a secret, it only works against the local emulator.
             export KBM_LEDSAS_RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672/
-            export KBM_LEDSAS_BLOB_CONN_STRING="..."
+            export KBM_LEDSAS_BLOB_CONN_STRING="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
             config = SDKConfig.from_env("my_service")
         """
         tenant_value = _env("KBM_LEDSAS_TENANT", tenant or "")
         tenant_final = tenant_value if tenant_value else None
-
-        # Retired env flags: warn once if any leftover flag is
-        # set, then ignore it — nothing breaks for existing deployments.
-        _warn_legacy_mode_vars_once()
 
         # KBM_LEDSAS_DEBUG is read when a startup error is reported; an
         # unrecognized value is refused here, like every other setting.
@@ -584,6 +571,7 @@ class SDKConfig(BaseModel):
             health_host=_env("KBM_LEDSAS_HEALTH_HOST", "127.0.0.1"),
             health_verbose=_bool_env("KBM_LEDSAS_HEALTH_VERBOSE", "false"),
             connect_timeout=_int_env("KBM_LEDSAS_CONNECT_TIMEOUT", "15"),
+            heartbeat=_int_env("KBM_LEDSAS_HEARTBEAT", "15"),
         )
 
     @field_serializer("rabbitmq_url", "blob_conn_string", when_used="always")

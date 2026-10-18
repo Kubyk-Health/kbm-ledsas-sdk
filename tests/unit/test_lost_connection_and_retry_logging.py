@@ -1,6 +1,6 @@
 """Regression tests: a broker connection lost while a handler runs, a broker
 redelivery of a command that is still running, and the per-attempt logging
-of retried failures (SDK 0.3.5).
+of retried failures (SDK 0.3.6).
 
 - **Connection lost while a handler runs (no shutdown).** The command's
   ACK / requeue / dead-letter, or its reply, cannot be sent on the lost

@@ -10,7 +10,5 @@
 
 # Binary assets (no diff, no eol conversion)
 *.png   binary
-*.jpg   binary
 *.gz    binary
 *.whl   binary
-*.dcm   binary

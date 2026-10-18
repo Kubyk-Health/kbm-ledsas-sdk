@@ -21,20 +21,21 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import logging  # noqa: F401
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..utils.logging import masked_logger, redact_secrets
 
 logger = masked_logger(__name__)
 
-CheckCallable = Callable[[], bool | Awaitable[bool]]
+# A check: sync or async, taking no arguments; its (awaited) result is
+# read as true or false.
+CheckCallable = Callable[[], object]
 
-# Time limit of a check registered without its own (seconds). Below the
-# 3 s probe timeout the deployment examples use, so a hanging check makes
-# the probe fail (503) instead of time out.
+# Time limit of a check registered without its own (seconds). Keep each
+# check below a typical 3 s probe timeout, so a hanging check makes the
+# probe fail (503) instead of time out.
 DEFAULT_CHECK_TIMEOUT_S = 2.0
 # Largest time limit a check may be registered with (seconds).
 MAX_CHECK_TIMEOUT_S = 60.0
@@ -94,11 +95,27 @@ class HealthCheckRegistry:
         ``timeout``: seconds the check may run before it is cancelled and
         reported as unhealthy (default ``DEFAULT_CHECK_TIMEOUT_S``, 2 s;
         greater than 0, at most ``MAX_CHECK_TIMEOUT_S``, 60 s).
+
+        Raises TypeError when ``check`` is not callable or cannot be called
+        without arguments (it would fail on every probe).
         """
         if not name or not isinstance(name, str):
             raise ValueError("Health check name must be a non-empty string")
         if name in self._checks:
             raise ValueError(f"Health check already registered: {name!r}")
+        if not callable(check):
+            raise TypeError(
+                f"Health check {name!r} must be a function taking no "
+                f"arguments, got {type(check).__name__}"
+            )
+        try:
+            inspect.signature(check).bind()
+        except TypeError as e:
+            raise TypeError(
+                f"Health check {name!r} must be callable with no arguments: {e}"
+            ) from None
+        except ValueError:
+            pass  # no readable signature (some builtins): accepted
         self._checks[name] = (check, _checked_timeout(name, timeout))
 
     def names(self) -> list[str]:

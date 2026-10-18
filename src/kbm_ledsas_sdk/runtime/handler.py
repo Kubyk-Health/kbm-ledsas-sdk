@@ -22,7 +22,6 @@ import dataclasses
 import enum
 import inspect
 import json
-import logging  # noqa: F401
 import os
 import re
 import sys
@@ -47,13 +46,13 @@ from ..models.messages import Command, Response
 # _command_fields: the identity of a command on every per-command record
 # (correlation_id, message_id, command_name, trace_id, idempotency_key and
 # job_id); imported from here by the service layer too.
-from ..utils.logging import _command_fields, masked_logger
+from ..utils.logging import _command_fields, masked_logger, redact_secrets
 from .context import ExecutionContext
 
 # Type alias for handler functions. A handler returns a JSON-serializable
 # dict (the reply payload); returning None is accepted and treated as an
 # empty result ({}), which suits fire-and-forget handlers.
-HandlerFunc = Callable[[ExecutionContext, dict], Awaitable[dict | None]]
+HandlerFunc = Callable[[ExecutionContext, dict[str, Any]], Awaitable[dict[str, Any] | None]]
 
 # A handler's exception text is quoted by this logger's records (internal
 # message, error message, traceback): secrets in it are masked by default,
@@ -84,7 +83,7 @@ class HandlerOutcome(NamedTuple):
 # validation and is dead-lettered before handler lookup.
 _COMMAND_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 _COMMAND_NAME_MAX_LENGTH = 64
-_MESSAGE_VERSION_PATTERN = re.compile(r"^\d+\.\d+$")
+_MESSAGE_VERSION_PATTERN = re.compile(r"[0-9]{1,4}\.[0-9]{1,4}")  # used with fullmatch
 
 # Default generic error messages for customer-facing responses
 # Used when generic_errors=True to hide internal error details from callers.
@@ -171,7 +170,7 @@ def _short_text(exc: BaseException) -> str:
     """First line of ``str(exc)``, shortened, URL credentials removed."""
     text = _safe_str(exc)
     first = text.splitlines()[0] if text else ""
-    return _URL_USERINFO.sub(r"\1***@", first)[:200]
+    return redact_secrets(_URL_USERINFO.sub(r"\1***@", first))[:200]
 
 
 def _format_seconds(seconds: float) -> str:
@@ -576,6 +575,21 @@ def _not_async_reason(handler: Any) -> str | None:
     return None
 
 
+def _call_signature_problem(func: Any, arguments: int) -> str | None:
+    """Why ``func`` cannot be called with ``arguments`` positional
+    arguments (the text of the TypeError ``inspect.Signature.bind``
+    raises), or None when it can or its signature cannot be read."""
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return None
+    try:
+        signature.bind(*([object()] * arguments))
+    except TypeError as e:
+        return str(e)
+    return None
+
+
 class HandlerRegistry:
     """
     Registry for command handlers.
@@ -636,9 +650,10 @@ class HandlerRegistry:
                 name or version fails envelope validation and is
                 dead-lettered, so the SDK refuses it at registration.
             TypeError: If ``handler`` is not an ``async def`` function
-                (a plain ``def``, a lambda, or an async generator). The
-                SDK awaits every handler; a plain function would run on
-                every attempt and then fail, so it is refused here.
+                (a plain ``def``, a lambda, or an async generator), or it
+                cannot be called with the two arguments the SDK passes
+                (``ctx, payload``). The SDK awaits every handler; such a
+                handler would fail on every attempt, so it is refused here.
 
         Example:
             registry.register("ProcessDataset", "1.0", my_handler)
@@ -668,6 +683,12 @@ class HandlerRegistry:
                 f"function ('async def'): {not_async}. The SDK awaits every "
                 f"handler; run blocking code inside it with "
                 f"'await asyncio.to_thread(...)'."
+            )
+        signature_problem = _call_signature_problem(handler, 2)
+        if signature_problem is not None:
+            raise TypeError(
+                f"Handler for {command_name} v{version} must accept two "
+                f"positional arguments (ctx, payload): {signature_problem}."
             )
         key = (command_name, version)
         if key in self._handlers:
@@ -738,7 +759,10 @@ class HandlerRegistry:
            internal message is never sent.
         2. Otherwise, if ``generic_errors`` is enabled, the caller sees the
            generic fallback (e.g. "Processing failed").
-        3. Otherwise, the caller sees the raw internal ``specific_message``.
+        3. Otherwise, the caller sees the internal ``specific_message``,
+           with the secrets it may quote masked (see
+           :func:`~kbm_ledsas_sdk.utils.logging.redact_secrets`), as in
+           the logs.
 
         A lone surrogate in the text (quoted from a request value) is
         replaced by U+FFFD. The internal ``specific_message`` is always
@@ -750,7 +774,9 @@ class HandlerRegistry:
             return _encodable_text(user_message)
         if self._generic_errors:
             return GENERIC_ERROR_MESSAGES.get(code, "An error occurred")
-        return _encodable_text(specific_message)
+        # The internal text goes to the caller: mask the secrets it may
+        # quote (a connection URL's password, a storage key), as the logs do.
+        return _encodable_text(redact_secrets(specific_message))
 
     def _calculate_timeout(self, envelope: Envelope, config_timeout: int) -> float | None:
         """
@@ -797,6 +823,7 @@ class HandlerRegistry:
         timeout_seconds: int = 0,
         *,
         final_attempt: bool | None = None,
+        attempt: int | None = None,
     ) -> Response:
         """Execute the handler for a command and return its reply.
 
@@ -806,7 +833,7 @@ class HandlerRegistry:
         ``"error"`` key): use :meth:`execute_with_outcome` for that.
         """
         outcome = await self.execute_with_outcome(
-            ctx, command, timeout_seconds, final_attempt=final_attempt
+            ctx, command, timeout_seconds, final_attempt=final_attempt, attempt=attempt
         )
         return outcome.response
 
@@ -817,6 +844,7 @@ class HandlerRegistry:
         timeout_seconds: int = 0,
         *,
         final_attempt: bool | None = None,
+        attempt: int | None = None,
     ) -> HandlerOutcome:
         """
         Execute handler for a command and return the attempt's outcome.
@@ -841,6 +869,10 @@ class HandlerRegistry:
                 ``None`` (no retry context, e.g. a transport that keeps no
                 retry count) keeps the ERROR with the traceback on every
                 call.
+            attempt: The number of this attempt (1 for the first), added
+                as ``attempt`` to the record of a ``Retryable`` failure
+                (with ``will_retry`` from ``final_attempt``); None when the
+                transport keeps no retry count.
 
         Returns:
             HandlerOutcome: the reply (success or error) and, decided here
@@ -1005,11 +1037,17 @@ class HandlerRegistry:
             # formatter escapes any control characters, and the text
             # formatter escapes them in its key=value pairs.
             text = _safe_str(e)
+            retry_fields: dict[str, Any] = {}
+            if final_attempt is not None:
+                retry_fields["will_retry"] = not final_attempt
+            if attempt is not None:
+                retry_fields["attempt"] = attempt
             logger.warning(
                 "Retryable error in handler",
                 extra={
                     **_command_fields(envelope),
                     "error_message": text,
+                    **retry_fields,
                 },
             )
             return self._error_outcome(

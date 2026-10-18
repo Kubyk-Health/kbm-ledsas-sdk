@@ -1,4 +1,4 @@
-"""Regression tests for direct-mode reply-publish parity.
+"""Regression tests for reply-publish behaviour.
 
 Replies (and statuses) now publish with ``mandatory=True`` so an
 exists-but-unbound reply exchange no longer swallows the response: the
@@ -59,7 +59,7 @@ BODY_SENTINEL = "SENTINEL-BODY-BYTES-DO-NOT-LOG"
 class _FakeReturnedMessage:
     """Stands in for aiormq's DeliveredMessage in the raised error.
 
-    Precision note (reviewer L4): the REAL unroutable-return exception is
+    Precision note: the REAL unroutable-return exception is
     ``PublishError``, whose ``__init__`` replaces ``args`` with the short
     ``(reply_text, routing_key)`` strings — its ``str()`` never contains
     the body. A *bare* ``DeliveryError``, however, passes the message
@@ -122,7 +122,7 @@ def _transport() -> DirectTransport:
     return DirectTransport(
         rabbitmq_url="amqp://guest:guest@127.0.0.1:5672/",
         blob_conn_string=AZURITE_CONN,
-        service_name="task046-svc",
+        service_name="reply-publish-svc",
     )
 
 
@@ -160,7 +160,7 @@ class TestClassifyDeliveryError:
     def test_bare_delivery_error_is_expected_with_nack_reason(self) -> None:
         """Basic.Nack (broker refused to confirm) is a DIFFERENT operator
         condition from unroutable — same noise treatment, distinct reason
-        so on-call isn't misdirected to check bindings (reviewer M1)."""
+        so on-call isn't misdirected to check bindings."""
         is_expected, reason = _classify_publish_error(_delivery_error())
         assert is_expected is True
         assert reason == "broker did not confirm the publish (Basic.Nack)"
@@ -290,7 +290,7 @@ class TestSendResponseUnroutable:
     ) -> None:
         """Basic.Nack (bare DeliveryError) is NOT the unroutable case:
         aggregate counter only, and the operator hint points at broker
-        policies, not at bindings (reviewer M1)."""
+        policies, not at bindings."""
         transport = _transport()
         transport.publisher = _mock_publisher(side_effect=_delivery_error())
 
@@ -386,7 +386,7 @@ class TestSendStatusUnroutable:
     async def test_non_delivery_error_swallowed_with_original_text(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Pre-existing branch (reviewer L5): a non-DeliveryError status
+        """A non-DeliveryError status
         failure is still swallowed with a WARNING carrying str(e) and
         the single status counter."""
 

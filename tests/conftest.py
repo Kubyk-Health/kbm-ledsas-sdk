@@ -4,7 +4,6 @@ import logging
 
 import pytest
 
-from kbm_ledsas_sdk.runtime import config as _config
 from kbm_ledsas_sdk.transport import _build_direct
 
 
@@ -30,19 +29,6 @@ def _restore_sdk_logger_state():
     logger.setLevel(saved_level)
     logger.propagate = saved_propagate
     logger.filters[:] = saved_filters
-
-
-@pytest.fixture(autouse=True)
-def _reset_legacy_mode_warning():
-    """Reset the one-time warning guard for retired settings around every test.
-
-    The guard is a module global that flips the first time a retired setting
-    is seen; without the reset, the first test to set one would suppress the
-    warning for every later test.
-    """
-    _config._legacy_mode_warned = False
-    yield
-    _config._legacy_mode_warned = False
 
 
 @pytest.fixture(autouse=True)

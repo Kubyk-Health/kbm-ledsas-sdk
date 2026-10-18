@@ -122,7 +122,6 @@ class TestTopologyNameBudget:
         """The model_validator wires the budget check into SDKConfig
         load so app.py sees a clean 'Configuration error: ...' line
         BEFORE any AMQP / blob client is constructed."""
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", "x")
         monkeypatch.setenv("KBM_LEDSAS_SERVICE_NAME", "s" * 64)
@@ -143,7 +142,6 @@ class TestCleartextAmqpAtConfigLoad:
 
     def test_loopback_amqp_accepted(self, isolated_env, monkeypatch):
         """Loopback hosts don't trigger the refusal."""
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", "x")
         cfg = SDKConfig.from_env(service_name="svc")
@@ -151,7 +149,6 @@ class TestCleartextAmqpAtConfigLoad:
 
     def test_amqps_to_remote_accepted(self, isolated_env, monkeypatch):
         """amqps:// to non-loopback is fine (TLS) — only amqp:// refused."""
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv(
             "KBM_LEDSAS_RABBITMQ_URL", "amqps://guest:guest@broker.example.com:5671/"
         )
@@ -162,7 +159,6 @@ class TestCleartextAmqpAtConfigLoad:
     def test_cleartext_to_remote_refused_at_load(self, isolated_env, monkeypatch):
         """amqp:// to non-loopback raises at SDKConfig.from_env — NOT
         after AzureBlobClient construction."""
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@10.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", "x")
         with pytest.raises((ValueError, ValidationError)) as exc_info:
@@ -173,7 +169,6 @@ class TestCleartextAmqpAtConfigLoad:
 
     def test_allow_insecure_amqp_escape_hatch(self, isolated_env, monkeypatch):
         """KBM_LEDSAS_ALLOW_INSECURE_AMQP downgrades refusal to WARNING."""
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@10.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", "x")
         monkeypatch.setenv("KBM_LEDSAS_ALLOW_INSECURE_AMQP", "1")
@@ -183,7 +178,6 @@ class TestCleartextAmqpAtConfigLoad:
     @pytest.mark.parametrize("truthy", ["1", "true", "TRUE", "yes", "YES", "on", "t", "y"])
     def test_allow_insecure_amqp_accepts_truthy_strings(self, isolated_env, monkeypatch, truthy):
         """L2: ALLOW_INSECURE_AMQP now accepts any truthy form, not only '1'."""
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@10.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", "x")
         monkeypatch.setenv("KBM_LEDSAS_ALLOW_INSECURE_AMQP", truthy)
@@ -194,7 +188,6 @@ class TestCleartextAmqpAtConfigLoad:
     def test_allow_insecure_amqp_falsy_strings_still_refuse(self, isolated_env, monkeypatch, falsy):
         """Security-sensitive: anything not in the accepted truthy set
         fails closed (the refusal still fires)."""
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@10.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", "x")
         monkeypatch.setenv("KBM_LEDSAS_ALLOW_INSECURE_AMQP", falsy)
@@ -216,46 +209,45 @@ class TestBoolEnvUnified:
     def test_truthy_forms(self, raw, monkeypatch):
         """Each of these values, when read from the env, must be truthy."""
         assert _is_truthy(raw) is True
-        monkeypatch.setenv("KBM_LEDSAS_TASK022_BOOL", raw)
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "false") is True
+        monkeypatch.setenv("KBM_LEDSAS_TEST_BOOL", raw)
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "false") is True
 
     @pytest.mark.parametrize("raw", ["0", "false", "no", "off", "FALSE", "f", "n"])
     def test_falsy_forms(self, raw, monkeypatch):
         """The falsy tokens are false even with a true default."""
         assert _is_truthy(raw) is False
-        monkeypatch.setenv("KBM_LEDSAS_TASK022_BOOL", raw)
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "true") is False
+        monkeypatch.setenv("KBM_LEDSAS_TEST_BOOL", raw)
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "true") is False
 
     @pytest.mark.parametrize("raw", ["", "  "])
     def test_empty_gives_the_default(self, raw, monkeypatch):
         """An empty value counts as unset."""
-        monkeypatch.setenv("KBM_LEDSAS_TASK022_BOOL", raw)
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "true") is True
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "false") is False
+        monkeypatch.setenv("KBM_LEDSAS_TEST_BOOL", raw)
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "true") is True
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "false") is False
 
     @pytest.mark.parametrize("raw", ["anything", "ture", "maybe"])
     def test_unknown_tokens_are_refused(self, raw, monkeypatch):
         """An unrecognized value is a configuration error naming the
         variable; it used to be read as false."""
         assert _is_truthy(raw) is False
-        monkeypatch.setenv("KBM_LEDSAS_TASK022_BOOL", raw)
-        with pytest.raises(ValueError, match="KBM_LEDSAS_TASK022_BOOL=.* is not a boolean"):
-            _bool_env("KBM_LEDSAS_TASK022_BOOL", "false")
+        monkeypatch.setenv("KBM_LEDSAS_TEST_BOOL", raw)
+        with pytest.raises(ValueError, match="KBM_LEDSAS_TEST_BOOL=.* is not a boolean"):
+            _bool_env("KBM_LEDSAS_TEST_BOOL", "false")
 
     def test_none_is_falsy(self):
         assert _is_truthy(None) is False
 
     def test_bool_env_default_when_unset(self, monkeypatch):
         """When env var is unset, the default string is parsed via _is_truthy."""
-        monkeypatch.delenv("KBM_LEDSAS_TASK022_BOOL", raising=False)
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "false") is False
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "true") is True
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "1") is True
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "0") is False
+        monkeypatch.delenv("KBM_LEDSAS_TEST_BOOL", raising=False)
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "false") is False
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "true") is True
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "1") is True
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "0") is False
 
     def test_generic_errors_accepts_one(self, isolated_env, monkeypatch):
         """L2 regression: GENERIC_ERRORS=1 used to be silently false."""
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", "x")
         monkeypatch.setenv("KBM_LEDSAS_GENERIC_ERRORS", "1")
@@ -263,7 +255,6 @@ class TestBoolEnvUnified:
         assert cfg.generic_errors is True
 
     def test_health_verbose_accepts_yes(self, isolated_env, monkeypatch):
-        monkeypatch.setenv("KBM_LEDSAS_MODE", "direct")
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", "x")
         monkeypatch.setenv("KBM_LEDSAS_HEALTH_VERBOSE", "yes")

@@ -1,15 +1,15 @@
 [build-system]
-# Build backend pinned exactly (not a floor): the release workflow builds in an
-# isolated environment from this list, and an unpinned setuptools changes the
+# Build backend pinned exactly (not a floor): an unpinned setuptools changes the
 # wheel (its dist-info/WHEEL "Generator:" line) whenever setuptools releases.
-# Pinned, the wheel published to PyPI has the same content as the one built and
-# reviewed before the release. Bump deliberately.
+# Pinned, and built with SOURCE_DATE_EPOCH set to the commit time (as the CI and
+# release workflows do), the wheel published to PyPI has the same file contents
+# as one built from the same commit before the release. Bump deliberately.
 requires = ["setuptools==84.0.0", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kbm-ledsas-sdk"
-version = "0.3.5"
+version = "0.3.6"
 description = "KeborMed LEDSAS SDK - Python client for building Local External Data Sources Action Service (LEDSAS) data-processing services"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -54,7 +54,7 @@ dev = [
     "ruff>=0.5,<0.18",
     "black>=26.3.1,<27",
     "mypy>=1.10",
-    "build>=1.2",
+    "build>=1.2.1",
 ]
 
 [project.urls]
@@ -81,7 +81,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 markers = [
-    "integration: live wire tests that need Docker + Azurite (skip if unavailable)",
+    "integration: live tests that need a local RabbitMQ on 127.0.0.1:5672 (skipped when none answers)",
 ]
 
 [tool.mypy]

@@ -4,19 +4,19 @@ Environment Variable Drift Prevention Tests.
 These tests ensure that:
 1. All documented env vars are implemented in code
 2. Default values in registry match actual code defaults
-3. Internal-only variables are never advertised
+3. Undocumented variables are never advertised
 
 These serve as the AUTOMATED VERIFICATION that documentation and code
 stay in sync.
 """
 
-import logging
 import os
 from unittest.mock import patch
 
 from kbm_ledsas_sdk.runtime.config import SDKConfig
 from kbm_ledsas_sdk.runtime.env_vars import (
     ENV_VAR_REGISTRY,
+    EnvVarSpec,
     get_all_var_names,
     get_deprecated_vars,
     get_env_var,
@@ -64,10 +64,16 @@ class TestEnvVarRegistry:
         assert "KBM_LEDSAS_SERVICE_NAME" in names
         assert len(names) == len(ENV_VAR_REGISTRY)
 
-    def test_get_deprecated_vars(self):
-        """get_deprecated_vars returns only entries marked deprecated."""
-        deprecated = get_deprecated_vars()
-        assert all(v.deprecated for v in deprecated)
+    def test_get_deprecated_vars(self, monkeypatch):
+        """get_deprecated_vars returns exactly the entries marked deprecated
+        (none at present; checked on a registry that has one)."""
+        from kbm_ledsas_sdk.runtime import env_vars
+
+        assert get_deprecated_vars() == []
+        current = EnvVarSpec(name="KBM_LEDSAS_A", description="a", default=None)
+        old = EnvVarSpec(name="KBM_LEDSAS_B", description="b", default=None, deprecated=True)
+        monkeypatch.setattr(env_vars, "ENV_VAR_REGISTRY", [current, old])
+        assert get_deprecated_vars() == [old]
 
 
 class TestDocumentedDefaultsMatchCode:
@@ -104,59 +110,6 @@ class TestDocumentedDefaultsMatchCode:
         assert config.blob_container == "dev"
 
 
-class TestRetiredModeVars:
-    """The retired mode settings are accepted but ignored,
-    with a one-time warning, and absent from the SDKConfig model."""
-
-    def test_config_has_no_mode_fields(self):
-        """SDKConfig no longer carries mode / dev_mode fields."""
-        fields = set(SDKConfig.model_fields.keys())
-        assert "mode" not in fields
-        assert "dev_mode" not in fields
-
-    def test_retired_var_warns_once(self, caplog):
-        """A single warning lists the retired vars; a second from_env is silent."""
-        env = {
-            "KBM_LEDSAS_MODE": "direct",
-            "KBM_LEDSAS_DEV": "1",
-            "KBM_LEDSAS_RABBITMQ_URL": "amqp://guest:guest@127.0.0.1:5672/",
-            "KBM_LEDSAS_BLOB_CONN_STRING": _BLOB_CONN,
-        }
-        with patch.dict(os.environ, env, clear=True):
-            with caplog.at_level(logging.WARNING):
-                SDKConfig.from_env("svc")
-                SDKConfig.from_env("svc")  # second call: once-per-process guard
-        warnings = [r for r in caplog.records if "no longer used" in r.getMessage()]
-        assert len(warnings) == 1
-        # The single warning names whichever retired vars were present.
-        assert "KBM_LEDSAS_MODE" in warnings[0].getMessage()
-        assert "KBM_LEDSAS_DEV" in warnings[0].getMessage()
-
-    def test_no_retired_var_no_warning(self, caplog):
-        """No retired var set -> no deprecation warning."""
-        env = {
-            "KBM_LEDSAS_RABBITMQ_URL": "amqp://guest:guest@127.0.0.1:5672/",
-            "KBM_LEDSAS_BLOB_CONN_STRING": _BLOB_CONN,
-        }
-        with patch.dict(os.environ, env, clear=True):
-            with caplog.at_level(logging.WARNING):
-                SDKConfig.from_env("svc")
-        warnings = [r for r in caplog.records if "no longer used" in r.getMessage()]
-        assert warnings == []
-
-
-class TestNoUnimplementedVariables:
-    """Ensure we don't document variables that aren't implemented."""
-
-    def test_no_trace_sampling_in_registry(self):
-        names = get_all_var_names()
-        assert "KBM_LEDSAS_TRACE_SAMPLING" not in names
-
-    def test_no_max_inline_bytes_in_registry(self):
-        names = get_all_var_names()
-        assert "KBM_LEDSAS_MAX_INLINE_BYTES" not in names
-
-
 class TestCustomerJourneyScenario:
     """Simulate the exact scenario a customer follows from documentation."""
 
@@ -185,7 +138,14 @@ class TestRegistryValidValues:
         spec = get_env_var("KBM_LEDSAS_LOG_FORMAT")
         assert set(spec.valid_values) == {"json", "text"}
 
-    def test_mode_and_dev_not_in_registry(self):
-        """The retired mode settings are absent from the registry."""
-        assert get_env_var("KBM_LEDSAS_MODE") is None
-        assert get_env_var("KBM_LEDSAS_DEV") is None
+
+class TestNoUnimplementedVariables:
+    """Ensure we don't document variables that aren't implemented."""
+
+    def test_no_trace_sampling_in_registry(self):
+        names = get_all_var_names()
+        assert "KBM_LEDSAS_TRACE_SAMPLING" not in names
+
+    def test_no_max_inline_bytes_in_registry(self):
+        names = get_all_var_names()
+        assert "KBM_LEDSAS_MAX_INLINE_BYTES" not in names

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Send a ``SayHello`` command to the hello-world service and print the reply.
 
-This is the *caller* side of the template: it publishes a LEDSAS command
+This is the *caller* side of this example: it publishes a LEDSAS command
 envelope to the service's command exchange, waits for the response on a
-transient reply exchange it owns, and prints the greeting.
+reply exchange it owns, and prints the greeting.
 
 It deliberately uses **aio-pika directly** — NOT the LEDSAS SDK. The SDK is
 the service/handler side; a caller (orchestrator, test rig, this script)
@@ -11,15 +11,21 @@ just speaks AMQP. aio-pika is already a transitive dependency of the SDK,
 so no extra install is needed in the dev venv.
 
 Reply-to contract (see docs/SDK_API_REFERENCE.md): the caller owns the
-reply topology. This script declares a transient reply exchange + queue +
-binding (routing key ``response``), sets ``envelope.reply_to`` to that
-exchange name, and the SDK publishes the handler's return value there. The
-response is matched on ``correlation_id``.
+reply topology. This script declares a reply exchange + queue + binding
+(routing key ``response``), sets ``envelope.reply_to`` to that exchange name,
+and the SDK publishes the handler's return value there. The response is
+matched on ``correlation_id``; the script deletes its reply queue and
+exchange when it exits, whatever happened.
 
 Usage::
 
     python scripts/send_hello.py            # -> "hello world"
     python scripts/send_hello.py Ada        # -> "hello Ada"
+    python scripts/send_hello.py Ada --idempotency-key hello-1   # a deliberate resend
+
+Each run sends a new request (a new idempotency key, printed at the
+start). Pass the key of an earlier run with ``--idempotency-key`` to resend
+that request on purpose.
 
 Environment (read from process env; see ../.env.example):
     KBM_LEDSAS_SERVICE_NAME   (default hello-world)
@@ -35,6 +41,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -46,28 +53,44 @@ from typing import Any
 
 DEFAULT_SERVICE_NAME = "hello-world"
 DEFAULT_RABBITMQ_URL = "amqp://guest:guest@127.0.0.1:5672/"
+# The service sends one reply per command, after its last attempt, so the
+# wait must cover the retries: with the SDK defaults (3 retries, 7-10 s of
+# backoff) 30 s covers a handler that fails fast on every attempt.
+DEFAULT_TIMEOUT_S = 30.0
 
 
 def build_command_exchange_name(tenant: str | None, service_name: str) -> str:
-    """Reproduce the SDK's command-exchange naming.
+    """The service's command exchange, as documented in docs/SDK_API_REFERENCE.md:
 
-    Mirrors ``kbm_ledsas_sdk.amqp.topology.build_exchange_name("cmd", ...)``:
-      - with tenant:    cmd.{tenant}.{service}.v1
-      - without tenant: cmd.{service}.v1
+    - with tenant:    cmd.{tenant}.{service}.v1
+    - without tenant: cmd.{service}.v1
     """
     if tenant:
         return f"cmd.{tenant}.{service_name}.v1"
     return f"cmd.{service_name}.v1"
 
 
-def build_idempotency_key(now: datetime | None = None) -> str:
-    """Build the idempotency key: hello-{utc-iso8601-second}.
+def build_idempotency_key() -> str:
+    """A new idempotency key, ``hello-<32 hex digits>``, for a new request.
 
-    Truncated to whole seconds so re-sends within the same second collapse
-    to one logical request.
+    One key per logical request: two sends of the same request must carry
+    the same key (pass it with ``--idempotency-key``), and two different
+    requests never share one, however close together they are sent.
     """
-    now = now or datetime.now(UTC)
-    return f"hello-{now.strftime('%Y%m%dT%H%M%SZ')}"
+    return f"hello-{uuid.uuid4().hex}"
+
+
+# The envelope's idempotency-key pattern: a key outside it makes the command
+# an invalid envelope, dead-lettered without a reply.
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_\-:.]{1,128}$")
+
+
+def idempotency_key_arg(text: str) -> str:
+    """argparse type for ``--idempotency-key``: 1 to 128 letters, digits or
+    ``_ - : .`` characters (the envelope's pattern)."""
+    if not _IDEMPOTENCY_KEY_RE.match(text):
+        raise argparse.ArgumentTypeError("must be 1 to 128 letters, digits or _ - : . characters")
+    return text
 
 
 def build_command_envelope(
@@ -150,68 +173,84 @@ async def _publish_and_wait(
     correlation_id: str,
     timeout: float,
 ) -> dict[str, Any]:
-    """Declare reply topology, publish the command, await the matching reply."""
+    """Declare reply topology, publish the command, await the matching reply.
+
+    The reply queue and exchange are deleted however this ends (reply
+    received, timeout, a failed publish), so a run leaves nothing behind on
+    the broker; when the command exchange does not exist, none is created.
+    """
     import aio_pika
 
     connection = await aio_pika.connect_robust(env.rabbitmq_url)
     try:
         channel = await connection.channel()
 
-        # Caller-owned reply topology (the SDK does NOT declare this).
-        rx = await channel.declare_exchange(
-            reply_exchange, aio_pika.ExchangeType.TOPIC, durable=True
-        )
-        # durable=True + auto_delete=False: an auto_delete reply queue
-        # vanishes the moment its consumer disconnects, unbinding the
-        # exchange — after which every response the SDK publishes is
-        # unroutable and dead-letters the command it answers (the SDK
-        # publishes replies mandatory). This script owns and deletes the
-        # queue explicitly in the finally below.
-        rq = await channel.declare_queue(reply_queue, durable=True, auto_delete=False)
-        await rq.bind(rx, routing_key="response")
-
         # Reference the command exchange the service declares (do NOT
-        # redeclare it with conflicting args — passive lookup).
+        # redeclare it with conflicting args — passive lookup). Looked up
+        # first: when the service has never started, nothing is created.
         cmd_ex = await channel.get_exchange(env.command_exchange, ensure=True)
-        await cmd_ex.publish(
-            aio_pika.Message(
-                body=json.dumps(message).encode("utf-8"),
-                content_type="application/json",
-                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-            ),
-            routing_key="command",
-        )
 
-        # Await the matching response.
-        future: asyncio.Future = asyncio.get_event_loop().create_future()
-
-        async def on_message(msg: aio_pika.abc.AbstractIncomingMessage) -> None:
-            async with msg.process():
-                try:
-                    body = json.loads(msg.body)
-                except Exception:
-                    return
-                env_block = body.get("envelope", {})
-                if env_block.get("correlation_id") == correlation_id:
-                    if not future.done():
-                        future.set_result(body)
-
-        consumer_tag = await rq.consume(on_message)
+        rx = None
+        rq = None
+        consumer_tag = None
         try:
+            # Caller-owned reply topology (the SDK does NOT declare this).
+            rx = await channel.declare_exchange(
+                reply_exchange, aio_pika.ExchangeType.TOPIC, durable=True
+            )
+            # durable=True + auto_delete=False: an auto_delete reply queue
+            # vanishes the moment its consumer disconnects, unbinding the
+            # exchange — after which every response the SDK publishes is
+            # unroutable and dead-letters the command it answers (the SDK
+            # publishes replies mandatory). This script owns the queue and
+            # deletes it in the finally below.
+            rq = await channel.declare_queue(reply_queue, durable=True, auto_delete=False)
+            await rq.bind(rx, routing_key="response")
+
+            # Await the matching response.
+            future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+
+            async def on_message(msg: aio_pika.abc.AbstractIncomingMessage) -> None:
+                async with msg.process():
+                    try:
+                        body = json.loads(msg.body)
+                    except Exception:
+                        return
+                    env_block = body.get("envelope", {})
+                    if env_block.get("correlation_id") == correlation_id:
+                        if not future.done():
+                            future.set_result(body)
+
+            # Consume before publishing, so a fast reply cannot be missed.
+            consumer_tag = await rq.consume(on_message)
+            await cmd_ex.publish(
+                aio_pika.Message(
+                    body=json.dumps(message).encode("utf-8"),
+                    content_type="application/json",
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                ),
+                routing_key="command",
+            )
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
-            await rq.cancel(consumer_tag)
-            # Cleanup: the reply queue is durable + not auto_delete now, so
-            # delete it explicitly (it no longer disappears on disconnect),
-            # then remove the transient reply exchange we created.
-            try:
-                await rq.delete(if_unused=False, if_empty=False)
-            except Exception:
-                pass
-            try:
-                await rx.delete(if_unused=True)
-            except Exception:
-                pass
+            # Cleanup, whatever happened above (a cleanup error never hides
+            # the original one): the reply queue is durable and not
+            # auto_delete, so delete it explicitly, then the reply exchange.
+            if rq is not None:
+                if consumer_tag is not None:
+                    try:
+                        await rq.cancel(consumer_tag)
+                    except Exception:
+                        pass
+                try:
+                    await rq.delete(if_unused=False, if_empty=False)
+                except Exception:
+                    pass
+            if rx is not None:
+                try:
+                    await rx.delete(if_unused=False)
+                except Exception:
+                    pass
     finally:
         await connection.close()
 
@@ -219,12 +258,13 @@ async def _publish_and_wait(
 async def _run(args: argparse.Namespace) -> int:
     env = Env()
     correlation_id = str(uuid.uuid4())
-    idempotency_key = build_idempotency_key()
+    idempotency_key = args.idempotency_key or build_idempotency_key()
     reply_exchange = f"reply-ex-hello-{uuid.uuid4().hex[:8]}"
     reply_queue = f"{reply_exchange}-q"
 
     print(f"Service:      {env.service_name} (tenant={env.tenant})")
     print(f"Cmd exchange: {env.command_exchange}")
+    print(f"Idempotency:  {idempotency_key} (pass --idempotency-key to resend this request)")
 
     message = build_command_message(
         reply_to=reply_exchange,
@@ -260,7 +300,7 @@ async def _run(args: argparse.Namespace) -> int:
     return 0 if payload.get("greeting") else 1
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Publish a SayHello command and print the greeting."
     )
@@ -273,10 +313,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--timeout",
         type=float,
-        default=15.0,
-        help="Seconds to wait for the response (default 15).",
+        default=DEFAULT_TIMEOUT_S,
+        help=(
+            "Seconds to wait for the response (default %(default)s). The one reply "
+            "comes after the last attempt: allow the handler's run time times "
+            "(KBM_LEDSAS_MAX_RETRIES + 1) plus the retry backoff (7 to 10 s with the "
+            "default 3 retries); at least 30 s with the SDK defaults."
+        ),
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--idempotency-key",
+        type=idempotency_key_arg,
+        default=None,
+        help=(
+            "Resend an earlier request on purpose: reuse its idempotency key "
+            "(1 to 128 letters, digits or _ - : .; default: a new key for every run)."
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     return asyncio.run(_run(args))
 
 

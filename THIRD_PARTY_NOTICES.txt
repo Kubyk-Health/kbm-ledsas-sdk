@@ -1,4 +1,4 @@
-LEDSAS SDK v0.3.5 - THIRD-PARTY SOFTWARE NOTICES
+LEDSAS SDK v0.3.6 - THIRD-PARTY SOFTWARE NOTICES
 
 The LEDSAS SDK itself is licensed under the Apache License, Version 2.0
 (see LICENSE at the root of this repository). The notices below are for the
@@ -20,12 +20,15 @@ This software includes the following third-party components:
 
 3. pydantic (v2.5.0+)
    License: MIT License
-   Copyright: Copyright (c) 2023 Samuel Colvin
+   Copyright: Copyright (c) 2017 to present Pydantic Services Inc. and
+   individual contributors
    URL: https://github.com/pydantic/pydantic
 
 4. aiohttp (v3.14.3+)
-   License: Apache License 2.0
-   Copyright: Copyright (c) 2013-2023 aiohttp contributors
+   License: Apache License 2.0 AND MIT License (Apache-2.0 for aiohttp;
+   MIT for the llhttp HTTP parser it bundles)
+   Copyright: Copyright aio-libs contributors; llhttp: Copyright (c) 2018
+   Fedor Indutny
    URL: https://github.com/aio-libs/aiohttp
 
 5. cryptography (v50.0.0+)
@@ -47,7 +50,8 @@ The SDK's wheel and source distribution do not contain the listed
 third-party packages:
 `pip install` pulls them from PyPI, and each ships its own LICENSE file
 inside the install directory (e.g.
-`venv/lib/python3.11/site-packages/aio_pika-*.dist-info/LICENSE`). The
+`venv/lib/python3.11/site-packages/aio_pika-*.dist-info/licenses/COPYING`;
+aiohttp's includes `licenses/vendor/llhttp/LICENSE`). The
 URLs above link to each project's source, which also carries the full
 license text.
 
@@ -55,7 +59,8 @@ Container images are different: the LEDSAS base image
 `ghcr.io/kebormed/kbm-ledsas-base-direct` (see the README, "Container
 base image") contains the SDK with all of these packages already
 installed, so an image built on it redistributes them. Their license files are inside the image, under the
-Python site-packages directory (`<pkg>-*.dist-info/`); keep them when
+Python site-packages directory (`<pkg>-*.dist-info/licenses/`, or
+`<pkg>-*.dist-info/` for packages built with older tools); keep them when
 you ship an image, and include this notice with it.
 
 This notice covers only the SDK's Python packages. The base image also
@@ -82,7 +87,8 @@ above, annotated with the path that pulls each one:
   azure-core            (via azure-storage-blob)
   cryptography          (via azure-storage-blob; also declared
                         directly, see 5. above)
-  cffi                  (via cryptography)
+  cffi                  (via cryptography)  — License: MIT-0 (MIT No
+                        Attribution)
   pycparser             (via cffi)
   isodate               (via azure-storage-blob)
   requests              (via azure-storage-blob -> azure-core)
@@ -91,13 +97,13 @@ above, annotated with the path that pulls each one:
                         License 2.0). This is the only non-permissive
                         (weak file-level copyleft) license among the
                         SDK's Python dependencies listed here; all
-                        others are Apache-2.0 / MIT / BSD / PSF (the base
+                        others are Apache-2.0 / MIT / MIT-0 / BSD / PSF (the base
                         image's operating-system packages are not part
                         of this list; see above). The SDK wheel does not contain certifi
                         (pip pulls it at install time as above). An image
                         built on the base image does redistribute it,
                         unmodified, inside the base image, with its license
-                        file (`certifi-*.dist-info/`) and its source (the
+                        file (`certifi-*.dist-info/licenses/`) and its source (the
                         `.py` files themselves). Distributing unmodified
                         MPL-2.0 files that way, with the license notice
                         kept, needs no further action; the MPL's
@@ -123,8 +129,9 @@ above, annotated with the path that pulls each one:
   typing-inspection     (via pydantic)
 
 Each ships its own license file in the install directory (e.g.
-`venv/lib/python3.11/site-packages/<pkg>-*.dist-info/LICENSE`).
+`venv/lib/python3.11/site-packages/<pkg>-*.dist-info/licenses/LICENSE`;
+packages built with older tools keep it directly in `<pkg>-*.dist-info/`).
 
 All third-party software is used in accordance with their respective licenses.
 
-Last Updated: 2026-10-17
+Last Updated: 2026-10-18

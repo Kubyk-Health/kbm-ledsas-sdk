@@ -8,7 +8,10 @@ change is documented here and in [CHANGELOG.md](CHANGELOG.md).
 ## Before any upgrade
 
 1. **Pin the exact version** you are moving to (for example
-   `kbm-ledsas-sdk==0.3.5`) and upgrade deliberately.
+   `kbm-ledsas-sdk==0.3.6`) and upgrade deliberately. Upgrade with
+   `pip install -U --upgrade-strategy eager kbm-ledsas-sdk==0.3.6`: a plain
+   `pip install -U` keeps dependencies that still satisfy the new ranges (an
+   installed `aio-pika` 9.x stays, where a fresh install gets 10.x).
 2. **Read the section below** for your target version, alongside the matching
    [CHANGELOG.md](CHANGELOG.md) entry.
 3. **Run your test suite** against the new version in a non-production environment
@@ -16,15 +19,15 @@ change is documented here and in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
-## Upgrading to 0.3.5 (from 0.3.3)
+## Upgrading to 0.3.6 (from 0.3.3)
 
 **Type:** dependency, security and reliability release. **No public method or
 parameter was removed or renamed** and the AMQP envelope (schema `1.0`) and
 topology are unchanged, but several behaviors change, and input that was never
-valid but used to be accepted is now refused with a clear error. 0.3.4 was not
-published to PyPI; upgrade straight from 0.3.3. The full list of changes is in the
-[CHANGELOG.md](CHANGELOG.md) `[0.3.5]` entry; this section lists what may need
-action.
+valid but used to be accepted is now refused with a clear error. 0.3.4 and 0.3.5
+were not released (numbers skipped, no changes); upgrade straight from 0.3.3. The
+full list of changes is in the [CHANGELOG.md](CHANGELOG.md) `[0.3.6]` entry; this
+section lists what may need action.
 
 ### Dependencies
 
@@ -33,7 +36,8 @@ action.
   your own requirements or constraints, the install fails to resolve: raise your
   pin.
 - **`aio-pika` 10.x is accepted** (`>=9.4.0,<11.0`). Nothing to do; if you pin
-  `aio-pika` yourself, both 9.x and 10.x work.
+  `aio-pika` yourself, both 9.x and 10.x work. An in-place `pip install -U` keeps
+  an installed 9.x (see "Before any upgrade" for `--upgrade-strategy eager`).
 
 ### Callers: one reply per command
 
@@ -41,14 +45,23 @@ action.
   retried sends no reply any more; the one reply is the handler's result, a
   non-retryable error, or the last attempt's error once `KBM_LEDSAS_MAX_RETRIES` is
   spent. A caller that waited for several replies can stop at the first. **Allow
-  for the retries in the caller's reply timeout:** with the default 3 retries the
-  backoff alone is 7 to 10 seconds (30 seconds or more is a safe timeout).
+  for the retries in the caller's reply timeout:** a command can take up to its
+  handler's run time × (`KBM_LEDSAS_MAX_RETRIES` + 1) plus the backoff between
+  attempts (7 to 10 seconds in all with the default 3 retries). For a handler
+  that answers in a few seconds, wait at least 30 seconds with the defaults
+  (the example's `scripts/send_hello.py` waits 30); for longer handlers use the
+  formula.
 - **Envelope timestamps and `priority` are not converted any more.** Send
   `sent_at` / `deadline` as ISO 8601 text and `priority` as an integer; a command
   with any other type is dead-lettered as an invalid envelope.
 - **A `reply_to` naming a service's own command or dead-letter exchange**
-  (`cmd.…` / `dlq.…`) is refused: the command is dead-lettered before its handler
-  runs. `"reply_to": null` now means fire-and-forget, like `""`.
+  (`cmd.…` / `dlq.…`) **or a reserved broker exchange** (`amq.…`, such as
+  `amq.topic` or `amq.direct`) is refused: the command is dead-lettered before its
+  handler runs. A caller that named `amq.topic` as its `reply_to` declares a reply
+  exchange of its own. `"reply_to": null` now means fire-and-forget, like `""`.
+- **Version fields are ASCII digits, 1 to 4 on each side of the dot.**
+  `schema_version` and `message_version` look like `1.0` or `12.3`; a command with
+  longer numbers or other Unicode digits is dead-lettered as an invalid envelope.
 - **A result with a top-level `"error"` key is a successful result:** any dict a
   handler returns is replied as it is and the command acknowledged (such a result
   used to have its command dead-lettered after the reply). To fail a command,
@@ -57,11 +70,28 @@ action.
 ### Handlers
 
 - **`@app.handler` checks what it registers.** The command name must match
-  `^[A-Za-z][A-Za-z0-9_]*$` (at most 64 characters) and the version must look like
-  `1.0`; a handler that is not `async def` raises `TypeError` at registration. If
-  registration now raises, rename the command (callers must send the new name) or
-  define the handler with `async def` (run blocking work with
-  `await asyncio.to_thread(...)`).
+  `^[A-Za-z][A-Za-z0-9_]*$` (at most 64 characters), the version must look like
+  `1.0`, and the handler must be an `async def` function that takes two
+  positional arguments (`ctx, payload`); the version, like the envelope's, is
+  ASCII digits, 1 to 4 on each side of the dot. The check runs when the decorator runs,
+  that is **when your module is imported**, so a refusal is a traceback at
+  import (before `app.run()`), ending in one of:
+
+  ```text
+  ValueError: Invalid command name 'Process-CSV': use a letter followed by letters, digits or underscores (at most 64 characters), e.g. 'ProcessDataset' or 'process_data'. ...
+  ValueError: Invalid message version '1' for ProcessCSV: use '<major>.<minor>' digits, e.g. '1.0'.
+  TypeError: Handler for ProcessCSV v1.0 must be an async function ('async def'): ...
+  TypeError: Handler for ProcessCSV v1.0 must accept two positional arguments (ctx, payload): ...
+  ```
+
+  Rename the command (callers must send the new name), fix the version, or
+  define the handler with `async def handler(ctx, payload)` (run blocking work
+  with `await asyncio.to_thread(...)`).
+- **Message models are read-only.** `Envelope`, `Command`, `Response` and `Status`
+  are immutable, like `BlobRef` already was: assigning a field (for example
+  `ctx.envelope.reply_to = ...`, or setting a field of a `Command` you built)
+  raises `pydantic.ValidationError` ("Instance is frozen"). Build a changed copy
+  with `model_copy(update={"reply_to": ...})`, or construct a new object.
 - **Return a JSON-serializable `dict` (or nothing).** A handler that returns
   `None` replies `{}`. Any other value without a JSON form, or a result larger than
   `KBM_LEDSAS_MAX_PAYLOAD_BYTES`, is replied as `Permanent` and dead-lettered
@@ -94,6 +124,25 @@ action.
   characters are refused with a clear message, and a storage connection string
   must carry a credential (an `AccountKey` the storage client can decode, or a
   `SharedAccessSignature`). Fix the setting the error names.
+- **A broker URL that sets `no_verify_ssl` to any value except `0` is refused at
+  start** (`1`, `true`, even `false` or an empty value: the AMQP client library
+  then skips the verification of the broker's TLS certificate;
+  `no_verify_ssl=0` keeps it on and is accepted), unless
+  `KBM_LEDSAS_ALLOW_INSECURE_AMQP=1` acknowledges it (then one WARNING is logged).
+  Remove it; to trust a private certificate authority, name its certificate with
+  `?cafile=<path>` instead.
+- **New `KBM_LEDSAS_HEARTBEAT`** (default `15` seconds, `0` to `600`, `0` turns
+  heartbeats off): the SDK asks the broker for this AMQP heartbeat interval
+  (0.3.3 set none of its own, so the AMQP client library's default of 60 seconds
+  applied). A `?heartbeat=` in `KBM_LEDSAS_RABBITMQ_URL` still wins. A dead broker
+  or network path is now noticed within about 50 seconds (48 to 55 with the
+  default; three intervals plus three seconds), and the SDK reconnects.
+  **Blocking code that holds the event loop longer than about two intervals**
+  (about 30 seconds with the default) now makes the broker close the connection,
+  and the SDK reconnects. Run blocking work with
+  `await asyncio.to_thread(...)` (see "Blocking code is not timed out" in the
+  [API reference](docs/SDK_API_REFERENCE.md)), or set `KBM_LEDSAS_HEARTBEAT=60` for
+  the old timing.
 - **A boolean setting must be a boolean.** `KBM_LEDSAS_GENERIC_ERRORS`,
   `KBM_LEDSAS_HEALTH_VERBOSE`, `KBM_LEDSAS_ALLOW_INSECURE_AMQP` and
   `KBM_LEDSAS_DEBUG` accept `true` / `false` (or `1` / `0`, `yes` / `no`,
@@ -114,6 +163,9 @@ action.
 
 ### Operations
 
+- **`deployment_id` is read as before**: from `KBM_LEDSAS_DEPLOYMENT_ID`, or
+  from `KBM_LASTCOMMITID` when the first is unset or blank. Both names stay
+  supported; nothing to change.
 - **`/ready` reports a broker outage** (`503` until the SDK has reconnected by
   itself) and answers `503` while the service stops. A readiness probe that
   expected `200` throughout an outage now sees the outage.
@@ -124,17 +176,23 @@ action.
 - **Log formats.** JSON log timestamps are UTC ISO 8601 with milliseconds and a `Z`
   suffix, and the text format shows the failure details as `key=value` fields;
   update a log parser that expected the old shapes.
+- **A message whose AMQP properties are not valid UTF-8 is dead-lettered once**
+  (one WARNING, `AMQP message property message_id is not valid UTF-8;
+  dead-lettering`), instead of dropping the connection on every redelivery.
+  Nothing to do; such a message ends up in the dead-letter queue.
+- **Storage reached over `http://` on another machine logs one WARNING at start**
+  (its requests travel in cleartext); use `https://` outside local development.
 - **Message bodies nested more than 256 levels deep are dead-lettered.** Flatten
   such data, or upload it to blob storage and send its reference.
 
 ### Containers
 
-- **Build service images `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.5`**,
+- **Build service images `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6`**,
   which comes with the SDK installed (the tag is the SDK version), instead of
   installing `kbm-ledsas-sdk` on a generic Python image; never list the SDK in your
   `requirements.txt`. See the [README](README.md#container-base-image) and
   [`examples/hello_world_service/`](examples/hello_world_service/). This is a
-  recommendation: `pip install kbm-ledsas-sdk==0.3.5` on any Python 3.11+ image
+  recommendation: `pip install kbm-ledsas-sdk==0.3.6` on any Python 3.11+ image
   still works.
 
 ---
@@ -153,7 +211,7 @@ Responses (and status updates) are now published with the AMQP **mandatory** fla
   bound** for the `response` routing key, the broker silently discarded the
   response and the command was acknowledged as if it had been delivered — a silent
   data loss.
-- **Now (0.3.3):** the broker returns the unroutable message, `send_response()`
+- **Now (0.3.3):** the broker returns the unroutable message, the SDK
   reports the failure, and the command is NACKed to the dead-letter queue with one
   clean ERROR line (and a new `reply_unroutable_failures` counter). The failure is
   now **visible** instead of silent.
@@ -196,12 +254,14 @@ A correctly-wired service and caller need **no changes**.
 
 ## Upgrading from a clone / source install
 
-If you install from source (`pip install -e .`), check out the target release,
-reinstall, and re-run your tests:
+If you install from source, check out the target release, reinstall with the
+test toolchain (the `dev` extra), and re-run the unit tests (see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the integration tests, which need a
+broker):
 
 ```bash
 git fetch --tags
-git checkout v0.3.5
-pip install -e .
-pytest
+git checkout v0.3.6
+pip install -e ".[dev]"
+pytest -m "not integration"
 ```

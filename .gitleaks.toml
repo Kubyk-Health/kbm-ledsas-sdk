@@ -1,28 +1,24 @@
 # gitleaks configuration for kbm-ledsas-sdk.
-# Extends the default ruleset and allowlists known-safe test fixtures /
-# documentation values that are NOT real secrets. Reviewed 2026-07-01:
-# both gitleaks and trufflehog reported zero verified secrets.
+# Extends the default ruleset and allowlists documentation/test values that are
+# not secrets. Each allowlist regex is anchored (^...$) and is matched against
+# the detected secret itself, so it allows exactly one value and can never hide
+# a different string that merely contains it.
 
 [extend]
 useDefault = true
 
 [[allowlists]]
-description = "Known-safe fixtures: public Azurite dev key, UUID test fixtures, obvious fakes"
-regexTarget = "match"
+description = "Known-safe values: the public Azurite development key, a UUID test fixture, an obvious fake"
+regexTarget = "secret"
 regexes = [
-  # Microsoft's WELL-KNOWN public Azurite development storage key — documented
-  # in every Azure dev example; used here so the example service runs offline.
-  '''Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==''',
+  # Microsoft's WELL-KNOWN public Azurite development storage key, documented
+  # in every Azure development example; used so the example service runs offline.
+  '''^Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==$''',
   # The same public key split across two string literals (first half).
-  '''Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/''',
-  # Docstring example in runtime/security.py: a broker URL whose password holds an
-  # unencoded '@'/'#', shown to explain why such URLs are refused. Not a credential.
-  '''amqp://guest:p@ss#word@host''',
+  '''^Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/$''',
   # UUID literal used as an idempotency_key across model tests (matched only
   # because the field name contains "key").
-  '''a6f6d1e7-6c8a-4f6b-9c4b-4c2f8dbf1d99''',
+  '''^a6f6d1e7-6c8a-4f6b-9c4b-4c2f8dbf1d99$''',
   # Obvious fake account key in a validation test.
-  '''Fak3K3yForT3sts999==''',
-  # Default RabbitMQ guest credentials in local/dev/test URLs (not a secret).
-  '''amqp://guest:guest@''',
+  '''^Fak3K3yForT3sts999==$''',
 ]

@@ -6,7 +6,6 @@ client libraries are only loaded when a service starts.
 
 from __future__ import annotations
 
-import logging  # noqa: F401
 import os
 from typing import TYPE_CHECKING
 
@@ -24,16 +23,15 @@ def warn_unknown_settings() -> None:
     """One WARNING naming the ``KBM_LEDSAS_*`` environment variables that
     are not settings of this SDK (a typo such as ``KBM_LEDSAS_PREFECH``
     would otherwise be ignored without a word while the default applies),
-    each with the closest setting's name. The retired variables are left
-    to their own warning. Values are never logged."""
-    from ..runtime import config as config_module
+    each with the closest setting's name.
+    Values are never logged."""
     from ..runtime.env_vars import (
         describe_unknown_settings,
         get_all_var_names,
         unknown_settings,
     )
 
-    known = set(get_all_var_names()) | set(config_module._LEGACY_MODE_VARS)
+    known = set(get_all_var_names())
     found = unknown_settings(os.environ, known)
     if found:
         logger.warning(
@@ -241,6 +239,36 @@ def warn_prefetch_below_concurrency(config: SDKConfig) -> None:
     )
 
 
+# Credential-free examples: the error text is logged through the SDK's
+# secret masker, which would turn a user:password example into "***".
+_MISSING_RABBITMQ_URL = (
+    "KBM_LEDSAS_RABBITMQ_URL is not set. Set it to the broker URL, for "
+    "example amqp://127.0.0.1:5672/ (put user:password@ before the host)."
+)
+_MISSING_BLOB_CONN_STRING = (
+    "KBM_LEDSAS_BLOB_CONN_STRING is not set. Set it to the storage "
+    "account's connection string (it starts with DefaultEndpointsProtocol=)."
+)
+_SEE_ENV_VARS = (
+    'See "Environment Variables" in the SDK API reference '
+    "(https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/docs/SDK_API_REFERENCE.md#environment-variables)."
+)
+
+
+def missing_connection_settings(config: SDKConfig) -> list[str]:
+    """Messages for every required connection setting that is unset (all
+    of them at once, so one restart fixes the configuration), ending with
+    a pointer to the settings reference; empty when nothing is missing."""
+    problems = []
+    if not config.rabbitmq_url:
+        problems.append(_MISSING_RABBITMQ_URL)
+    if not config.blob_conn_string:
+        problems.append(_MISSING_BLOB_CONN_STRING)
+    if problems:
+        problems.append(_SEE_ENV_VARS)
+    return problems
+
+
 def build_transport(config: SDKConfig) -> Transport:
     """Construct DirectTransport, validating required connection env vars
     (and warning once about ``KBM_LEDSAS_*`` variables that are not
@@ -254,19 +282,9 @@ def build_transport(config: SDKConfig) -> Transport:
     warn_memory_bound(config)
     warn_long_handler_timeout(config)
     warn_prefetch_below_concurrency(config)
-    if not config.rabbitmq_url:
-        raise ValueError(
-            "This deployment requires a RabbitMQ connection URL. "
-            "Set KBM_LEDSAS_RABBITMQ_URL (e.g. "
-            "amqp://guest:guest@127.0.0.1:5672/). "
-            "See QUICKSTART_DIRECT_MODE.md section 3.1."
-        )
-    if not config.blob_conn_string:
-        raise ValueError(
-            "This deployment requires an Azure Blob connection string. "
-            "Set KBM_LEDSAS_BLOB_CONN_STRING. "
-            "See QUICKSTART_DIRECT_MODE.md section 3.1."
-        )
+    missing = missing_connection_settings(config)
+    if missing:
+        raise ValueError(" ".join(missing))
 
     return DirectTransport(
         rabbitmq_url=config.rabbitmq_url,
@@ -277,4 +295,5 @@ def build_transport(config: SDKConfig) -> Transport:
         default_container=config.blob_container,
         max_payload_bytes=config.max_payload_bytes,
         connect_timeout=config.connect_timeout,
+        heartbeat=config.heartbeat,
     )

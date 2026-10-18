@@ -7,8 +7,6 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
-import logging  # noqa: F401
-import os
 import socket
 import time
 from collections.abc import Awaitable, Callable
@@ -17,6 +15,7 @@ from http import HTTPStatus
 from aiohttp import hdrs, web, web_protocol
 from aiohttp.http_exceptions import HttpProcessingError
 
+from ..runtime.security import _read_env
 from ..utils.logging import masked_logger
 from .checks import CheckResult, HealthCheckRegistry
 
@@ -45,7 +44,6 @@ LivenessSignal = Callable[[], Awaitable[CheckResult]]
 # The server is aiohttp's low-level ``web.Server`` with a small router, so
 # no application-level hook is needed for either.
 
-ROUTES = ("/health", "/ready", "/livez", "/readyz")
 _ALLOWED_METHODS = ("GET", "HEAD")
 
 # How long stop() waits for probe requests still being answered (seconds).
@@ -297,13 +295,8 @@ class HealthServer:
         # service name, SDK version, and per-check status — useful for
         # development but fingerprintable when HEALTH_HOST=0.0.0.0.
         self.verbose = verbose
-        # Whether to surface the deployed-service id (deployment_id, from
-        # KBM_LASTCOMMITID) in responses. Reported only when the SDK is the
-        # deployment's own health surface; when another component owns the
-        # aggregated health, that component owns deployment_id and the SDK
-        # stays silent to avoid a duplicate/divergent value. ``ServiceApp``
-        # passes ``True`` for direct/dev deployments. Defaults to ``True``
-        # so a directly-constructed server keeps reporting it.
+        # Whether to include deployment_id (from KBM_LEDSAS_DEPLOYMENT_ID,
+        # else KBM_LASTCOMMITID); ServiceApp decides. Defaults to True.
         self.emit_deployment_id = emit_deployment_id
 
         # /health and /ready, plus the Kubernetes-conventional /livez and
@@ -417,20 +410,20 @@ async def _trivial_liveness() -> CheckResult:
 
 
 def _deployment_id() -> str | None:
-    """Deployed-service identifier injected at deploy time via ``KBM_LASTCOMMITID``.
+    """Deployed-service identifier: ``KBM_LEDSAS_DEPLOYMENT_ID``, else
+    ``KBM_LASTCOMMITID`` (the same identifier under another name, read when
+    ``KBM_LEDSAS_DEPLOYMENT_ID`` is unset or blank).
 
     Returned as ``deployment_id`` in every /health and /ready body so an
     operator can confirm which build is actually live behind a probe. Read
     from the environment at request time (the value is stable for the life
-    of the process). Returns ``None`` when the variable is unset or blank —
-    in which case the key is omitted entirely, keeping the minimal default
-    response fingerprint-free outside a real deployment.
+    of the process) with the settings reader: surrounding whitespace and
+    one matched pair of surrounding quotes are removed. Returns ``None``
+    when neither variable holds a value, in which case the key is omitted
+    entirely, keeping the minimal default response fingerprint-free
+    outside a real deployment.
     """
-    value = os.environ.get("KBM_LASTCOMMITID")
-    if value is None:
-        return None
-    value = value.strip()
-    return value or None
+    return _read_env("KBM_LEDSAS_DEPLOYMENT_ID") or _read_env("KBM_LASTCOMMITID") or None
 
 
 def _build_response(
@@ -447,7 +440,7 @@ def _build_response(
         # Minimal default — no fingerprintable detail. Failing checks
         # do report names so an operator can diagnose, but no
         # version/service identifiers. The deploy id is the one exception:
-        # it is present only when injected at deploy time, so it never
+        # it is present only when set at deploy time, so it never
         # leaks build info in a dev/local run where the var is unset.
         body = {"status": status}
         if deployment_id is not None:

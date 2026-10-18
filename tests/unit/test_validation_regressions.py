@@ -33,7 +33,7 @@ AZURITE_CONN = (
 
 
 # ---------------------------------------------------------------------------
-# C-MEDIUM-1 — expected-startup-error suppression for broker-unreachable
+# Expected-startup-error suppression for broker-unreachable
 # ---------------------------------------------------------------------------
 
 
@@ -82,7 +82,7 @@ def test_broker_unreachable_exits_clean_without_traceback(
 
 
 # ---------------------------------------------------------------------------
-# C-LOW-1 — BlobRef boundary hardening
+# BlobRef boundary hardening
 # ---------------------------------------------------------------------------
 
 
@@ -127,7 +127,7 @@ def test_blobref_still_accepts_normal_unicode() -> None:
 
 
 # ---------------------------------------------------------------------------
-# C-LOW-2 — model_dump credential redaction
+# model_dump credential redaction
 # ---------------------------------------------------------------------------
 
 
@@ -170,7 +170,7 @@ def test_none_credentials_dump_as_none() -> None:
 
 
 # ---------------------------------------------------------------------------
-# A-F2 — public JSON log formatter renders extra={} fields
+# The public JSON log formatter renders extra={} fields
 # ---------------------------------------------------------------------------
 
 

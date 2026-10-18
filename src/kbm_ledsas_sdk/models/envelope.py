@@ -5,9 +5,11 @@ The envelope is a fixed wrapper around all message types (command, response, sta
 containing metadata for routing, correlation, tracing, and deadlines.
 """
 
+import copy as _copy
 import re
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
@@ -16,7 +18,52 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 _ISO_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}")
 
 
-class Envelope(BaseModel):
+_M = TypeVar("_M", bound="_ValidatedCopyModel")
+
+
+class _ValidatedCopyModel(BaseModel):
+    """A model whose copies are checked like a new one: pydantic's
+    ``model_copy(update=...)`` (and ``copy.replace()`` and the deprecated
+    ``copy(update=...)``, which use it) would set the updated fields
+    without running the validators, so an envelope that no constructor
+    accepts could be built and only be refused on the wire."""
+
+    def model_copy(self: _M, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> _M:
+        """A copy of this message; the fields in ``update`` replace the
+        copied ones and the result is validated as a new message is
+        (``pydantic.ValidationError`` when it is not a valid one).
+
+        As with pydantic's own ``model_copy``, the copy keeps which fields
+        were set (``model_fields_set``, so ``model_dump(exclude_unset=True)``
+        gives the same keys), plus the fields named in ``update``."""
+        data = {name: getattr(self, name) for name in type(self).model_fields}
+        if deep:
+            data = _copy.deepcopy(data)
+        update = dict(update) if update else {}
+        data.update(update)
+        copied = type(self).model_validate(data)
+        fields_set = set(self.model_fields_set) | (set(update) & set(type(self).model_fields))
+        object.__setattr__(copied, "__pydantic_fields_set__", fields_set)
+        return copied
+
+    def copy(
+        self: _M,
+        *,
+        include: Any = None,
+        exclude: Any = None,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> _M:
+        """Deprecated pydantic alias of :meth:`model_copy` (validated too;
+        ``include`` / ``exclude`` are not supported)."""
+        if include is not None or exclude is not None:
+            raise TypeError(
+                f"{type(self).__name__}.copy() takes no include / exclude; use model_copy()"
+            )
+        return self.model_copy(update=update, deep=deep)
+
+
+class Envelope(_ValidatedCopyModel):
     """
     Fixed envelope for all LEDSAS messages.
 
@@ -33,7 +80,8 @@ class Envelope(BaseModel):
     schema_version: str = Field(
         ...,
         description="Envelope schema version (not payload version)",
-        pattern=r"^\d+\.\d+$",
+        pattern=r"^[0-9]{1,4}\.[0-9]{1,4}$",
+        max_length=9,
     )
 
     # Drop the unused ``"error"`` value. The SDK
@@ -52,7 +100,8 @@ class Envelope(BaseModel):
     message_version: str = Field(
         ...,
         description="Version of the payload schema for this message name",
-        pattern=r"^\d+\.\d+$",
+        pattern=r"^[0-9]{1,4}\.[0-9]{1,4}$",
+        max_length=9,
     )
 
     # Accept mixed-case hex in UUID fields. RFC 4122
@@ -83,9 +132,9 @@ class Envelope(BaseModel):
         description=(
             "Idempotency key for replay safety. Must be URL-safe: "
             "alphanumerics, dot, underscore, hyphen, colon. Length "
-            "1..128. The bundled examples interpolate this key into "
-            "blob paths, so the character set is restricted to avoid "
-            "path-injection footguns in customer code."
+            "1..128. Handlers commonly interpolate this key into blob "
+            "paths (the idempotency-key replay pattern), so the "
+            "character set is restricted to avoid path injection."
         ),
         min_length=1,
         max_length=128,
@@ -210,11 +259,16 @@ class Envelope(BaseModel):
         or dead-letter queue (this service's own or another's), so such a
         command is refused like any other invalid envelope: dead-lettered
         before its handler runs. A reply exchange is the caller's own.
+
+        The broker's reserved exchanges (``amq.*``: ``amq.topic``,
+        ``amq.fanout``, ...) are refused too: anything bound to them would
+        receive the result.
         """
-        if v.startswith(("cmd.", "dlq.")):
+        if v.startswith(("cmd.", "dlq.", "amq.")):
             raise ValueError(
                 "reply_to must name the caller's own reply exchange, not a "
-                "service command or dead-letter exchange (cmd.* / dlq.*)"
+                "service command or dead-letter exchange (cmd.* / dlq.*) "
+                "or a reserved broker exchange (amq.*)"
             )
         return v
 
@@ -250,8 +304,13 @@ class Envelope(BaseModel):
                 raise ValueError(f"Deadline ({v}) must be after sent_at ({sent_at})")
         return v
 
+    # Frozen: a handler that assigns an envelope field (ctx.envelope.
+    # message_id = ...) gets a ValidationError instead of silently
+    # changing the ids the SDK acknowledges and replies with. Build a
+    # changed copy with model_copy(update=...), which validates it.
     model_config = ConfigDict(
         validate_assignment=True,
+        frozen=True,
     )
 
     @field_serializer("sent_at", "deadline", when_used="json")

@@ -195,9 +195,8 @@ class TestStreamingMemoryBound:
     These tests *do not* exercise SDK code or transport. They iterate a
     standalone async generator and use tracemalloc to verify the
     consume-while-streaming pattern stays bounded. They prove the pattern,
-    not the SDK's implementation of it. Wire-level memory behavior of the
-    SDK's ``download_stream`` / ``upload_stream`` is covered by the live
-    integration tests under ``tests/integration/``.
+    not the SDK's implementation of it; they do not measure the memory use
+    of the SDK's own ``download_stream`` / ``upload_stream``.
 
     """
 
@@ -209,6 +208,8 @@ class TestStreamingMemoryBound:
         standalone async generator that mimics the SDK's chunk-yield shape.
         Acceptance: Peak memory delta < 50MB (52,428,800 bytes)
 
+        Note: a synthetic generator, not the SDK's own download path; the
+        SDK's memory use is not measured here.
         """
         import tracemalloc
 

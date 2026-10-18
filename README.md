@@ -28,7 +28,7 @@ focused on the data transformation.
 - **Health & readiness** HTTP endpoints (`/health`, `/ready`, `/livez`, `/readyz`) with
   pluggable liveness/readiness checks.
 - **Structured JSON logging** out of the box.
-- **Fully type-hinted** (`py.typed`), Python 3.11+.
+- **Type hints** (`py.typed`) on the public API, Python 3.11+.
 
 ## Installation
 
@@ -47,6 +47,8 @@ pip install -e .            # add "[dev]" for the test/lint toolchain: pip insta
 ```
 
 ## Quickstart
+
+Save this as `my_service.py`:
 
 ```python
 import logging
@@ -103,45 +105,165 @@ if __name__ == "__main__":
     app.run()
 ```
 
-Run it against a local RabbitMQ + Azure Blob (Azurite):
+Run it against a local RabbitMQ and Azure Blob Storage emulator (Azurite), from
+the directory where you saved `my_service.py` (nothing else is needed there).
+The two `docker run` lines start both on loopback, and the `until` line waits
+until RabbitMQ has started:
 
 ```bash
+docker run -d --name ledsas-quickstart-rabbitmq -p 127.0.0.1:5672:5672 rabbitmq:4.1-management-alpine
+docker run -d --name ledsas-quickstart-azurite -p 127.0.0.1:10000:10000 \
+  mcr.microsoft.com/azure-storage/azurite:3.34.0 azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+until docker logs ledsas-quickstart-rabbitmq 2>&1 | grep -q "Server startup complete"; do sleep 1; done
+
+# Azurite's documented development account (devstoreaccount1) and its
+# well-known public key: not a secret, it only works against the emulator.
 export KBM_LEDSAS_RABBITMQ_URL="amqp://guest:guest@127.0.0.1:5672/"
-export KBM_LEDSAS_BLOB_CONN_STRING="DefaultEndpointsProtocol=http;AccountName=...;AccountKey=...;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+export KBM_LEDSAS_BLOB_CONN_STRING="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
 python my_service.py
 ```
+
+Stop and remove the two containers afterwards with
+`docker rm -f -v ledsas-quickstart-rabbitmq ledsas-quickstart-azurite`. (The example
+service under `examples/hello_world_service/` has the same stack as a
+`docker compose` file; see "Local development" below.)
 
 The service also exposes health endpoints at
 `http://127.0.0.1:8090/health` and `/ready` (loopback only by default; set
 `KBM_LEDSAS_HEALTH_HOST=0.0.0.0` to bind all interfaces, or
 `KBM_LEDSAS_HEALTH_PORT=0` to turn them off).
 
+### Send it a command
+
+A caller publishes a command envelope to the service's command exchange
+(`cmd.csv-processor.v1`) and, to get the reply, binds a queue of its own to a
+reply exchange for routing key `response`. Save this as `send_command.py` and
+run it in a second shell with the same two `export` lines: it uploads
+`test-container/sample.csv` to Azurite, sends `ProcessCSV` and prints the
+reply.
+
+```python
+import asyncio
+import json
+import os
+import uuid
+from datetime import UTC, datetime
+
+import aio_pika
+from azure.storage.blob import BlobServiceClient
+
+CSV = "name,value\na,1\nb,2\n"
+
+
+async def main() -> None:
+    blobs = BlobServiceClient.from_connection_string(os.environ["KBM_LEDSAS_BLOB_CONN_STRING"])
+    container = blobs.get_container_client("test-container")
+    if not container.exists():
+        container.create_container()
+    container.upload_blob("sample.csv", CSV, overwrite=True)
+
+    correlation_id = str(uuid.uuid4())
+    reply_exchange = f"reply-ex-quickstart-{uuid.uuid4().hex[:8]}"
+    connection = await aio_pika.connect_robust(os.environ["KBM_LEDSAS_RABBITMQ_URL"])
+    async with connection:
+        channel = await connection.channel()
+        command_exchange = await channel.get_exchange("cmd.csv-processor.v1", ensure=True)
+        rx = await channel.declare_exchange(reply_exchange, aio_pika.ExchangeType.TOPIC, durable=True)
+        rq = await channel.declare_queue(f"{reply_exchange}-q", durable=True, auto_delete=False)
+        try:
+            await rq.bind(rx, routing_key="response")
+            envelope = {
+                "schema_version": "1.0",
+                "type": "command",
+                "name": "ProcessCSV",
+                "message_version": "1.0",
+                "message_id": str(uuid.uuid4()),
+                "correlation_id": correlation_id,
+                "idempotency_key": f"quickstart-{uuid.uuid4().hex}",
+                "sent_at": datetime.now(UTC).isoformat(),
+                "trace_id": str(uuid.uuid4()),
+                "reply_to": reply_exchange,
+            }
+            body = {"envelope": envelope, "payload": {"csv_uri": "azblob://test-container/sample.csv"}}
+            await command_exchange.publish(
+                aio_pika.Message(json.dumps(body).encode(), content_type="application/json"),
+                routing_key="command",
+            )
+            async with rq.iterator(timeout=30) as replies:
+                async for message in replies:
+                    async with message.process():
+                        reply = json.loads(message.body)
+                    if reply["envelope"].get("correlation_id") == correlation_id:
+                        print(reply["payload"])  # {'result_uri': 'azblob://test-container/result-...json'}
+                        break
+        finally:
+            await rq.delete(if_unused=False, if_empty=False)
+            await rx.delete()
+
+
+asyncio.run(main())
+```
+
+[`examples/hello_world_service/scripts/send_hello.py`](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/examples/hello_world_service/scripts/send_hello.py)
+is the same caller with the timeout, error handling and cleanup spelled out.
+
 ## Local development
 
-A ready-to-run stack (RabbitMQ + Azurite) is provided with the example service:
+A ready-to-run example service, with its local stack (RabbitMQ + Azurite), is
+in [`examples/hello_world_service/`](https://github.com/Kubyk-Health/kbm-ledsas-sdk/tree/main/examples/hello_world_service)
+(handler, sender script, tests, `Dockerfile`, and a `docker compose` stack
+under `deploy/local/`). From a clone of this repository:
 
 ```bash
 cd examples/hello_world_service
-pip install -e ../..                                        # install the SDK from this repo
-docker compose -f deploy/local/docker-compose.yml up -d     # start RabbitMQ + Azurite
-python main.py                                              # run the example service
+pip install -e ../..                                            # the SDK from this clone
+docker compose -f deploy/local/docker-compose.yml up -d --wait  # RabbitMQ + Azurite, healthy
+cp .env.example .env                                            # the local settings
+(set -a; . ./.env; set +a; exec python main.py)                 # the service, with .env loaded
 ```
 
-See [`examples/hello_world_service/`](https://github.com/Kubyk-Health/kbm-ledsas-sdk/tree/main/examples/hello_world_service) for a complete,
-runnable service (handler, sender script, tests, `Dockerfile`, and a local
-`docker compose` stack under `deploy/local/`).
+and, in a second shell in the same directory:
+
+```bash
+(set -a; . ./.env; set +a; exec python scripts/send_hello.py Ada)   # prints "greeting: hello Ada"
+```
+
+The subshell `(set -a; . ./.env; set +a; exec ...)` exports the settings in
+`.env` for that one command only. Without a clone, take the example from a
+release's source archive and install the SDK from PyPI instead of
+`pip install -e ../..`:
+
+```bash
+curl -L https://github.com/Kubyk-Health/kbm-ledsas-sdk/archive/refs/tags/v0.3.6.tar.gz | tar -xz
+cd kbm-ledsas-sdk-0.3.6/examples/hello_world_service
+pip install kbm-ledsas-sdk==0.3.6
+```
+
+then continue with the `docker compose` line above.
 
 ## Container base image
 
 To run a service in a container, build it `FROM` the LEDSAS base image
-[`ghcr.io/kebormed/kbm-ledsas-base-direct`](https://github.com/orgs/KeborMed/packages/container/package/kbm-ledsas-base-direct),
-which comes with the SDK and its runtime dependencies installed (Python 3.11 on
-Alpine Linux, amd64 and arm64):
+[`ghcr.io/kebormed/kbm-ledsas-base-direct`](https://github.com/orgs/KeborMed/packages/container/package/kbm-ledsas-base-direct)
+(published under the KeborMed GitHub organization, the SDK's maintainer). It is
+the official Python 3.11 Alpine Linux image (`linux/amd64` and `linux/arm64`)
+with `kbm-ledsas-sdk` of the tag's version and its runtime dependencies
+installed from PyPI, a pip constraints file that pins that SDK version
+(`PIP_CONSTRAINT=/etc/kbm-ledsas-pip-constraints.txt`), and the non-root user
+`kbmuser` (uid 1000) with the working directory `/app`.
+[COMPATIBILITY.md](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/COMPATIBILITY.md#container-base-image)
+lists the tags.
+
+The minimal shape of a service image (for an image you deploy, copy
+[`examples/hello_world_service/Dockerfile`](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/examples/hello_world_service/Dockerfile)
+instead: it keeps `/app` read-only for the service user, clears the base
+image's labels and removes pip at the end of the build):
 
 ```dockerfile
-FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.5
+FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6
 WORKDIR /app
 USER root
+ENV PIP_ROOT_USER_ACTION=ignore
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && pip check
 COPY main.py .
@@ -149,9 +271,11 @@ USER kbmuser
 CMD ["python", "main.py"]
 ```
 
-- **The image tag is the SDK version on PyPI**: `:0.3.5` carries `kbm-ledsas-sdk`
-  0.3.5. `latest` moves with every release; build on a version tag, and pin the
-  digest as well (`:0.3.5@sha256:<digest>`) for a reproducible build.
+- **The image tag is the SDK version on PyPI**: `:0.3.6` carries `kbm-ledsas-sdk`
+  0.3.6. `latest` moves with every release; build on a version tag, and pin the
+  digest as well (`:0.3.6@sha256:<digest>`, from `docker buildx imagetools
+  inspect ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6`) for a reproducible
+  build.
 - **Never list `kbm-ledsas-sdk` in your `requirements.txt`** and never install it
   again in the image: the base image pins its SDK version, and a requirement for
   another version fails the build.
@@ -161,12 +285,21 @@ CMD ["python", "main.py"]
   example torch, onnxruntime, tensorflow, opencv-python, scikit-learn) do not
   install on it; numpy, pandas, scipy, pillow, scikit-image, pyarrow and pydicom
   do.
-
-[`examples/hello_world_service/Dockerfile`](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/examples/hello_world_service/Dockerfile)
-is the complete version (it also clears the base image's labels, keeps the code
-read-only for the service user and removes pip at the end of the build), and its
-[README](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/examples/hello_world_service/README.md#base-image)
-explains each step.
+- **Inside the container, `127.0.0.1` is the container itself.** Point
+  `KBM_LEDSAS_RABBITMQ_URL` and the `BlobEndpoint` at addresses the container
+  can reach, use `amqps://` for any broker that is not on loopback (an `amqp://`
+  URL to another host is refused unless `KBM_LEDSAS_ALLOW_INSECURE_AMQP=1`,
+  which belongs on a local Docker network only), and set
+  `KBM_LEDSAS_HEALTH_HOST=0.0.0.0` when the health endpoints are probed from
+  outside the container. The example's
+  [README](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/examples/hello_world_service/README.md#container-image)
+  has a complete `docker run` line for its local stack.
+- **Give it time to stop.** On SIGTERM the service stops taking commands and
+  waits for the handlers already running (each bounded by
+  `KBM_LEDSAS_HANDLER_TIMEOUT`); with none running it exits within about a
+  second. `docker stop` kills the container after 10 seconds by default: set
+  `docker stop -t`, Compose `stop_grace_period` or Kubernetes
+  `terminationGracePeriodSeconds` above your longest handler run.
 
 ## Configuration
 
@@ -185,23 +318,25 @@ The SDK is configured through environment variables. The most common are below; 
 | `KBM_LEDSAS_MAX_RETRIES` | Retries for transient failures before the command is dead-lettered | `3` |
 | `KBM_LEDSAS_GENERIC_ERRORS` | When `true`, callers get a generic error message unless the handler set `user_message` | `false` |
 | `KBM_LEDSAS_CONNECT_TIMEOUT` | Seconds one connection attempt to the broker may take (`1` to `300`) | `15` |
+| `KBM_LEDSAS_HEARTBEAT` | AMQP heartbeat interval in seconds asked of the broker (`0` to `600`, `0` off; a `?heartbeat=` in the broker URL wins). Blocking code that holds the event loop longer than about two intervals loses the connection | `15` |
 | `KBM_LEDSAS_LOG_LEVEL` | Log level | `INFO` |
 | `KBM_LEDSAS_LOG_FORMAT` | Log format (`json` or `text`) | `json` |
 | `KBM_LEDSAS_DEBUG` | When `1`, a configuration error at startup prints the full traceback instead of one line | `0` |
 | `KBM_LEDSAS_HEALTH_HOST` | Health server bind host | `127.0.0.1` |
 | `KBM_LEDSAS_HEALTH_PORT` | Health server port (`0` disables; a port in use stops the service at start) | `8090` |
-| `KBM_LASTCOMMITID` | Build/commit id surfaced as `deployment_id` in `/health` and `/ready` (usually set by the deployment platform) | *(optional)* |
+| `KBM_LEDSAS_DEPLOYMENT_ID` | Build/commit id surfaced as `deployment_id` in `/health` and `/ready`; takes precedence over `KBM_LASTCOMMITID` | *(optional)* |
+| `KBM_LASTCOMMITID` | Read for `deployment_id` when `KBM_LEDSAS_DEPLOYMENT_ID` is unset or blank (some deployment platforms set it) | *(optional)* |
 
 A `KBM_LEDSAS_*` variable the SDK does not know (a typo, for example) is reported
 at startup with one WARNING.
 
 ## Documentation
 
+- [Upgrade guide](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/UPGRADING.md) — what to do when upgrading (start here)
 - [API Reference](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/docs/SDK_API_REFERENCE.md)
 - [Example service](https://github.com/Kubyk-Health/kbm-ledsas-sdk/tree/main/examples/hello_world_service)
 - [Compatibility & supported versions](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/COMPATIBILITY.md)
-- [Upgrade guide](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/UPGRADING.md)
-- [Changelog](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/CHANGELOG.md)
+- [Changelog](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/CHANGELOG.md) — full detail of every change
 
 ## Contributing
 

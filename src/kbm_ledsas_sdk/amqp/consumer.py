@@ -4,7 +4,6 @@ Consumes LEDSAS commands from RabbitMQ.
 
 import asyncio
 import json
-import logging  # noqa: F401
 import re
 import time
 from collections import OrderedDict, deque
@@ -18,11 +17,13 @@ from aio_pika.exceptions import (
     DeliveryError,
     MessageProcessError,
 )
-from aiormq.exceptions import AMQPConnectionError, ChannelInvalidStateError
+from aiormq.exceptions import AMQPConnectionError, AMQPError, ChannelInvalidStateError
 from pydantic import ValidationError
 
 from kbm_ledsas_sdk.models.messages import Command
 from kbm_ledsas_sdk.transport.base import DeliveryLost
+from kbm_ledsas_sdk.utils.amqp_text import shown as shown_text
+from kbm_ledsas_sdk.utils.amqp_text import undecodable_properties
 from kbm_ledsas_sdk.utils.logging import _command_fields, masked_logger
 
 logger = masked_logger(__name__)
@@ -412,7 +413,7 @@ def _delivery_fields(message: Any) -> dict[str, Any]:
     ):
         value = getattr(message, attr, None)
         if isinstance(value, str) and value:
-            fields[key] = value[:128]
+            fields[key] = shown_text(value)[:128]
     body = getattr(message, "body", None)
     if isinstance(body, (bytes, bytearray)):
         fields["body_bytes"] = len(body)
@@ -616,6 +617,12 @@ class AMQPConsumer:
 
             logger.info("AMQP consumer started", extra={"consumer_tag": self.consumer_tag})
 
+        except AMQPError:
+            # The broker refused (no read permission on the queue, an
+            # exclusive consumer elsewhere, ...): an operator-facing
+            # condition the caller reports in one clean line, naming the
+            # queue; no traceback.
+            raise
         except Exception as e:
             logger.error("Failed to start AMQP consumer", exc_info=True, extra={"error": str(e)})
             raise
@@ -884,6 +891,23 @@ class AMQPConsumer:
         # a validation failure's record are read from it).
         data: Any = None
         try:
+            # A short-string property (message_id, correlation_id, ...) or
+            # a header name whose bytes are not UTF-8: decoded tolerantly
+            # (see utils.amqp_text) so the frame does not stop the
+            # consumer; the message is unusable as sent, so it is
+            # dead-lettered once (by its delivery, whatever its ids).
+            undecodable = undecodable_properties(message)
+            if undecodable:
+                logger.warning(
+                    "AMQP message property %s is not valid UTF-8; dead-lettering",
+                    ", ".join(undecodable),
+                    extra={
+                        "undecodable_properties": undecodable,
+                        **_delivery_fields(message),
+                    },
+                )
+                raise _RejectOnArrivalError
+
             # Payload size limit. Large payloads should travel
             # via blob storage, not the AMQP body. Reject oversize
             # messages straight to DLQ with a single WARNING — no
@@ -936,11 +960,11 @@ class AMQPConsumer:
                 self._note_body_read(time.perf_counter() - read_started, len(message.body))
 
             # Enforce envelope.type=="command" on the command
-            # exchange. The Envelope schema's Literal accepts four type
-            # values (command/response/status/error) because the same
+            # exchange. The Envelope schema's Literal accepts three type
+            # values (command/response/status) because the same
             # model is reused for outbound responses and status updates,
             # but only "command" is legitimate on a *command* queue. A
-            # forged response/status/error envelope reaching this queue
+            # forged response/status envelope reaching this queue
             # is either a misconfigured upstream or a hostile reflection
             # attempt — dead-letter it without invoking the handler.
             envelope_type = command.envelope.type

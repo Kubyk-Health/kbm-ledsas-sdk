@@ -7,13 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.5] - 2026-10-14
+## [0.3.6] - 2026-10-18
 
 Dependency, security and reliability release. **No public method or
 parameter was removed or renamed**, but several behaviors change, and input
 that was never valid but used to be accepted is now refused: read "Changed"
-and [UPGRADING.md](UPGRADING.md) before upgrading. 0.3.4 was not published to
-PyPI, so this entry lists every change since 0.3.3.
+and [UPGRADING.md](UPGRADING.md) before upgrading. 0.3.4 and 0.3.5 were not
+released (numbers skipped), so this entry lists every change since 0.3.3.
 
 ### Security
 
@@ -32,9 +32,14 @@ PyPI, so this entry lists every change since 0.3.3.
 ### Added
 
 - **Container base image.** `ghcr.io/kebormed/kbm-ledsas-base-direct:<version>`
-  comes with the SDK and its runtime dependencies installed (Python 3.11 on
-  Alpine Linux, `linux/amd64` and `linux/arm64`); its tag is the SDK version.
-  The README section "Container base image" and
+  (published under the KeborMed GitHub organization) is the official Python
+  3.11 Alpine Linux image (`linux/amd64` and `linux/arm64`) with
+  `kbm-ledsas-sdk` of that version and its runtime dependencies installed
+  from PyPI, a pip constraints file
+  (`PIP_CONSTRAINT=/etc/kbm-ledsas-pip-constraints.txt`) that pins the SDK
+  version and the `cryptography` floor, and the non-root user `kbmuser` (uid
+  1000) with the working directory `/app`; its tag is the SDK version. The
+  README section "Container base image" and
   [COMPATIBILITY.md](COMPATIBILITY.md) describe it, and
   `examples/hello_world_service/Dockerfile` builds on it.
 
@@ -141,15 +146,14 @@ PyPI, so this entry lists every change since 0.3.3.
   otherwise names that cause instead of the library's
   `Expected one of ['Connection.OpenOk']` message.
   A queue that already exists on the broker with other arguments (for
-  example a dead-letter queue created by an earlier SDK release)
+  example one declared by hand or by another tool with other limits, or
+  kept in a reused local broker volume)
   now gives one line that names the queue and says to delete it once
   (the service re-creates it); before, the first of three ERROR records
   embedded the client library's traceback and none named the fix.
   Configuration errors found while reading the environment now use the
   SDK log format (`KBM_LEDSAS_LOG_FORMAT`, JSON by default) like every
-  other startup error, and so do the warnings logged while it is read (a
-  retired variable such as `KBM_LEDSAS_MODE` is set; the
-  `KBM_LEDSAS_ALLOW_INSECURE_AMQP` acknowledgment, now logged once
+  other startup error, and so do the warnings logged while it is read (the `KBM_LEDSAS_ALLOW_INSECURE_AMQP` acknowledgment, now logged once
   instead of twice). Before, those warnings were bare text on stderr.
 - **`KBM_LEDSAS_SERVICE_NAME` overriding the constructor is logged.**
   When the variable is set and differs from
@@ -239,7 +243,7 @@ PyPI, so this entry lists every change since 0.3.3.
     every attempt (`Failed to download blob`, `Failed to upload blob`,
     `Streaming download failed` or `Streaming upload failed`).
 
-  Each record carries `will_retry`. The `Retry k/N, waiting ...` line is
+  Each record carries `will_retry` and `attempt`. The `Retry k/N, waiting ...` line is
   now INFO, and the storage client's own line for a transient failure
   (`Failed to download blob (transient storage error)`, and the same for
   uploads and streams) is INFO without a traceback. The failed command
@@ -414,11 +418,15 @@ PyPI, so this entry lists every change since 0.3.3.
   be 3 to 63 characters (one-character names were accepted, two-character
   ones refused; the message now states the rule), and a `.` path segment
   and a `?` with no `versionId` are refused, as for upload paths.
-- **A `reply_to` naming a service exchange is refused.** A command whose
-  `reply_to` starts with `cmd.` or `dlq.` (a LEDSAS service's command or
-  dead-letter exchange) is now an invalid envelope, dead-lettered before
-  its handler runs; its reply used to be published into that service's
-  command or dead-letter queue.
+- **A `reply_to` naming a service exchange or a reserved broker exchange
+  is refused.** A command whose `reply_to` starts with `cmd.` or `dlq.`
+  (a LEDSAS service's command or dead-letter exchange) or with `amq.`
+  (the broker's reserved exchanges, such as `amq.topic` and
+  `amq.direct`) is now an invalid envelope, dead-lettered before its
+  handler runs; its reply used to be published into that service's
+  command or dead-letter queue, or to whatever was bound to the reserved
+  exchange. **Action:** a caller that named `amq.topic` or `amq.direct`
+  as its `reply_to` declares a reply exchange of its own.
 - **Commands waiting for a worker at shutdown are given back at once, not
   run.** On SIGTERM the service now stops receiving from the broker (which
   then delivers the queue's commands to the other replicas) and returns
@@ -508,8 +516,10 @@ PyPI, so this entry lists every change since 0.3.3.
 - **Text with a lone surrogate is refused in what the SDK writes.** A
   reply, an `emit_status` `stage` / `note` or an `upload_json` object
   holding a string with a lone surrogate (such as `"\ud800"`, which a
-  JSON request can carry) is refused with a message naming where; JSON
-  wrote it as an escape that strict readers refuse (.NET's
+  JSON request can carry) is refused with a message naming where
+  (`emit_status() refused: stage is text with a lone surrogate ...`,
+  `upload_json() refused: obj["k"] is text with a lone surrogate ...`);
+  JSON wrote it as an escape that strict readers refuse (.NET's
   System.Text.Json throws when the string is read). A reply value with no
   JSON form is now named in the SDK's words (`payload["o"] is an
   instance of Weird, which has no JSON form`); the serializer's own text,
@@ -583,9 +593,7 @@ PyPI, so this entry lists every change since 0.3.3.
   `envelope.message_id` / `envelope.correlation_id` when they can be
   read, so the dead letter can be matched to its record. A body that is
   not JSON logs `Failed to parse message JSON; dead-lettering`, like the
-  other malformed-body records. The `emit_status` / `upload_json` lone
-  surrogate errors read `emit_status() refused: stage is text with a lone
-  surrogate ...`.
+  other malformed-body records.
 - **`download_json` treats JSON that Python cannot parse as a content
   error.** Content holding an integer with more than 4300 digits, or
   nested more deeply than Python's JSON parser reads (about 1,000 levels
@@ -594,10 +602,7 @@ PyPI, so this entry lists every change since 0.3.3.
   `UnexpectedError` after the retries). Now, like content that is not
   JSON, it is logged once (`Failed to parse blob as JSON`, no traceback)
   and, uncaught, replied `Permanent` (`blob content cannot be parsed as
-  JSON (...)`) without a retry. The exception types are unchanged. A
-  lone-surrogate refusal from `upload_json` is said once
-  (`upload_json() refused: ...`, without `got an object with no JSON form`
-  around it).
+  JSON (...)`) without a retry. The exception types are unchanged.
 - **`upload_json` and `upload_text` store a content type.** Blobs written
   by `upload_json` are stored as `application/json` and by `upload_text`
   as `text/plain; charset=utf-8` (before: `application/octet-stream`,
@@ -668,7 +673,8 @@ PyPI, so this entry lists every change since 0.3.3.
   WARNING at start naming it and the closest setting (`did you mean
   KBM_LEDSAS_PREFETCH?`). The variables Kubernetes sets for a Service in
   the namespace (`KBM_LEDSAS_<NAME>_SERVICE_HOST` and the rest of that
-  Service's group) are not reported.
+  Service's group) are not reported. Documented settings such as
+  `KBM_LEDSAS_DEPLOYMENT_ID` are never reported.
 - **An IPv6 broker address keeps its brackets in log records**
   (`amqp://***:***@[::1]:5672/`; the brackets were dropped).
 - **The per-command records carry the command's identity.** `Handling
@@ -727,10 +733,6 @@ PyPI, so this entry lists every change since 0.3.3.
   less. With `KBM_LEDSAS_MAX_PAYLOAD_BYTES=0` (no SDK limit) it assumes
   128 MiB bodies, RabbitMQ 3.x's default `max_message_size` (4.x's is
   16 MiB). The defaults are unchanged.
-- **The `did you mean` hint never names a retired variable.**
-  `KBM_LEDSAS_TRANSPORT_MODE` was reported with `(did you mean
-  KBM_LEDSAS_MODE?)`, a variable the next WARNING asks to remove; it is
-  now named without a suggestion.
 - **An abrupt broker loss logs no traceback.** When the broker was killed
   or the TCP connection cut, the AMQP client library's `Cancelling cause
   reader exited abnormally` WARNING carried a two-part traceback next to
@@ -874,10 +876,12 @@ PyPI, so this entry lists every change since 0.3.3.
   of a client library's error) was logged as raised by `Uncaught
   exception in handler` and the other records of the handler layer,
   traceback included. Every record the SDK writes now masks a URL's user
-  name and password, every query value and the fragment of a broker URL,
-  and the values of `AccountKey=`, `SharedAccessSignature=`,
-  `SharedAccessKey=`, `Password=` / `Pwd=` and a `sig=` URL query
-  parameter: the records of every SDK module (the handler layer, the
+  name and password (a URL of any scheme), every query value and the
+  fragment of a broker URL, the values of `AccountKey=` / `account_key=`,
+  `SharedAccessSignature=`, `SharedAccessKey=` and `Password=` / `Pwd=`
+  (quoted or not), a `Bearer` token, and the values of the `sig=`,
+  `code=`, `access_token=` and `token=` URL query parameters: the
+  records of every SDK module (the handler layer, the
   storage client's `Failed to download blob` ERROR and its traceback,
   ...) and of the AMQP client library that the SDK filters, and whatever
   the SDK's own log handler and its last-resort handler write, in the
@@ -885,8 +889,11 @@ PyPI, so this entry lists every change since 0.3.3.
   format. A text that cannot be masked is not written: the record carries
   `<withheld: secret masking failed>` (a field), `<record text withheld:
   secret masking failed>` (the message) or `<traceback withheld: secret
-  masking failed>` instead, and is still written. The reply is unchanged,
-  and so are the records your own code writes, except the WARNING and
+  masking failed>` instead, and is still written. An error reply's
+  internal message (the exception's text, sent when no `user_message` is
+  set and `KBM_LEDSAS_GENERIC_ERRORS` is off) is masked the same way; a
+  `user_message` is sent as given. The records of your own loggers are
+  not masked (`ctx.logger`'s are, see below), except the WARNING and
   higher records that the SDK's last-resort handler writes when your
   service configures no logging of its own.
 - **A refused configuration keeps no connection setting in its error.**
@@ -939,13 +946,108 @@ PyPI, so this entry lists every change since 0.3.3.
   the trace_id>]` and `idempotency_key=` / `job_id=` pairs. These values
   are logged as sent: keep identifiable data out of them.
 - **A broker URL's query string is masked in log records.** The broker
-  URL in a log record (the `Connecting to the AMQP broker at ...` and
-  `Could not connect to the AMQP broker at ...` lines) had only its user
-  name and password masked; its query string was shown as given
+  URL the SDK logged (at DEBUG, `Connecting to RabbitMQ: ...`) had only
+  its user name and password masked; its query string was shown as given
   (`?login=guest&password=...`). Every value of the query string and the
   fragment are now masked too (`amqp://127.0.0.1:5672/?login=***&password=***`),
-  in these lines and wherever a broker URL appears in a record the SDK
-  masks.
+  in the new `Connecting to the AMQP broker at ...` and `Could not connect
+  to the AMQP broker at ...` lines and wherever a broker URL appears in a
+  record the SDK masks.
+- **`deployment_id`: a matched pair of surrounding quotes is removed.**
+  The `deployment_id` field of `/health` and `/ready` is read from the
+  same variables as in 0.3.3 (`KBM_LEDSAS_DEPLOYMENT_ID`, else
+  `KBM_LASTCOMMITID`); a matched pair of quotes around the value is now
+  removed, as from every setting (`KBM_LASTCOMMITID="a1b2c3d4"` under
+  `docker run --env-file` reported the quotes). Set either at deploy time,
+  for example to the commit id; nothing sets them for you.
+- **A broker URL with `no_verify_ssl` is refused.** A
+  `KBM_LEDSAS_RABBITMQ_URL` whose query sets `no_verify_ssl` to any value
+  other than `0` (`1`, `true`, `false`, or no value at all: the AMQP client
+  library keeps TLS certificate verification on only for
+  `no_verify_ssl=0`) was accepted, so the service trusted any
+  certificate. It now stops the start with one `Configuration error`
+  line, unless `KBM_LEDSAS_ALLOW_INSECURE_AMQP=1` acknowledges it, which
+  then logs one WARNING. **Action:** remove `no_verify_ssl`; to trust a
+  private certificate authority, name its certificate with
+  `?cafile=<path>` (`?certfile=` and `?keyfile=` give a client
+  certificate). See "Transport security" in `SDK_API_REFERENCE.md`.
+- **Storage reached over `http://` on another machine is reported.** A
+  `KBM_LEDSAS_BLOB_CONN_STRING` that reaches storage over `http://` at a
+  host other than this machine (`localhost`, `127.0.0.1`, `::1`) now logs
+  one WARNING at start: its requests, signed with the account key or
+  SAS, travel in cleartext. The service still starts.
+- **`Envelope`, `Command`, `Response` and `Status` are frozen.** Their
+  fields could be assigned (`ctx.envelope.reply_to = ...`,
+  `envelope.job_id = ...`), which skipped the fields' checks. Assigning a
+  field now raises `pydantic.ValidationError`, and `ctx.envelope` is
+  read-only. **Action:** make a changed copy with
+  `model_copy(update={...})` instead.
+- **New `KBM_LEDSAS_HEARTBEAT` (default 15 s).** The SDK now asks the
+  broker for an AMQP heartbeat every 15 seconds (`0` to `600`; `0` turns
+  heartbeats off), so a broker or a network path that stops answering
+  without closing the connection is detected after about three times
+  this interval (the AMQP client library allows three missed heartbeats:
+  `3 × (interval + 1)` seconds, 48 s at the default 15, plus up to half an
+  interval until its next check), and the SDK reconnects. Earlier releases set no heartbeat of
+  their own (the AMQP client library's default applied). A
+  `?heartbeat=` in `KBM_LEDSAS_RABBITMQ_URL` still wins.
+- **A message whose AMQP properties are not UTF-8 is dead-lettered.** A
+  message whose AMQP short-string property (`message_id`,
+  `correlation_id`, `reply_to`, `type`, ...) or header name held bytes
+  that are not valid UTF-8 made the AMQP client library drop the
+  connection; the broker delivered the same message again on the next
+  connection, so the service processed nothing else. It is now
+  dead-lettered once, with one WARNING (`AMQP message property
+  message_id is not valid UTF-8; dead-lettering`; the record's
+  `amqp_message_id` shows such bytes as `\xNN` escapes); consumption
+  goes on and the connection stays up. To decode such a message, the
+  service replaces the two short-string decoders of the AMQP frame
+  decoder (`pamqp`) for the whole process when it starts (importing
+  `kbm_ledsas_sdk` alone changes nothing): only a value that fails strict
+  UTF-8 decoding is decoded differently (with `surrogateescape`); valid
+  UTF-8 decodes exactly as before. Your own `aio-pika` code in the same
+  process then receives such a value as a `str` with lone surrogates
+  instead of losing its connection.
+- **`ctx.logger`'s records are masked.** `ctx.logger` is still the
+  stdlib logger `handler.<command name>`, whose records go to your root
+  logging configuration; the SDK now attaches its secret masking to it,
+  so its records are masked like the SDK's own (see "Secrets in handler
+  exceptions are masked in the log").
+- **Version fields take ASCII digits only.** `schema_version` and
+  `message_version` are `<major>.<minor>` with 1 to 4 ASCII digits
+  (`0`-`9`) each, at most 9 characters; other Unicode digits (`١.٠`) and
+  longer numbers used to be accepted. The `version` of `@app.handler`
+  follows the same rule (`ValueError` at registration).
+- **Handler and health-check registration checks the function.**
+  `@app.handler` raises `TypeError` for something that is not callable
+  or a function that cannot be called with the two arguments
+  (`ctx`, `req`); `@app.liveness_check` / `@app.readiness_check` raise
+  `TypeError` for something that is not callable or a function that
+  cannot be called without arguments. Before, such a handler failed on
+  every command and such a check on every probe.
+- **`BlobRef` refuses blob names over 1024 characters,** the storage
+  limit (a longer name used to be accepted and failed at the storage
+  service), and its error names a lone surrogate in the URI even when a
+  control character comes before it.
+- **An `AccountKey` placeholder or an inline comment stops the start.**
+  A `KBM_LEDSAS_BLOB_CONN_STRING` whose `AccountKey` decodes to nothing
+  (a placeholder such as `...`), or whose `AccountKey` or `BlobEndpoint`
+  holds whitespace (an inline `# comment` that `docker run --env-file`
+  passes through), is refused at start with one `Configuration error`
+  line; before, every storage request failed.
+- **`BlobOperations` can be imported from `kbm_ledsas_sdk`.** `from
+  kbm_ledsas_sdk import BlobOperations` gives the type of `ctx.blob`,
+  for type hints; it used to be reachable only through an internal
+  module.
+- **More fields in the SDK's records.** The retry record of a
+  `Retryable` failure carries `will_retry` and `attempt`. The start
+  record (`Starting <service> service`) carries `sdk_version` and, when
+  set, `deployment_id`. An `upload_json` call whose object has no JSON
+  form is logged once (the handler layer's one ERROR). A stop signal
+  that arrives before the connection is started logs `Stopped before the
+  service started ...` and exits with code 0. Missing connection
+  settings (`KBM_LEDSAS_RABBITMQ_URL`, `KBM_LEDSAS_BLOB_CONN_STRING`) are
+  reported together in one `Configuration error`.
 - **`aio-pika` 10.x is now accepted** (`aio-pika>=9.4.0,<11.0`; was
   `<10.0`). A fresh install resolves aio-pika 10 (with aiormq 7 and
   pamqp 4). The SDK's message handling, reply publishing and startup /
@@ -965,7 +1067,15 @@ PyPI, so this entry lists every change since 0.3.3.
   the broker is found unreachable, the remaining round trips are skipped
   and the connection is closed locally. A single WARNING (`AMQP broker
   not reachable during shutdown ...`, naming the cause) replaces the
-  hang. A command whose reply could not be confirmed, or that could not
+  hang. It counts the unacknowledged messages this consumer held, the
+  commands whose reply or acknowledgement could not be confirmed, and the
+  acknowledgements, requeues and dead-letters sent after the stop signal:
+  the broker does not answer these, so one sent to a broker that had
+  stopped answering (frozen, not disconnected) is written and logged
+  (`ACKed command ...`) but may never be read, and the WARNING then says
+  `N acknowledgement(s), requeue(s) or dead-letter(s) were sent after the
+  stop signal; the broker does not answer them, so they may not have
+  reached it, and those commands may be delivered and run again.` A command whose reply could not be confirmed, or that could not
   be acknowledged, requeued or dead-lettered at that point, is left
   unacknowledged for the broker to redeliver, instead of being
   dead-lettered. That command runs again on redelivery. A broker that was
@@ -986,25 +1096,15 @@ PyPI, so this entry lists every change since 0.3.3.
   reconnecting): the handlers are cancelled at once, instead of only
   after a broker operation failed during the drain, which a long handler
   delayed until it ended.
-- **The shutdown WARNING counts the acknowledgements a broker that stopped
-  answering may not have received.** An acknowledgement, requeue or
-  dead-letter gets no answer from the broker, so one sent after the stop
-  signal to a broker that had stopped answering (frozen, not
-  disconnected) is written and logged (`ACKed command ...`) but may never
-  be read: the command is then delivered again and runs again. The
-  WARNING said `0 held by this consumer` and nothing else; it now adds
-  `N acknowledgement(s), requeue(s) or dead-letter(s) were sent after the
-  stop signal; the broker does not answer them, so they may not have
-  reached it, and those commands may be delivered and run again.`
 - **README.** The quickstart takes the output container from
-  `BlobRef.from_uri(uri).container` instead of splitting the URI string (a
-  URI from a storage account with blob versioning ends in `?versionId=...`,
-  which the split kept in the blob name), writes its own log records in the
-  SDK's JSON format, and the configuration table names the variable that
-  sets `deployment_id` correctly (`KBM_LASTCOMMITID`; the table said
-  `KBM_LEDSAS_DEPLOYMENT_ID`, which the SDK never read) and lists
+  `BlobRef.from_uri(uri).container` instead of splitting the URI string by
+  hand, writes its own log records in the
+  SDK's JSON format, and the configuration table lists both variables that
+  set `deployment_id` (`KBM_LEDSAS_DEPLOYMENT_ID`, and `KBM_LASTCOMMITID`,
+  which is read when the first is unset; the table named only the first) and
   `KBM_LEDSAS_CONNECT_TIMEOUT`, `KBM_LEDSAS_GENERIC_ERRORS` and
-  `KBM_LEDSAS_DEBUG`.
+  `KBM_LEDSAS_DEBUG`. The "Local development" commands load the example's
+  `.env` and say they run from a clone of this repository.
 - **Example service.** `examples/hello_world_service` builds `FROM` the LEDSAS
   base image (one stage; the code stays read-only for the non-root service
   user; pip is removed at the end of the build), no longer lists the SDK in
@@ -1027,9 +1127,13 @@ PyPI, so this entry lists every change since 0.3.3.
   limit that is also not valid JSON is dead-lettered on every version,
   but may be logged as either error.
 
-## [0.3.4] - 2026-07-11
+## [0.3.5]
 
-Internal release line; no changes to this distribution (not published to PyPI).
+Not released; number skipped, no changes.
+
+## [0.3.4]
+
+Not released; number skipped, no changes.
 
 ## [0.3.3] - 2026-07-09
 
@@ -1086,7 +1190,7 @@ for building LEDSAS data-processing services.
 - Structured JSON logging, exposed via `json_log_formatter()`.
 - Full type hints (`py.typed`); requires Python 3.11+.
 
-[Unreleased]: https://github.com/Kubyk-Health/kbm-ledsas-sdk/compare/v0.3.5...HEAD
-[0.3.5]: https://github.com/Kubyk-Health/kbm-ledsas-sdk/compare/v0.3.3...v0.3.5
+[Unreleased]: https://github.com/Kubyk-Health/kbm-ledsas-sdk/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/Kubyk-Health/kbm-ledsas-sdk/compare/v0.3.3...v0.3.6
 [0.3.3]: https://github.com/Kubyk-Health/kbm-ledsas-sdk/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/Kubyk-Health/kbm-ledsas-sdk/releases/tag/v0.3.2

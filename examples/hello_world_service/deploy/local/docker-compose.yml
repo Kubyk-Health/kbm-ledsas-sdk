@@ -11,17 +11,23 @@
 # loopback only — same threat model the SDK applies to its own health
 # server and amqp:// non-loopback refusal.
 #
-# NOTE: this stack uses the standard host ports (5672/15672/10000). If you run
-# another local RabbitMQ/Azurite stack, stop it first to avoid port conflicts.
+# The host ports default to the standard ones (5672/15672/10000). If another
+# local RabbitMQ/Azurite already uses them, choose others, for example
+#   HELLO_WORLD_AMQP_PORT=5673 HELLO_WORLD_MGMT_PORT=15673 \
+#   HELLO_WORLD_BLOB_PORT=10010 docker compose up -d
+# and use the same ports in KBM_LEDSAS_RABBITMQ_URL and the BlobEndpoint of
+# KBM_LEDSAS_BLOB_CONN_STRING (.env). The container, volume and network names are
+# fixed (one such stack per Docker host): stop the other stack first, or rename
+# them, to run a second one.
 
 services:
   rabbitmq:
-    # RabbitMQ 4.1 (LTS) — matches the SDK's local-dev stack.
+    # RabbitMQ 4.1 (LTS).
     image: rabbitmq:4.1-management-alpine
     container_name: hello-world-rabbitmq
     ports:
-      - "127.0.0.1:5672:5672"    # AMQP protocol
-      - "127.0.0.1:15672:15672"  # Management UI
+      - "127.0.0.1:${HELLO_WORLD_AMQP_PORT:-5672}:5672"    # AMQP protocol
+      - "127.0.0.1:${HELLO_WORLD_MGMT_PORT:-15672}:15672"  # Management UI
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
@@ -40,10 +46,11 @@ services:
     image: mcr.microsoft.com/azure-storage/azurite:3.34.0
     container_name: hello-world-azurite
     ports:
-      - "127.0.0.1:10000:10000"  # Blob service (queue/table not mapped)
+      - "127.0.0.1:${HELLO_WORLD_BLOB_PORT:-10000}:10000"  # Blob service (queue/table not mapped)
     # --skipApiVersionCheck lets newer azure-storage-blob SDKs negotiate
-    # API versions this Azurite image doesn't recognize yet.
-    command: azurite --blobHost 0.0.0.0 --skipApiVersionCheck
+    # API versions this Azurite image doesn't recognize yet; -l /data keeps
+    # Azurite's data in the azurite_data volume (until `down -v`).
+    command: azurite --blobHost 0.0.0.0 -l /data --skipApiVersionCheck
     volumes:
       - azurite_data:/data
     healthcheck:
