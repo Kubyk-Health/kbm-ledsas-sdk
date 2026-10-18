@@ -15,6 +15,9 @@ regexes = [
   '''Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==''',
   # The same public key split across two string literals (first half).
   '''Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/''',
+  # Docstring example in runtime/security.py: a broker URL whose password holds an
+  # unencoded '@'/'#', shown to explain why such URLs are refused. Not a credential.
+  '''amqp://guest:p@ss#word@host''',
   # UUID literal used as an idempotency_key across model tests (matched only
   # because the field name contains "key").
   '''a6f6d1e7-6c8a-4f6b-9c4b-4c2f8dbf1d99''',
