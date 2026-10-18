@@ -7,7 +7,7 @@ streaming for multi-GB file transfers with minimal memory footprint.
 
 import base64
 import binascii
-import logging
+import logging  # noqa: F401
 import uuid
 from collections.abc import AsyncIterator, Callable
 from urllib.parse import urlsplit
@@ -27,11 +27,28 @@ from azure.storage.blob import ContentSettings
 from azure.storage.blob.aio import BlobServiceClient, ExponentialRetry
 
 from kbm_ledsas_sdk.blob.operations import (
+    _check_stream_chunk,
     _check_upload_path,
     _mark_non_retryable,
     _mark_retryable,
 )
 from kbm_ledsas_sdk.models.blob import BlobRef
+from kbm_ledsas_sdk.utils.logging import masked_logger
+
+
+def _raised_by_caller(error: BaseException, caller_errors: list) -> bool:
+    """True when ``error`` is one of ``caller_errors`` (or was raised
+    ``from`` one): an exception that came out of the caller's upload
+    stream, not out of the storage service."""
+    seen: set = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if any(current is known for known in caller_errors):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False
+
 
 # Reason given when the blob a download_stream reads is overwritten during
 # the download (HTTP 412 of the ETag check below).
@@ -71,7 +88,7 @@ STORAGE_READ_TIMEOUT_S = 10
 _TRANSIENT_HTTP_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 
-logger = logging.getLogger(__name__)
+logger = masked_logger(__name__)
 
 
 def is_transient_azure_error(exc: BaseException) -> bool:
@@ -846,7 +863,10 @@ class AzureBlobClient:
             BlobRef with URI including version ID
 
         Raises:
-            Exception: If upload fails
+            TypeError: If the stream yields a chunk that is not bytes-like
+                (non-retryable; nothing is logged here).
+            Exception: If upload fails. An exception raised by ``stream``
+                itself is re-raised unchanged, without a storage record.
 
         Example:
             >>> async def file_stream():
@@ -872,13 +892,34 @@ class AzureBlobClient:
             },
         )
 
+        # Exceptions that come from the caller's stream (its own read
+        # failed, or it yielded something that is not bytes) rather than
+        # from storage: re-raised unchanged below, without the storage
+        # failure records. The handler layer reports them once, as the
+        # handler's own error.
+        caller_errors: list = []
+
         try:
             blob_client = self.service_client.get_blob_client(container=container, blob=path_clean)
 
-            # Wrap stream with progress tracking if callback provided
+            # Each chunk is checked (bytes only; bytearray / memoryview are
+            # converted) and counted for the progress callback.
             async def tracked_stream():
                 bytes_uploaded = 0
-                async for chunk in stream:
+                source = aiter(stream)
+                while True:
+                    try:
+                        chunk = await anext(source)
+                    except StopAsyncIteration:
+                        return
+                    except Exception as source_error:
+                        caller_errors.append(source_error)
+                        raise
+                    try:
+                        chunk = _check_stream_chunk(chunk)
+                    except TypeError as chunk_error:
+                        caller_errors.append(chunk_error)
+                        raise
                     bytes_uploaded += len(chunk)
                     if progress_callback:
                         try:
@@ -922,6 +963,11 @@ class AzureBlobClient:
             raise
 
         except Exception as e:
+            if _raised_by_caller(e, caller_errors):
+                # The caller's stream failed (or yielded a non-bytes chunk,
+                # refused as Permanent): the handler's own error, not a
+                # storage failure. No record here.
+                raise
             credential = _credential_failure(e)
             client_4xx = _is_client_4xx(e)
             transient = is_transient_azure_error(e)

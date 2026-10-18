@@ -131,7 +131,10 @@ class JSONFormatter(logging.Formatter):
             log_data[key] = value
 
         if record.exc_info:
-            log_data["exception"] = self.formatException(record.exc_info)
+            # A traceback already rendered for the record (exc_text: the
+            # masked one of a handler failure, see SecretMaskFilter) is used
+            # as it is.
+            log_data["exception"] = record.exc_text or self.formatException(record.exc_info)
 
         try:
             line = json.dumps(log_data, default=_safe_repr, allow_nan=False)
@@ -330,10 +333,12 @@ class TextFormatter(logging.Formatter):
             line += " " + " ".join(pairs)
 
         extra_lines = []
-        if record.exc_info:
-            extra_lines.append(self.formatException(record.exc_info))
-        elif record.exc_text:
+        if record.exc_text:
+            # Already rendered (the masked traceback of a handler failure,
+            # see SecretMaskFilter).
             extra_lines.append(record.exc_text)
+        elif record.exc_info:
+            extra_lines.append(self.formatException(record.exc_info))
         if record.stack_info:
             extra_lines.append(self.formatStack(record.stack_info))
         for block in extra_lines:
@@ -346,25 +351,263 @@ class TextFormatter(logging.Formatter):
 # ("amqp://user:password@host"), and the credential parts of a storage
 # connection string or SAS URL ("AccountKey=...", "SharedAccessSignature=...",
 # "sig=..."). Masked by redact_secrets().
-_URL_USERINFO = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]*://)[^\s/@'\"<>]+@")
+# A user info already masked ("***@", "***:***@") is left as it is.
+_URL_USERINFO = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]*://)(?!\*\*\*(?::\*\*\*)?@)[^\s/@'\"<>]+@")
+# A value already masked ("password=***" in a broker URL's query, possibly
+# followed by its masked fragment "#***" and by the punctuation that ends
+# the sentence, as in "...?password=***)." ) is left as it is: it is not
+# taken for the start of a value running to the next ";", which would drop
+# that punctuation.
+_ALREADY_MASKED_VALUE = r"(?!\*\*\*(?:#\*\*\*)?[.,:!?)\]}]*(?:[&;\s'\"<>]|$))"
 _CONNECTION_STRING_SECRET = re.compile(
-    r"(?i)\b(AccountKey|SharedAccessSignature|SharedAccessKey|Password|Pwd)=[^;\s'\"]+"
+    r"(?i)\b(AccountKey|SharedAccessSignature|SharedAccessKey|Password|Pwd)="
+    + _ALREADY_MASKED_VALUE
+    + r"[^;\s'\"]+"
 )
-_SAS_SIGNATURE = re.compile(r"(?i)([?&]sig=)[^&\s'\"]+")
+_SAS_SIGNATURE = re.compile(r"(?i)([?&]sig=)" + _ALREADY_MASKED_VALUE + r"[^&\s'\"]+")
+# A broker URL quoted in a text (up to a space, a quote or an angle bracket).
+_BROKER_URL = re.compile(r"(?i)\bamqps?://[^\s'\"<>]+")
+# Punctuation that ends a sentence rather than the URL it follows.
+_URL_TRAILING_PUNCTUATION = ".,;:!?)]}"
+# A query parameter name shown as it is; any other name is masked too.
+_PLAIN_QUERY_KEY = re.compile(r"[A-Za-z0-9_.\-]{1,64}")
+_QUERY_ITEM = re.compile(r"[^&;]+")
+
+
+def _mask_query(query: str) -> str:
+    """The query string ``query`` (without its ``?``) with every value
+    masked (``name=***``), separators kept; an item without ``=`` or whose
+    name is not a plain token is masked whole (``***``)."""
+
+    def item(match: "re.Match[str]") -> str:
+        key, eq, _value = match.group(0).partition("=")
+        if eq and _PLAIN_QUERY_KEY.fullmatch(key):
+            return f"{key}=***"
+        return "***"
+
+    return _QUERY_ITEM.sub(item, query)
+
+
+def _masked_userinfo(userinfo: str) -> str:
+    """``***:***``, or the user info as it is when it is already masked
+    (``***`` or ``***:***``)."""
+    return userinfo if userinfo in ("***", "***:***") else "***:***"
+
+
+def _query_or_fragment_start(text: str) -> int:
+    """The index of the first ``?`` or ``#`` of ``text`` (its length when
+    there is none)."""
+    cut = len(text)
+    for char in "?#":
+        index = text.find(char)
+        if index != -1:
+            cut = min(cut, index)
+    return cut
+
+
+def _userinfo_end(rest: str) -> int:
+    """The index of the ``@`` that ends the user info of ``rest`` (a URL
+    after its ``scheme://``), or -1. Found before the query and the
+    fragment are split off, because a password may hold an unencoded
+    ``?``, ``#`` or ``/``; it fails closed (masks more rather than less):
+
+    - the last ``@`` before the first ``/`` (a password with ``?`` or
+      ``#``: ``amqp://user:pa?ss@host/``);
+    - else the last ``@`` before the first ``?`` or ``#`` (a password with
+      ``/``: ``amqp://user:pa/ss@host/``);
+    - else the last ``@`` of all (a password with ``/`` and then ``?`` or
+      ``#``); so a ``@`` in the query or the fragment of a URL with no
+      user info masks its host and path as well."""
+    slash = rest.find("/")
+    at = rest.rfind("@", 0, len(rest) if slash == -1 else slash)
+    if at == -1:
+        at = rest.rfind("@", 0, _query_or_fragment_start(rest))
+    if at == -1:
+        at = rest.rfind("@")
+    return at
+
+
+def mask_url_secrets(url: str) -> str:
+    """``url`` with what may carry a secret masked, read as text (it works
+    on a URL no parser accepts):
+
+    - the user info: everything before the last ``@`` of the part after
+      ``scheme://`` up to the first ``/`` becomes ``***:***`` (a ``?`` or
+      ``#`` in the password does not end it); with no ``@`` there,
+      everything before the last ``@`` ahead of the query and the fragment
+      (a password with an unencoded ``/``); with none there either,
+      everything before the last ``@`` of the URL (a password with ``/``
+      and ``?`` or ``#``: it fails closed, so a ``@`` in the query of a URL
+      without user info masks its host too);
+    - every value of the query string (``?name=***&other=***``; an item
+      without ``=`` or with an unusual name becomes ``***``);
+    - the fragment (``#***``).
+
+    The scheme, the host, the port and the path are kept. A broker URL has
+    no secret in its query by design, but the client library reads some
+    settings from it and an operator may put anything there."""
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        scheme, rest = "", url
+    userinfo = ""
+    at = _userinfo_end(rest)
+    if at != -1:
+        userinfo = _masked_userinfo(rest[:at]) + "@"
+        rest = rest[at + 1 :]
+    cut = _query_or_fragment_start(rest)
+    head, tail = rest[:cut], rest[cut:]
+    if tail.startswith("?"):
+        query, hash_, fragment = tail[1:].partition("#")
+        tail = "?" + _mask_query(query) + (hash_ + "***" if hash_ else "")
+    elif tail.startswith("#"):
+        tail = "#***"
+    return f"{scheme}{sep}{userinfo}{head}{tail}"
+
+
+def _mask_broker_url(match: "re.Match[str]") -> str:
+    url = match.group(0)
+    trailing = ""
+    while url and url[-1] in _URL_TRAILING_PUNCTUATION:
+        url, trailing = url[:-1], url[-1] + trailing
+    return mask_url_secrets(url) + trailing
 
 
 def redact_secrets(text: str) -> str:
     """``text`` with the secrets it may quote masked: the user name and
-    password of a URL (``amqp://***:***@host``), and the values of
-    ``AccountKey=``, ``SharedAccessSignature=``, ``SharedAccessKey=``,
-    ``Password=`` / ``Pwd=`` and of a ``sig=`` query parameter (``***``).
-    Used on texts the SDK logs or serves that come from code it does not
-    control, such as the exception a health check raised."""
+    password of a URL (``amqp://***:***@host``), the query values and the
+    fragment of a broker URL (``amqp://host/?password=***``, see
+    :func:`mask_url_secrets`), and the values of ``AccountKey=``,
+    ``SharedAccessSignature=``, ``SharedAccessKey=``, ``Password=`` /
+    ``Pwd=`` and of a ``sig=`` query parameter (``***``). Used on texts the
+    SDK logs or serves that come from code it does not control, such as the
+    exception a health check raised."""
     if not isinstance(text, str):
         return text
+    if "://" in text:
+        text = _BROKER_URL.sub(_mask_broker_url, text)
     text = _URL_USERINFO.sub(r"\1***:***@", text)
     text = _CONNECTION_STRING_SECRET.sub(lambda m: f"{m.group(1)}=***", text)
     return _SAS_SIGNATURE.sub(r"\1***", text)
+
+
+# What a record carries in place of a text that could not be masked: the
+# masking fails closed, so the text itself is never written.
+_WITHHELD_TEXT = "<withheld: secret masking failed>"
+_WITHHELD_MESSAGE = "<record text withheld: secret masking failed>"
+_WITHHELD_TRACEBACK = "<traceback withheld: secret masking failed>"
+
+
+class SecretMaskFilter(logging.Filter):
+    """Masks the secrets (see :func:`redact_secrets`) in the text a record
+    may quote from code the SDK does not control: its message, every text
+    field (``extra={...}``: ``error``, ``error_message``,
+    ``internal_message``, ``reason``, ``uri``, ...), its traceback and its
+    stack. Fields that are not text (numbers, lists, dicts) are kept as they
+    are.
+
+    Attached to the logger of every SDK module (:func:`masked_logger`; a
+    logger's filter only sees the records created at that logger, not those
+    of its children) and to the handlers the SDK installs
+    (:func:`setup_logging`, :func:`install_root_handler`): an exception text
+    that quotes a connection URL or a storage key is logged masked, by
+    default, in every log format.
+
+    It fails closed: a field that cannot be masked is replaced by
+    ``<withheld: secret masking failed>``, and when the message or the
+    traceback cannot be masked, the record keeps its level, logger and
+    fields, with ``<record text withheld: secret masking failed>`` as its
+    message (and ``<traceback withheld: ...>`` as its traceback). The record
+    itself is never dropped."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            self._mask(record)
+        except Exception:
+            self._withhold(record)
+        return True
+
+    @staticmethod
+    def _text_fields(record: logging.LogRecord) -> list:
+        return [
+            (name, value)
+            for name, value in list(record.__dict__.items())
+            if name not in JSONFormatter._STANDARD_RECORD_ATTRS and isinstance(value, str)
+        ]
+
+    def _mask(self, record: logging.LogRecord) -> None:
+        for name, value in self._text_fields(record):
+            try:
+                masked = redact_secrets(value)
+            except Exception:
+                masked = _WITHHELD_TEXT
+            if masked != value:
+                record.__dict__[name] = masked
+        try:
+            message = record.getMessage()
+        except Exception:
+            # The formatters then write the template: mask that.
+            message = _safe_str(record.msg)
+        masked = redact_secrets(message)
+        if masked != message:
+            record.msg = masked
+            record.args = None
+        if record.exc_info and record.exc_info[1] is not None:
+            text = record.exc_text or logging.Formatter().formatException(record.exc_info)
+            masked = redact_secrets(text)
+            if masked != text:
+                # Rendered once, masked; the formatters use it as it is.
+                record.exc_text = masked
+        if isinstance(record.stack_info, str):
+            masked = redact_secrets(record.stack_info)
+            if masked != record.stack_info:
+                record.stack_info = masked
+
+    @classmethod
+    def _withhold(cls, record: logging.LogRecord) -> None:
+        """Fail closed: replace every text of ``record`` that may quote a
+        secret by a placeholder."""
+        record.msg = _WITHHELD_MESSAGE
+        record.args = None
+        if record.exc_info:
+            record.exc_text = _WITHHELD_TRACEBACK
+        record.stack_info = None
+        try:
+            for name, _value in cls._text_fields(record):
+                record.__dict__[name] = _WITHHELD_TEXT
+        except Exception:  # pragma: no cover - a record whose __dict__ fails
+            pass
+
+
+def masked_logger(name: str) -> logging.Logger:
+    """``logging.getLogger(name)`` with a :class:`SecretMaskFilter` attached
+    (once). Every SDK module takes its logger from here, so the secrets in
+    its records are masked whichever handler writes them (the SDK's own or
+    one the application configured)."""
+    logger = logging.getLogger(name)
+    if not any(isinstance(f, SecretMaskFilter) for f in logger.filters):
+        logger.addFilter(SecretMaskFilter())
+    return logger
+
+
+def _command_fields(envelope: Any) -> dict:
+    """The fields that identify a command in every per-command record:
+    ``correlation_id``, ``message_id`` (the key of the dead-letter queue
+    message and of a log search across services), ``command_name``,
+    ``trace_id`` (shown as ``[trace=...]`` in the text format),
+    ``idempotency_key`` and, when the command carries one, ``job_id``. The
+    envelope of a reply or a status update carries the same values as its
+    command's."""
+    fields = {
+        "correlation_id": getattr(envelope, "correlation_id", None),
+        "message_id": getattr(envelope, "message_id", None),
+        "command_name": getattr(envelope, "name", None),
+        "trace_id": getattr(envelope, "trace_id", None),
+        "idempotency_key": getattr(envelope, "idempotency_key", None),
+    }
+    job_id = getattr(envelope, "job_id", None)
+    if job_id is not None:
+        fields["job_id"] = job_id
+    return fields
 
 
 def setup_logging(
@@ -400,6 +643,11 @@ def setup_logging(
     else:
         formatter = TextFormatter()
 
+    # Secrets are masked on the way out as well (handler-level, so it
+    # covers the records of every child logger, including one that has no
+    # filter of its own); the SDK modules' loggers mask them already.
+    handler.addFilter(SecretMaskFilter())
+
     # Attach the service-name filter to the HANDLER (not the logger).
     # Logger-level filters only fire on records originated at that exact
     # logger; handler-level filters fire on every record that reaches
@@ -415,6 +663,122 @@ def setup_logging(
 
     # Don't propagate to root logger
     logger.propagate = False
+
+
+# Marks the last-resort handler install_root_handler sets.
+_LAST_RESORT_MARK = "_kbm_ledsas_last_resort"
+
+
+class _StderrHandler(logging.Handler):
+    """Writes each record as one line to the ``sys.stderr`` of the moment
+    (looked up for each record, as Python's own last-resort handler does),
+    so a later redirection of stderr is followed."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            stream = sys.stderr
+            stream.write(self.format(record) + "\n")
+            stream.flush()
+        except RecursionError:  # pragma: no cover - as logging.StreamHandler
+            raise
+        except Exception:
+            self.handleError(record)
+
+
+class _WarningsFallback(logging.Handler):
+    """On the ``py.warnings`` logger: hands the record of a Python warning
+    to the last-resort handler when no handler of the application takes it.
+
+    ``logging.captureWarnings(True)`` gives ``py.warnings`` a ``NullHandler``
+    when it has none, so Python never hands a warning to its last resort.
+    This handler stands in for that ``NullHandler``; a handler the
+    application adds (to ``py.warnings``, a parent or the root logger, at
+    any time) takes the record instead, so it is never written twice."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        logger: logging.Logger | None = logging.getLogger(record.name)
+        while logger is not None:
+            for handler in logger.handlers:
+                if handler is self or isinstance(handler, (logging.NullHandler, _WarningsFallback)):
+                    continue
+                return  # the application's own handler takes the record
+            if not logger.propagate:
+                break
+            logger = logger.parent
+        last = logging.lastResort
+        if last is not None and record.levelno >= last.level:
+            last.handle(record)
+
+
+def _is_python_last_resort(handler: object) -> bool:
+    """True when ``handler`` is Python's own last-resort handler (the one
+    that writes the bare message), or one ``install_root_handler`` set."""
+    if getattr(handler, _LAST_RESORT_MARK, False):
+        return True
+    default = getattr(logging, "_defaultLastResort", None)
+    if default is not None and handler is default:
+        return True
+    stdlib_class = getattr(logging, "_StderrHandler", None)
+    return isinstance(stdlib_class, type) and type(handler) is stdlib_class
+
+
+def install_root_handler(
+    log_format: str = "json",
+    service_name: str | None = None,
+) -> bool:
+    """Write the records no handler takes, and Python warnings, in the SDK's
+    log format, when the application has not configured logging itself.
+
+    When the root logger has no handler (the application did not call
+    ``logging.basicConfig`` or add a handler to the root logger), Python's
+    last-resort handler (``logging.lastResort``, which writes only the
+    message of a WARNING or higher record that no handler takes) is
+    replaced with one that writes in the SDK's format (``log_format``: json
+    or text) to stderr, and Python warnings are routed through logging
+    (``logging.captureWarnings(True)``; ``py.warnings`` gets a handler
+    that passes a warning on to that last resort when no handler of the
+    application takes it, see ``_WarningsFallback``). The records of the
+    asyncio event loop ("Task exception was never retrieved", with its
+    traceback in the record), of the client libraries, of the application's
+    loggers that have no handler and of warnings then go out in that format,
+    one per line, instead of as plain multi-line text.
+
+    Which records come out is unchanged: those at WARNING or higher that
+    their logger's level lets through and that no handler takes. A logger
+    the application gave a handler of its own is written by that handler
+    only, so no record is written twice; INFO records still need a logging
+    configuration of the application's own. A ``logging.basicConfig(...)``
+    called later still configures the root logger, and from then on the
+    last resort is not used. Nothing is changed when the root logger
+    already has a handler, or when the application replaced
+    ``logging.lastResort`` itself.
+
+    Returns:
+        True when the SDK's handler is now the last resort.
+    """
+    if logging.getLogger().handlers:
+        return False
+    if not _is_python_last_resort(logging.lastResort):
+        return False
+    handler = _StderrHandler(logging.WARNING)
+    handler.setFormatter(JSONFormatter() if log_format == "json" else TextFormatter())
+    # The records it writes come from other code (the event loop, the
+    # client libraries): the secrets they quote are masked.
+    handler.addFilter(SecretMaskFilter())
+    if service_name:
+        handler.addFilter(ServiceNameFilter(service_name))
+    setattr(handler, _LAST_RESORT_MARK, True)
+    logging.lastResort = handler
+    warnings_logger = logging.getLogger("py.warnings")
+    if not any(isinstance(h, _WarningsFallback) for h in warnings_logger.handlers):
+        # Before captureWarnings, which adds a NullHandler only when the
+        # logger has no handler.
+        warnings_logger.addHandler(_WarningsFallback())
+    logging.captureWarnings(True)
+    return True
 
 
 class ServiceNameFilter(logging.Filter):

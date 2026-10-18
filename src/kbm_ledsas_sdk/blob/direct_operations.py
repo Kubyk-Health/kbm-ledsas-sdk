@@ -13,6 +13,7 @@ from kbm_ledsas_sdk.blob.azure_client import DEFAULT_CHUNK_SIZE, AzureBlobClient
 from kbm_ledsas_sdk.blob.operations import (
     BlobOperations,
     _check_container,
+    _check_overwrite,
     _check_upload_data,
     _check_upload_stream,
     _encode_text,
@@ -21,8 +22,9 @@ from kbm_ledsas_sdk.blob.operations import (
     _mark_non_retryable,
 )
 from kbm_ledsas_sdk.models.blob import BlobRef
+from kbm_ledsas_sdk.utils.logging import masked_logger
 
-logger = logging.getLogger(__name__)
+logger = masked_logger(__name__)
 
 # The Content-Type stored with a blob written by upload_json / upload_text
 # (what a browser, a download tool or a storage browser sees).
@@ -209,13 +211,15 @@ class DirectBlobOperations(BlobOperations):
             BlobRef with URI including versionId
 
         Raises:
-            TypeError: If ``data`` is not bytes-like or ``container`` is
-                not a string (refused before any I/O; Permanent if uncaught).
+            TypeError: If ``data`` is not bytes-like, ``container`` is
+                not a string or ``overwrite`` is not a bool (refused before
+                any I/O; Permanent if uncaught).
             ValueError: If ``container`` or ``path`` is invalid (refused
                 before any I/O; Permanent if uncaught).
             ResourceExistsError: If ``overwrite=False`` and ``path`` exists.
             Exception: If upload fails for other reasons.
         """
+        _check_overwrite(overwrite)
         _check_container(container)
         # bytearray / memoryview become bytes (the storage client would
         # otherwise iterate a bytearray as a sequence of ints).
@@ -263,11 +267,13 @@ class DirectBlobOperations(BlobOperations):
             TypeError: If obj cannot be serialized to JSON (ValueError for
                 a circular reference). Uncaught, either is replied as
                 Permanent (not retried): the same object fails again.
-            TypeError / ValueError: If ``container`` or ``path`` is invalid
-                (refused before any I/O; Permanent if uncaught).
+            TypeError / ValueError: If ``container`` or ``path`` is invalid,
+                or ``overwrite`` is not a bool (TypeError); refused before
+                any I/O (Permanent if uncaught).
             ResourceExistsError: If ``overwrite=False`` and ``path`` exists.
             Exception: If upload fails for other reasons.
         """
+        _check_overwrite(overwrite)
         _check_container(container)
         try:
             # Standard JSON: NaN / Infinity are written as null, as in
@@ -333,9 +339,9 @@ class DirectBlobOperations(BlobOperations):
             TypeError: If text is not a string
             ValueError: If text holds a lone surrogate, which UTF-8 cannot
                 encode.
-            TypeError / ValueError: If ``container`` or ``path`` is invalid.
-                All of these are refused before any I/O (Permanent if
-                uncaught).
+            TypeError / ValueError: If ``container`` or ``path`` is invalid,
+                or ``overwrite`` is not a bool (TypeError). All of these are
+                refused before any I/O (Permanent if uncaught).
             ResourceExistsError: If ``overwrite=False`` and ``path`` exists.
             Exception: If upload fails for other reasons.
         """
@@ -348,6 +354,7 @@ class DirectBlobOperations(BlobOperations):
             )
             _mark_non_retryable(err, str(err))
             raise err
+        _check_overwrite(overwrite)
         _check_container(container)
 
         # Text UTF-8 cannot encode (a lone surrogate) is refused here, not
@@ -442,11 +449,16 @@ class DirectBlobOperations(BlobOperations):
             BlobRef with URI including versionId
 
         Raises:
-            TypeError: If ``stream`` is not an async iterable.
+            TypeError: If ``stream`` is not an async iterable or
+                ``overwrite`` is not a bool (refused before any I/O), or the
+                stream yields a chunk that is not bytes-like (a ``str``
+                chunk is refused, not stored encoded). Permanent if uncaught.
             TypeError / ValueError: If ``container`` or ``path`` is invalid.
                 Both are refused before any I/O (Permanent if uncaught).
             ResourceExistsError: If ``overwrite=False`` and ``path`` exists.
-            Exception: If upload fails for other reasons.
+            Exception: If upload fails for other reasons. An exception the
+                stream itself raises is raised unchanged (the handler's own
+                error), without a storage failure record.
 
         Example:
             >>> async def file_stream():
@@ -459,6 +471,7 @@ class DirectBlobOperations(BlobOperations):
             ...     progress_callback=lambda b: print(f"Uploaded {b} bytes")
             ... )
         """
+        _check_overwrite(overwrite)
         _check_container(container)
         _check_upload_stream(stream)
         logger.debug(

@@ -62,7 +62,7 @@ BOOLEAN_RULE = (
 
 # Canonical registry of customer-facing SDK environment variables.
 #
-# Retired variables are intentionally absent: since v0.3.0 they no longer
+# Retired variables are intentionally absent: they no longer
 # configure anything and are accepted but ignored (config.from_env logs a
 # one-time warning when one is set). Deployment tooling that enumerates
 # ENV_VAR_REGISTRY should not nudge operators toward a retired knob.

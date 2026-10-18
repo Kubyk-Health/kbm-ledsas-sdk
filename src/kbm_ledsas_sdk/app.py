@@ -48,13 +48,13 @@ from .health.server import HealthServer, HealthServerStartFailure, _host_port
 from .models.messages import Command
 from .runtime.config import SDKConfig, _shown_setting, describe_config_errors, service_name_problem
 from .runtime.context import ExecutionContext
-from .runtime.handler import HandlerFunc, HandlerRegistry
+from .runtime.handler import HandlerFunc, HandlerRegistry, _command_fields
 from .runtime.security import _is_truthy, _read_env
-from .transport.base import DeliveryLost, Transport, TransportConnectionLost
+from .transport.base import ERROR_REPLY_SENT, REPLY_UNCONFIRMED, DeliveryLost, Transport
 from .transport.factory import create_transport
-from .utils.logging import setup_logging
+from .utils.logging import SecretMaskFilter, install_root_handler, masked_logger, setup_logging
 
-logger = logging.getLogger(__name__)
+logger = masked_logger(__name__)
 
 
 class _SuppressExpectedAMQPErrors(logging.Filter):
@@ -112,12 +112,18 @@ class _SuppressExpectedAMQPErrors(logging.Filter):
             record.msg = scrubbed
             record.args = None
 
+    # The SDK's secret masking (URL user info, a broker URL's query values,
+    # storage keys, SAS signatures), on the message, the text fields and the
+    # traceback of a library record that is kept; it fails closed.
+    _MASK = SecretMaskFilter()
+
     def filter(self, record: logging.LogRecord) -> bool:
         # Decide on the record as the library logged it, then remove
         # credentials from the text of a record that is kept.
         keep = self._keep(record)
         if keep:
             self._scrub_credentials(record)
+            self._MASK.filter(record)
         return keep
 
     def _keep(self, record: logging.LogRecord) -> bool:
@@ -131,6 +137,20 @@ class _SuppressExpectedAMQPErrors(logging.Filter):
             record.name.startswith("aiormq")
             and record.levelno > logging.WARNING
             and self._message_starts_with(record, "Unexpected connection close from remote")
+        ):
+            record.levelno = logging.WARNING
+            record.levelname = logging.getLevelName(logging.WARNING)
+        # When the broker closes a channel (at its consumer_timeout, for
+        # example) while it is still sending deliveries on it, aiormq logs
+        # each frame that arrives for the closed channel as an ERROR ("Got
+        # frame for closed channel N: <Basic.Deliver ...>"). The broker
+        # takes such deliveries back with the channel and delivers them
+        # again, and the SDK logs the close itself, so the record is kept
+        # as a WARNING.
+        if (
+            record.name.startswith("aiormq")
+            and record.levelno > logging.WARNING
+            and self._message_starts_with(record, "Got frame for closed channel")
         ):
             record.levelno = logging.WARNING
             record.levelname = logging.getLevelName(logging.WARNING)
@@ -258,6 +278,15 @@ _FILTERED_LIBRARY_LOGGERS = (
     "azure",
 )
 
+# The client library's other module loggers: no record of theirs is dropped,
+# but the secrets they may quote (a connection's URL) are masked.
+_MASKED_LIBRARY_LOGGERS = (
+    "aio_pika.message",
+    "aio_pika.pool",
+    "aio_pika.robust_exchange",
+    "aio_pika.robust_queue",
+)
+
 
 def _quiet_noisy_libraries() -> None:
     """
@@ -301,6 +330,8 @@ def _quiet_noisy_libraries() -> None:
         # Avoid attaching the same filter twice if run() is called more than once.
         if not any(isinstance(f, _SuppressExpectedAMQPErrors) for f in lib_logger.filters):
             lib_logger.addFilter(suppressor)
+    for name in _MASKED_LIBRARY_LOGGERS:
+        masked_logger(name)
 
 
 class ServiceApp:
@@ -510,6 +541,11 @@ class ServiceApp:
 
                 app.run()
         """
+        # Set when the service exits 1 after a reported failure. The exit
+        # happens after the except block, so the SystemExit does not carry
+        # the error as its __context__ (a configuration error's settings
+        # input, for example, stays out of an error reporter's chain).
+        exit_code: int | None = None
         try:
             asyncio.run(self._run_async())
         except KeyboardInterrupt:
@@ -568,7 +604,7 @@ class ServiceApp:
                 logger.exception(f"Configuration error: {error_text}")
             else:
                 logger.error(f"Configuration error: {error_text}")
-            sys.exit(1)
+            exit_code = 1
         except Exception as e:
             # Expected startup-error classes are logged ONCE by
             # the layer that detected them (DirectTransport for AMQP
@@ -591,37 +627,27 @@ class ServiceApp:
                     # are listed, matching the dual-spelling pattern above.
                     "aio_pika.exceptions.AMQPConnectionError",
                     "aiormq.exceptions.AMQPConnectionError",
-                    # Transport connection died mid-run (v0.3.1): the
-                    # transport + execution loop each logged one clean line;
-                    # exit non-zero for a supervised restart, no re-dump.
-                    "kbm_ledsas_sdk.transport.base.TransportConnectionLost",
-                    # Transport could not connect at startup (v0.3.5): the
+                    # Transport could not connect at startup: the
                     # transport logged the cause as one clean line.
                     "kbm_ledsas_sdk.transport.base.TransportUnavailable",
                     # The health server could not listen on
-                    # KBM_LEDSAS_HEALTH_HOST / KBM_LEDSAS_HEALTH_PORT (v0.3.5):
+                    # KBM_LEDSAS_HEALTH_HOST / KBM_LEDSAS_HEALTH_PORT:
                     # it logged the cause and the setting to change.
                     "kbm_ledsas_sdk.health.server.HealthServerStartFailure",
                 }
             )
             if exc_qualname in _expected_startup_errors:
-                if exc_qualname == "kbm_ledsas_sdk.transport.base.TransportConnectionLost":
-                    # A runtime event, not a startup failure: an alert or a
-                    # search on "startup failure" must not fire for it.
-                    logger.error(
-                        "ServiceApp exiting: the transport connection was "
-                        "lost (reported above). Reason class: %s",
-                        exc_qualname,
-                    )
-                else:
-                    logger.error(
-                        "ServiceApp exiting (startup failure already "
-                        "reported above). Reason class: %s",
-                        exc_qualname,
-                    )
-                sys.exit(1)
-            logger.exception(f"Fatal error in ServiceApp: {e}")
-            raise
+                logger.error(
+                    "ServiceApp exiting (startup failure already "
+                    "reported above). Reason class: %s",
+                    exc_qualname,
+                )
+                exit_code = 1
+            else:
+                logger.exception(f"Fatal error in ServiceApp: {e}")
+                raise
+        if exit_code is not None:
+            sys.exit(exit_code)
 
     def _ensure_sdk_logging(self) -> None:
         """Install the SDK log handler if config loading failed before
@@ -668,6 +694,13 @@ class ServiceApp:
             log_format=self.config.log_format,
             service_name=self.config.service_name,
         )
+        # Records of other code (the event loop's "Task exception was never
+        # retrieved", the client libraries, Python warnings) in the same
+        # format, when the application has not configured logging itself.
+        install_root_handler(
+            log_format=self.config.log_format,
+            service_name=self.config.service_name,
+        )
         _quiet_noisy_libraries()
 
         if self.config.service_name != self.service_name:
@@ -708,6 +741,12 @@ class ServiceApp:
 
         # Create and start transport
         self.transport = create_transport(self.config)
+        # The command names this service handles, before the transport
+        # starts (an optional hook; the default does nothing).
+        if isinstance(self.transport, Transport):
+            self.transport.set_handled_commands(
+                sorted({name for name, _version in self.registry.list_handlers()})
+            )
         # Stop signals are handled from here on, the start included: a
         # SIGTERM / SIGINT that arrives while the transport is still
         # connecting stops the start (a broker that does not answer would
@@ -935,17 +974,6 @@ class ServiceApp:
                 active_tasks.add(task)
                 task.add_done_callback(active_tasks.discard)
 
-        except TransportConnectionLost as e:
-            # Expected operational condition (transport connection died):
-            # one clean line — the transport layer already logged the
-            # cause — then propagate so the process exits non-zero for a
-            # supervised restart. No traceback dump.
-            self._transport_lost = True
-            logger.error(
-                "Transport connection lost — exiting for supervised " "restart: %s",
-                e,
-            )
-            raise
         except Exception as e:
             logger.exception(f"Error in execution loop: {e}")
             raise
@@ -1084,7 +1112,7 @@ class ServiceApp:
                 "Giving back an unstarted command failed (the broker "
                 "redelivers it once the connection closes)",
                 exc_info=True,
-                extra={"correlation_id": envelope.correlation_id},
+                extra=_command_fields(envelope),
             )
 
     async def _stop_receiving_commands(self) -> None:
@@ -1200,7 +1228,7 @@ class ServiceApp:
             logger.debug(
                 "Settling a command whose task ended early failed",
                 exc_info=True,
-                extra={"correlation_id": envelope.correlation_id},
+                extra=_command_fields(envelope),
             )
 
     async def _handle_command(self, command: Command, semaphore: asyncio.Semaphore):
@@ -1222,7 +1250,6 @@ class ServiceApp:
         """
         async with self._worker_slot(semaphore) as has_worker:
             envelope = command.envelope
-            correlation_id = envelope.correlation_id
 
             if not has_worker or self._stopped_taking_commands():
                 # The service stopped taking commands while this one waited
@@ -1233,11 +1260,7 @@ class ServiceApp:
             try:
                 logger.info(
                     f"Handling command {envelope.name}",
-                    extra={
-                        "correlation_id": correlation_id,
-                        "message_id": envelope.message_id,
-                        "command_name": envelope.name,
-                    },
+                    extra=_command_fields(envelope),
                 )
 
                 # Create execution context
@@ -1298,11 +1321,11 @@ class ServiceApp:
                 # ONE reply, sent when the SDK has finished with it: success,
                 # a non-retryable error, or a retryable error whose retry
                 # budget (KBM_LEDSAS_MAX_RETRIES) is spent. An attempt that
-                # will be retried sends no reply. Before v0.3.5 every
-                # attempt replied, so a caller that took the first reply as
-                # the outcome saw a failure for a command that then
-                # succeeded on retry (and, if it had already removed its
-                # reply exchange, the successful attempt was dead-lettered).
+                # will be retried sends no reply. A reply per attempt would
+                # make a caller that takes the first reply as the outcome
+                # see a failure for a command that then succeeds on retry
+                # (and, if it had already removed its reply exchange, the
+                # successful attempt would be dead-lettered).
                 # The outcome is what the handler layer decided from how the
                 # handler ended (it raised, timed out, or returned an
                 # invalid result), never the reply's keys: a successful
@@ -1324,24 +1347,53 @@ class ServiceApp:
                         f"Retry {retry_count + 1}/{max_retries}, "
                         f"waiting {delay:.2f}s before requeue (no reply for "
                         f"this attempt)",
-                        extra={"correlation_id": correlation_id},
+                        extra=_command_fields(envelope),
                     )
                     await self._backoff_unless_shutdown(delay)
                     await self.transport.nack(envelope.message_id, requeue=True)
                     return
 
                 # Terminal outcome: reply once (only if reply_to is set).
+                reply_unconfirmed = False
                 if envelope.reply_to:
                     reply_publish_ok = await self.transport.send_response(response)
-                    if reply_publish_ok:
+                    if reply_publish_ok is REPLY_UNCONFIRMED:
+                        # The transport handed the reply on but could not
+                        # confirm it was published (it says so in its own
+                        # WARNING); an acknowledgement takes effect only once
+                        # the reply is confirmed. Not logged as sent / ACKed,
+                        # so neither line counts a command whose outcome is
+                        # still open (it may be delivered and run again).
+                        reply_unconfirmed = True
+                        logger.info(
+                            f"Reply to {envelope.name} handed to the transport "
+                            "unconfirmed"
+                            + (
+                                ""
+                                if is_error
+                                else "; acknowledgement deferred until the " "reply is confirmed"
+                            ),
+                            extra={**_command_fields(envelope), "reply_confirmed": False},
+                        )
+                    elif reply_publish_ok:
                         logger.info(
                             f"Sent response for {envelope.name}",
-                            extra={
-                                "correlation_id": correlation_id,
-                                "message_id": envelope.message_id,
-                                "command_name": envelope.name,
-                            },
+                            extra=_command_fields(envelope),
                         )
+                    elif reply_publish_ok is ERROR_REPLY_SENT:
+                        # The transport sent an error reply in place of the
+                        # result (it could not be sent as a reply) and
+                        # logged that once, as an ERROR. The caller has its
+                        # reply; the command is dead-lettered, and this is
+                        # not a failed publish.
+                        await self.transport.nack(envelope.message_id, requeue=False)
+                        logger.info(
+                            f"Replied an error in place of the result of "
+                            f"{envelope.name} (reported above); command "
+                            "dead-lettered",
+                            extra=_command_fields(envelope),
+                        )
+                        return
                     elif self._broker_unreachable_at_shutdown():
                         # Shutdown in progress and the transport found the
                         # broker unreachable: the reply could not be
@@ -1362,27 +1414,30 @@ class ServiceApp:
                         logger.info(
                             f"Reply publish failed for {envelope.name}; "
                             "command will be dead-lettered",
-                            extra={"correlation_id": correlation_id},
+                            extra=_command_fields(envelope),
                         )
                         await self.transport.nack(envelope.message_id, requeue=False)
                         return
                 else:
                     logger.info(
                         f"Skipping response for {envelope.name} (no reply_to)",
-                        extra={"correlation_id": correlation_id},
+                        extra=_command_fields(envelope),
                     )
 
                 if not is_error:
                     # Success
                     await self.transport.ack(envelope.message_id)
-                    logger.info(
-                        f"ACKed command {envelope.name}",
-                        extra={
-                            "correlation_id": correlation_id,
-                            "message_id": envelope.message_id,
-                            "command_name": envelope.name,
-                        },
-                    )
+                    if reply_unconfirmed:
+                        logger.info(
+                            f"ACK of command {envelope.name} deferred until "
+                            "its reply is confirmed",
+                            extra=_command_fields(envelope),
+                        )
+                    else:
+                        logger.info(
+                            f"ACKed command {envelope.name}",
+                            extra=_command_fields(envelope),
+                        )
                 elif retryable:
                     # Retry budget spent - send to DLQ. The ERROR is logged
                     # once the dead-letter has been sent: a dead-letter
@@ -1394,12 +1449,7 @@ class ServiceApp:
                     await self.transport.nack(envelope.message_id, requeue=False)
                     logger.error(
                         f"Max retries ({max_retries}) exceeded, sending to DLQ",
-                        extra={
-                            "correlation_id": correlation_id,
-                            "message_id": envelope.message_id,
-                            "command_name": envelope.name,
-                            "retry_count": retry_count,
-                        },
+                        extra={**_command_fields(envelope), "retry_count": retry_count},
                     )
                 else:
                     # Non-retryable error - send to DLQ immediately. The
@@ -1411,7 +1461,7 @@ class ServiceApp:
                     await self.transport.nack(envelope.message_id, requeue=False)
                     logger.info(
                         "Command failed with a non-retryable error, sending to DLQ",
-                        extra={"correlation_id": correlation_id},
+                        extra=_command_fields(envelope),
                     )
 
             except DeliveryLost:
@@ -1438,12 +1488,16 @@ class ServiceApp:
                 # the message bouncing forever.
                 logger.exception(
                     "Uncaught exception in _handle_command; dead-lettering",
-                    extra={"correlation_id": correlation_id},
+                    extra=_command_fields(envelope),
                 )
                 try:
                     await self.transport.nack(envelope.message_id, requeue=False)
                 except Exception as nack_error:
-                    logger.exception(f"Failed to NACK message: {nack_error}")
+                    logger.exception(
+                        "Failed to NACK message: %s",
+                        nack_error,
+                        extra=_command_fields(envelope),
+                    )
             except BaseException:
                 # The handler's own BaseExceptions (CancelledError it raised,
                 # SystemExit, ...) are handled by registry.execute. Reaching
@@ -1718,11 +1772,13 @@ class ServiceApp:
         await self.health_server.start()
 
         # Say once that the endpoints are reachable from the network, and
-        # only after the bind succeeded (a failed bind logs its own
-        # WARNING). Binding all interfaces is what an orchestrator's HTTP
-        # probes need, so it is INFO; with KBM_LEDSAS_HEALTH_VERBOSE the
-        # bodies also name the service and SDK version to anyone who can
-        # reach the port, so that combination is a WARNING.
+        # only after the bind succeeded (a failed bind stops the start:
+        # HealthServer.start logs one ERROR and raises
+        # HealthServerStartFailure). Binding all interfaces is what an
+        # orchestrator's HTTP probes need, so it is INFO; with
+        # KBM_LEDSAS_HEALTH_VERBOSE the bodies also name the service and
+        # SDK version to anyone who can reach the port, so that
+        # combination is a WARNING.
         loopback_hosts = {"127.0.0.1", "::1", "localhost"}
         if (
             self.health_server.bound_port is not None

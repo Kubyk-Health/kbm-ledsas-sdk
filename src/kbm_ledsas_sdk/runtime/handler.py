@@ -22,7 +22,7 @@ import dataclasses
 import enum
 import inspect
 import json
-import logging
+import logging  # noqa: F401
 import os
 import re
 import sys
@@ -43,6 +43,11 @@ from ..blob.operations import (
 from ..models.envelope import Envelope
 from ..models.errors import DeadlineExceeded, Permanent, Retryable
 from ..models.messages import Command, Response
+
+# _command_fields: the identity of a command on every per-command record
+# (correlation_id, message_id, command_name, trace_id, idempotency_key and
+# job_id); imported from here by the service layer too.
+from ..utils.logging import _command_fields, masked_logger
 from .context import ExecutionContext
 
 # Type alias for handler functions. A handler returns a JSON-serializable
@@ -50,7 +55,10 @@ from .context import ExecutionContext
 # empty result ({}), which suits fire-and-forget handlers.
 HandlerFunc = Callable[[ExecutionContext, dict], Awaitable[dict | None]]
 
-logger = logging.getLogger(__name__)
+# A handler's exception text is quoted by this logger's records (internal
+# message, error message, traceback): secrets in it are masked by default,
+# as in every SDK module's records.
+logger = masked_logger(__name__)
 
 
 class HandlerOutcome(NamedTuple):
@@ -674,8 +682,20 @@ class HandlerRegistry:
 
     def log_registered(self) -> None:
         """One INFO record per registered handler (``Registered handler for
-        <name> v<version>``). Called by ``ServiceApp`` once its logging is
-        set up, so the records use the SDK's log format and level."""
+        <name> v<version>``), or one WARNING when none is registered (every
+        command would then be replied ``HandlerNotFound`` and dead-lettered;
+        typically the module that defines the handlers was not imported).
+        Called by ``ServiceApp`` once its logging is set up, so the records
+        use the SDK's log format and level."""
+        if not self._handlers:
+            logger.warning(
+                "No command handler is registered: every command this service "
+                "receives is replied HandlerNotFound and dead-lettered. "
+                "Register handlers with @app.handler(...) in modules that are "
+                "imported before app.run()",
+                extra={"handlers": 0},
+            )
+            return
         for command_name, version in self._handlers:
             logger.info(
                 "Registered handler for %s v%s",
@@ -710,7 +730,7 @@ class HandlerRegistry:
         """
         Resolve the message the caller will see.
 
-        Precedence (v0.1.7+):
+        Precedence:
         1. If the handler supplied ``user_message`` (a string, an empty
            one included), the caller always sees that. A user_message that
            was set but cannot be sent (``_UNUSABLE_USER_MESSAGE``) gives
@@ -844,7 +864,7 @@ class HandlerRegistry:
             # No handler registered - permanent error
             logger.error(
                 f"No handler for {envelope.name} v{envelope.message_version}",
-                extra={"correlation_id": envelope.correlation_id},
+                extra=_command_fields(envelope),
             )
             specific_msg = f"No handler registered for {envelope.name} v{envelope.message_version}"
             return self._error_outcome(
@@ -878,8 +898,7 @@ class HandlerRegistry:
                     logger.warning(
                         "Deadline already exceeded",
                         extra={
-                            "correlation_id": envelope.correlation_id,
-                            "command_name": envelope.name,
+                            **_command_fields(envelope),
                             "deadline": envelope.deadline.isoformat(),
                             "now": now.isoformat(),
                         },
@@ -900,8 +919,7 @@ class HandlerRegistry:
             logger.info(
                 "Executing handler",
                 extra={
-                    "correlation_id": envelope.correlation_id,
-                    "command_name": envelope.name,
+                    **_command_fields(envelope),
                     "timeout": effective_timeout,
                 },
             )
@@ -953,8 +971,7 @@ class HandlerRegistry:
                 logger.warning(
                     "Handler timeout",
                     extra={
-                        "correlation_id": envelope.correlation_id,
-                        "command_name": envelope.name,
+                        **_command_fields(envelope),
                         "timeout_seconds": effective_timeout,
                     },
                 )
@@ -964,8 +981,7 @@ class HandlerRegistry:
                 # library's own timeout): reported as code Timeout, as
                 # documented, without claiming the SDK's timeout elapsed.
                 extra = {
-                    "correlation_id": envelope.correlation_id,
-                    "command_name": envelope.name,
+                    **_command_fields(envelope),
                     "error_class": type(e).__name__,
                     "error_message": _safe_str(e),
                 }
@@ -992,8 +1008,7 @@ class HandlerRegistry:
             logger.warning(
                 "Retryable error in handler",
                 extra={
-                    "correlation_id": envelope.correlation_id,
-                    "command_name": envelope.name,
+                    **_command_fields(envelope),
                     "error_message": text,
                 },
             )
@@ -1014,8 +1029,7 @@ class HandlerRegistry:
             logger.error(
                 "Permanent error in handler",
                 extra={
-                    "correlation_id": envelope.correlation_id,
-                    "command_name": envelope.name,
+                    **_command_fields(envelope),
                     "error_message": text,
                 },
             )
@@ -1061,8 +1075,7 @@ class HandlerRegistry:
                 f"the process"
             )
             extra = {
-                "correlation_id": envelope.correlation_id,
-                "command_name": envelope.name,
+                **_command_fields(envelope),
                 "error_class": type(e).__name__,
             }
             location = _error_location(e)
@@ -1089,8 +1102,7 @@ class HandlerRegistry:
                     "Non-retryable error in handler (not retried): %s",
                     reason,
                     extra={
-                        "correlation_id": envelope.correlation_id,
-                        "command_name": envelope.name,
+                        **_command_fields(envelope),
                         "error_class": type(e).__name__,
                     },
                 )
@@ -1144,8 +1156,7 @@ class HandlerRegistry:
         logger.warning(
             "Deadline exceeded in handler",
             extra={
-                "correlation_id": envelope.correlation_id,
-                "command_name": envelope.name,
+                **_command_fields(envelope),
                 "error_message": text,
             },
         )
@@ -1203,8 +1214,7 @@ class HandlerRegistry:
         an ERROR with the traceback, as for a single call.
         """
         extra = {
-            "correlation_id": envelope.correlation_id,
-            "command_name": envelope.name,
+            **_command_fields(envelope),
             "internal_message": internal_msg,
             "error_class": type(error).__name__,
         }
@@ -1244,6 +1254,13 @@ class HandlerRegistry:
         (values converted once, as listed in the API reference): the
         transport sends exactly what was checked, so a value that can be
         read only once (a generator) is not sent empty.
+
+        A command without ``reply_to`` (fire-and-forget) gets no reply, so
+        only the result's type is checked (a dict, None, or an awaitable
+        that was never awaited): its values are neither walked nor
+        serialized, which for a large result would hold the event loop for
+        a reply that is never sent. A dict whose values have no JSON form
+        is then not an error, and the command is acknowledged.
         """
         response_envelope = self._build_response_envelope(envelope)
         if result is None:
@@ -1269,6 +1286,11 @@ class HandlerRegistry:
         elif not isinstance(result, dict):
             problem = (
                 f"returned {type(result).__name__}; a handler must return a " f"dict (or None)"
+            )
+        elif not envelope.reply_to:
+            # No reply is sent: the result is kept as returned, unchecked.
+            return HandlerOutcome(
+                Response.model_construct(envelope=response_envelope, payload=result)
             )
         else:
             payload: Any = result
@@ -1336,10 +1358,9 @@ class HandlerRegistry:
                 if where is not None:
                     problem = f"returned a dict that is not JSON-serializable ({where})"
                     response = None
-                # Only a reply that will be published is size-checked: a
-                # command without reply_to (fire-and-forget) sends none, so
-                # a large result there is not an error.
-                elif envelope.reply_to and self.max_reply_bytes and size > self.max_reply_bytes:
+                # Only a reply that will be published reaches this point (a
+                # command without reply_to sends none, see above).
+                elif self.max_reply_bytes and size > self.max_reply_bytes:
                     problem = (
                         f"returned a result too large to send as a reply "
                         f"({size} bytes serialized; the limit is "
@@ -1359,8 +1380,7 @@ class HandlerRegistry:
             "Handler returned an invalid result (not retried): %s",
             problem,
             extra={
-                "correlation_id": envelope.correlation_id,
-                "command_name": envelope.name,
+                **_command_fields(envelope),
             },
         )
         specific_msg = f"Handler for {envelope.name} {problem}"

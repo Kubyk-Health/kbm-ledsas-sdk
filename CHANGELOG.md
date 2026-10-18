@@ -65,7 +65,12 @@ PyPI, so this entry lists every change since 0.3.3.
   traceback), replied as `Permanent` and dead-lettered **without
   retrying**, since the handler's side effects have already happened;
   before, a non-serializable value surfaced as a reply-publish failure
-  that blamed the reply exchange.
+  that blamed the reply exchange. The dict is checked (and serialized)
+  only for a command with `reply_to`, whose result becomes the reply: a
+  fire-and-forget command gets no reply, so only its result's type is
+  checked (a value that is not a dict, or an awaitable that was never
+  awaited, is refused), and a dict is acknowledged whatever it holds,
+  without being walked or serialized on the event loop.
 - **Errors that cannot succeed on a retry are not retried.** If a
   handler lets one of these propagate, the SDK now logs one ERROR line
   (no traceback), replies `Permanent` and dead-letters the command at
@@ -380,10 +385,10 @@ PyPI, so this entry lists every change since 0.3.3.
   becomes `"null"` (it was `"None"`), as `json.dumps` writes them. A key
   type with no JSON form (a tuple, a date) is refused, and so are two keys
   that become the same text. A refused result's error names where
-  (`payload["rows"][3] is bytes that are not UTF-8 text`) instead of
-  `1 validation error for Response`, and no longer gives interpreter
-  advice. The accepted value conversions are listed under "Payload" in
-  the API reference.
+  (`payload["rows"][3]: the key (1, 2) (tuple) is not a JSON object
+  key`) instead of `1 validation error for Response`, and no longer gives
+  interpreter advice. The accepted value conversions are listed under
+  "Payload" in the API reference.
 - **Timeout replies say what happened.** The reply `Handler timed out
   after 1800s` is now sent only when the SDK's own timeout expired. A
   `TimeoutError` raised by the handler itself is replied `Handler raised
@@ -701,7 +706,8 @@ PyPI, so this entry lists every change since 0.3.3.
   failing (`(still failing)`), with one INFO `Health check '<name>' passes
   again` when it recovers; a URL's user name and password and the values
   of `AccountKey=`, `SharedAccessSignature=`, `SharedAccessKey=`,
-  `Password=` / `Pwd=` and `sig=` are masked in the record and the body.
+  `Password=` / `Pwd=` and a `sig=` URL query parameter are masked in the
+  record and the body.
 - **A blocked event loop is reported.** Blocking code in an `async def`
   handler (`time.sleep`, a CPU-heavy loop, a synchronous client call)
   stops the whole service, health probes included, and the handler time
@@ -748,16 +754,31 @@ PyPI, so this entry lists every change since 0.3.3.
   in a returned dict were written as text when they happened to be UTF-8
   (`b"\x00\x01"` became `"\u0000\u0001"`) and refused otherwise, so a
   handler tested with text-like bytes failed later on real binary data.
-  Now `bytes`, `bytearray` and `memoryview` are refused at any level,
-  sets included, with one ERROR, a `Permanent` reply and no retry
-  (`payload["b"] is bytes; a reply carries text, not binary data: decode
-  it if it is text (data.decode()), base64-encode it otherwise
+  Now `bytes`, `bytearray` and `memoryview` are refused at every level of
+  what the reply writes as a JSON object or array (dicts, lists, tuples,
+  sets, deques, the items of a generator or iterator, a dataclass's
+  fields, an `Enum`'s value), with one ERROR, a `Permanent` reply and no
+  retry (`payload["b"] is bytes; a reply carries text, not binary data:
+  decode it if it is text (data.decode()), base64-encode it otherwise
   (base64.b64encode(data).decode()), or store it in a blob and return the
-  reference`). The value conversions the reply applies are listed under
-  "Payload" in the API reference, and the reply now carries the JSON the
-  SDK checked (a generator in a result was read by that check and then
-  sent as an empty list). **Action:** a handler that returns `bytes`
-  holding text must return `data.decode()` instead.
+  reference`). The key rules (two keys that become the same text, a key
+  type with no JSON form) and the lone-surrogate rule now apply in those
+  places too: colliding keys in the items of a generator, a deque or a
+  dataclass silently lost a value, and a lone surrogate there or in a set
+  was sent. A pydantic model is the one exception: it is written with its
+  own serialization settings (bytes as UTF-8 text unless it sets
+  `ser_json_bytes`), and only the lone-surrogate rule looks inside it. A
+  generator or other iterator in a result is read once and sent as the
+  list of its items (it was read by the check and then sent as an empty
+  list); an exception while reading it refuses the result naming where.
+  The value conversions the reply applies are listed under "Payload" in
+  the API reference. **Action:** a handler that returns `bytes` holding
+  text must return `data.decode()` instead (in a dataclass too); keep
+  bytes in a pydantic model only with `ser_json_bytes="base64"`, or
+  convert them first. These rules apply to the result of a command with
+  `reply_to`, which becomes the reply; the result of a fire-and-forget
+  command is not walked (see "A handler's return value is checked before
+  any retry decision").
 - **A health port that cannot be bound stops the service at start.**
   When `KBM_LEDSAS_HEALTH_PORT` was taken (or `KBM_LEDSAS_HEALTH_HOST` was
   not an address of the machine), the service logged a WARNING and ran
@@ -791,11 +812,140 @@ PyPI, so this entry lists every change since 0.3.3.
   error. Now a `stage` that is not a `str`, or a `note` that is neither
   `None` nor a `str`, raises `TypeError` (`emit_status() takes stage as a
   str, got int`) before anything is sent; uncaught, it is replied as
-  `Permanent` (not retried).
+  `Permanent` (not retried). An `Enum` member whose value is a `str`
+  (`class Stage(Enum): DOWNLOADING = "downloading"`) is still accepted
+  and sent as that value, as before. **Action:** pass text: `str(n)` for
+  a number, `str(stage.value)` for an `Enum` whose value is a number.
 - **The leading `/` of an upload path no longer counts against its 1024 characters.**
   `path="/" + "a" * 1024` was refused as longer than 1024 characters,
   although the blob name, which storage limits to 1024 characters, is the
   path without its leading `/`.
+- **The broker's `consumer_timeout` is named, and a handler timeout longer than its default is reported at start.**
+  RabbitMQ takes back a command left unacknowledged longer than its
+  `consumer_timeout` (30 minutes by default; a command is acknowledged
+  when its handler has finished): it closes the service's channel and
+  delivers the command again. The SDK reported this as a lost connection
+  (`ACK not sent: the connection to the AMQP broker was lost ...`), and
+  the client library logged an ERROR for each delivery in flight (`Got
+  frame for closed channel ...`). Now one WARNING names the cause (`The
+  AMQP broker closed the consumer channel: a command stayed
+  unacknowledged longer than the broker's consumer_timeout ...`), a
+  settlement that cannot be sent says `... not sent: the AMQP broker
+  closed the channel of this command's delivery at its consumer_timeout
+  ...` (field `reason`: `consumer_timeout`), and the client library's
+  records are WARNINGs. With `KBM_LEDSAS_HANDLER_TIMEOUT=0` or above
+  `1800`, one WARNING at start says to keep the broker's
+  `consumer_timeout` above the longest handler run plus the time a
+  command waits for a worker. **Action:** if a handler can run longer
+  than 30 minutes, have the broker's `consumer_timeout` raised (see
+  "Handler Timeout" in the API reference).
+- **`KBM_LEDSAS_PREFETCH` below `KBM_LEDSAS_CONCURRENCY` is reported at start.**
+  A command stays unacknowledged while its handler runs, so at most
+  `min(KBM_LEDSAS_PREFETCH, KBM_LEDSAS_CONCURRENCY)` handlers run at
+  once: `KBM_LEDSAS_PREFETCH=1` with `KBM_LEDSAS_CONCURRENCY=4` ran the
+  handlers one at a time without a word. One WARNING at start now says
+  so. The defaults (10 and 4) are unchanged.
+- **A service with no handler registered says so at start.** It started
+  silently and then replied `HandlerNotFound` to every command and
+  dead-lettered it. Now one WARNING at start (`No command handler is
+  registered: every command this service receives is replied
+  HandlerNotFound and dead-lettered ...`) names the usual cause, a module
+  with the `@app.handler` functions that was never imported. The
+  service still starts.
+- **`overwrite` must be `True` or `False`.** The `upload_*` methods read
+  it by its truth value, so `overwrite="false"` (a flag read as text from
+  the environment or a request field) replaced an existing blob. Now any
+  other value than `True` or `False` raises `TypeError` (`overwrite must
+  be True or False, got str`) before anything is written; uncaught, it is
+  replied as `Permanent` (not retried). **Action:** convert such a flag
+  to a bool first.
+- **`upload_stream` refuses a chunk that is not bytes.** A `str` chunk
+  was stored UTF-8 encoded without a word, and a chunk such as `None`, a
+  number or a dict failed inside the storage client, logged as an ERROR
+  `Streaming upload failed` with a traceback on every attempt, and was
+  retried. Now a chunk other than `bytes`, `bytearray` or `memoryview`
+  raises `TypeError` (`upload_stream() got a chunk of type str; the
+  stream must yield bytes`) and the blob is not written; uncaught, it is
+  replied as `Permanent` (not retried). An exception your stream raises
+  itself is passed on unchanged and is no longer logged as a storage
+  failure. **Action:** encode text chunks (`text.encode()`).
+- **Secrets in handler exceptions are masked in the log.** An exception
+  that quoted a connection URL or a connection string (often the message
+  of a client library's error) was logged as raised by `Uncaught
+  exception in handler` and the other records of the handler layer,
+  traceback included. Every record the SDK writes now masks a URL's user
+  name and password, every query value and the fragment of a broker URL,
+  and the values of `AccountKey=`, `SharedAccessSignature=`,
+  `SharedAccessKey=`, `Password=` / `Pwd=` and a `sig=` URL query
+  parameter: the records of every SDK module (the handler layer, the
+  storage client's `Failed to download blob` ERROR and its traceback,
+  ...) and of the AMQP client library that the SDK filters, and whatever
+  the SDK's own log handler and its last-resort handler write, in the
+  message, every text field, the traceback and the stack, in either log
+  format. A text that cannot be masked is not written: the record carries
+  `<withheld: secret masking failed>` (a field), `<record text withheld:
+  secret masking failed>` (the message) or `<traceback withheld: secret
+  masking failed>` instead, and is still written. The reply is unchanged,
+  and so are the records your own code writes, except the WARNING and
+  higher records that the SDK's last-resort handler writes when your
+  service configures no logging of its own.
+- **A refused configuration keeps no connection setting in its error.**
+  The settings error behind a `Configuration error` held the configuration
+  it checked: an error about a connection value, or about the
+  configuration as a whole, carried the broker URL or the storage
+  connection string as its input in `errors()` / `json()` (what error
+  reporters serialise), and its text (printed with
+  `KBM_LEDSAS_DEBUG=1`) showed input values. That input is now
+  `<not kept: the settings may hold connection secrets>`, the text shows
+  no input value, and the exit after a configuration error or a failed
+  start carries no exception context. The `Configuration error` line is
+  unchanged.
+- **Other code's log records follow `KBM_LEDSAS_LOG_FORMAT` when you configure no logging.**
+  A service that configured no root logging wrote Python warnings and the
+  event loop's records (`Task exception was never retrieved`, with a
+  multi-line traceback) as plain text between the SDK's JSON lines. Now,
+  when the root logger has no handler, `app.run()` writes the records that
+  no handler takes in `KBM_LEDSAS_LOG_FORMAT` (it replaces Python's
+  last-resort handler, `logging.lastResort`) and routes Python warnings
+  through logging (`logging.captureWarnings(True)`). The same records come
+  out as before (WARNING and above), each once: a logger you gave a
+  handler of your own is written by that handler only. An application
+  that configures root logging keeps its own setup (call
+  `logging.captureWarnings(True)` yourself to have the warnings in it).
+- **The handler layer's records carry the command's `message_id` and `command_name`.**
+  `Permanent error in handler`, `Uncaught exception in handler`, `Handler
+  timeout` and the other records of the handler layer carried the
+  `correlation_id` and the `command_name`; they now carry the command's
+  `message_id` too. `No handler for ...` and the SDK's retry, reply and
+  dead-letter records (`Retry k/N, waiting ... before requeue`, `Reply
+  publish failed for <name>`, `Skipping response for <name> (no
+  reply_to)`, the `Command failed with a non-retryable error, sending to
+  DLQ` INFO) carried only the `correlation_id`; they now carry all three,
+  as the `Max retries (N) exceeded` ERROR did, so an alert can be joined
+  to the dead-lettered message.
+- **Every per-command record carries the command's `trace_id` and `idempotency_key`.**
+  The SDK's records about a command (`Received command`, `Handling
+  command <name>`, `Sent response for <name>`, `ACKed command <name>`,
+  the handler layer's records, the retry, dead-letter, reply and
+  status records, and the consumer's records about settling it:
+  `Acknowledging message`, `Rejecting message`, the ACK / NACK failure
+  and `... not sent` records, and the duplicate and pending-cap
+  dead-letter WARNINGs, which carried only the `message_id`) carried no
+  `trace_id`, so the text format's
+  `[trace=...]` never appeared and a log search on a caller's trace found
+  nothing. They now carry `trace_id` and `idempotency_key`, and `job_id`
+  when the command has one, besides `correlation_id`, `message_id` and
+  `command_name`; the text format shows `[trace=<first 16 characters of
+  the trace_id>]` and `idempotency_key=` / `job_id=` pairs. These values
+  are logged as sent: keep identifiable data out of them.
+- **A broker URL's query string is masked in log records.** The broker
+  URL in a log record (the `Connecting to the AMQP broker at ...` and
+  `Could not connect to the AMQP broker at ...` lines) had only its user
+  name and password masked; its query string was shown as given
+  (`?login=guest&password=...`). Every value of the query string and the
+  fragment are now masked too (`amqp://127.0.0.1:5672/?login=***&password=***`),
+  in these lines and wherever a broker URL appears in a record the SDK
+  masks.
 - **`aio-pika` 10.x is now accepted** (`aio-pika>=9.4.0,<11.0`; was
   `<10.0`). A fresh install resolves aio-pika 10 (with aiormq 7 and
   pamqp 4). The SDK's message handling, reply publishing and startup /

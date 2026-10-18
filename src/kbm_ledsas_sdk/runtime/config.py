@@ -7,13 +7,14 @@ settings from ``KBM_LEDSAS_*`` environment variables. See
 """
 
 import ipaddress
-import logging
+import logging  # noqa: F401
 import os
 import re
 from typing import Any
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     ValidationError,
     field_serializer,
@@ -29,10 +30,11 @@ from kbm_ledsas_sdk.runtime.security import (
     check_transport_security,
     parse_bool_env,
 )
+from kbm_ledsas_sdk.utils.logging import masked_logger
 
-_logger = logging.getLogger(__name__)
+_logger = masked_logger(__name__)
 
-# Retired env vars (since v0.3.0 they no longer configure anything). They
+# Retired env vars (they no longer configure anything). They
 # are accepted but ignored; from_env warns once if any is present.
 _LEGACY_MODE_VARS = ("KBM_LEDSAS_MODE", "KBM_LEDSAS_DEV")
 _legacy_mode_warned = False
@@ -41,7 +43,7 @@ _legacy_mode_warned = False
 def _warn_legacy_mode_vars_once() -> None:
     """Warn once per process if any retired env var is set.
 
-    Since v0.3.0 these variables no longer configure anything, so they are
+    These variables no longer configure anything, so they are
     accepted but ignored — nothing breaks for existing deployments. A
     single warning lists whichever are present so operators can drop them.
     """
@@ -52,7 +54,7 @@ def _warn_legacy_mode_vars_once() -> None:
     if present:
         _legacy_mode_warned = True
         _logger.warning(
-            "%s no longer used (since v0.3.0): this package always runs "
+            "%s no longer used: this package always runs "
             "its built-in transport. Remove the variable(s) from your "
             "environment.",
             " / ".join(present),
@@ -127,6 +129,55 @@ _FIELD_ENV_VARS = {
 }
 # Fields whose value is never repeated in a message.
 _SECRET_FIELDS = frozenset({"rabbitmq_url", "blob_conn_string"})
+# Placeholder for the input of an SDKConfig ValidationError's errors() /
+# json() that may hold a connection secret (see
+# _config_error_without_secrets).
+_INPUT_NOT_KEPT = "<not kept: the settings may hold connection secrets>"
+
+
+def _config_error_without_secrets(exc: ValidationError) -> ValidationError:
+    """``exc`` (an SDKConfig ValidationError) without connection secrets in
+    its ``errors()`` / ``json()`` (what error reporters serialise; pydantic
+    keeps the input there even with ``hide_input_in_errors``, which only
+    governs ``str()`` / ``repr()``). The input of an error about one
+    setting that is not a connection value is kept (configuration error
+    messages quote it); the input of an error about a connection value, or
+    of a check of the whole configuration (its input is every setting, the
+    broker URL and the storage connection string included), becomes a
+    placeholder."""
+    details: list = []
+    for err in exc.errors(include_url=False):
+        loc = err.get("loc", ())
+        field = str(loc[0]) if loc else ""
+        keep = field in _FIELD_ENV_VARS and field not in _SECRET_FIELDS
+        detail: dict = {
+            "type": err["type"],
+            "loc": loc,
+            "input": err.get("input") if keep else _INPUT_NOT_KEPT,
+        }
+        if "ctx" in err:
+            detail["ctx"] = err["ctx"]
+        details.append(detail)
+    try:
+        return ValidationError.from_exception_data(exc.title, details, hide_input=True)
+    except Exception:  # an error type that cannot be rebuilt: keep the text only
+        return ValidationError.from_exception_data(
+            exc.title,
+            [
+                {
+                    "type": "value_error",
+                    "loc": err.get("loc", ()),
+                    "input": _INPUT_NOT_KEPT,
+                    "ctx": {
+                        "error": ValueError(str(err.get("msg", "")).removeprefix("Value error, "))
+                    },
+                }
+                for err in exc.errors(include_url=False)
+            ],
+            hide_input=True,
+        )
+
+
 _PLAIN_NUMBER = re.compile(r"^-?\d{1,30}$")
 
 
@@ -235,6 +286,11 @@ class SDKConfig(BaseModel):
     from environment variables; see :meth:`from_env` for the full variable
     list.
     """
+
+    # A ValidationError does not repeat the settings it was given: not in
+    # str() (hide_input_in_errors), and not in errors() / json() for the
+    # connection values (see _input_not_kept).
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     # Core
     #
@@ -404,6 +460,20 @@ class SDKConfig(BaseModel):
             check_transport_security(self.rabbitmq_url)
         return self
 
+    @model_validator(mode="wrap")
+    @classmethod
+    def _input_not_kept(cls, data: Any, handler: Any) -> Any:
+        """A rejected configuration's connection values are not kept in the
+        ValidationError (see _config_error_without_secrets). Defined after
+        the other validators so it wraps every check. Raised outside the
+        ``except`` block: ``raise ... from None`` would still keep the
+        original error as ``__context__``."""
+        try:
+            return handler(data)
+        except ValidationError as exc:
+            clean = _config_error_without_secrets(exc)
+        raise clean
+
     @classmethod
     def from_env(cls, service_name: str, tenant: str | None = None) -> "SDKConfig":
         """
@@ -472,7 +542,7 @@ class SDKConfig(BaseModel):
         tenant_value = _env("KBM_LEDSAS_TENANT", tenant or "")
         tenant_final = tenant_value if tenant_value else None
 
-        # Retired env flags (v0.3.0): warn once if any leftover flag is
+        # Retired env flags: warn once if any leftover flag is
         # set, then ignore it — nothing breaks for existing deployments.
         _warn_legacy_mode_vars_once()
 

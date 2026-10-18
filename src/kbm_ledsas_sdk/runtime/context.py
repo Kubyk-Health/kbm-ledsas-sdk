@@ -11,6 +11,7 @@ The ExecutionContext provides all the APIs a handler needs to:
 The context is scoped to a single command execution and is immutable after creation.
 """
 
+import enum
 import logging
 from datetime import UTC, datetime
 
@@ -18,6 +19,20 @@ from ..blob.operations import BlobOperations, _find_lone_surrogate, _mark_non_re
 from ..models.envelope import Envelope
 from ..models.messages import Status
 from ..transport.base import Transport
+
+
+def _status_text(field: str, value: object, allowed: str):
+    """``value`` as the text ``emit_status`` sends for ``field``: a ``str``
+    as it is (a ``str`` Enum included), ``None`` for ``note``, an ``Enum``
+    member whose value is a ``str`` as that value. Anything else raises
+    ``TypeError``, marked non-retryable."""
+    if isinstance(value, str) or (field == "note" and value is None):
+        return value
+    if isinstance(value, enum.Enum) and isinstance(value.value, str):
+        return value.value
+    err = TypeError(f"emit_status() takes {field} as {allowed}, got {type(value).__name__}")
+    _mark_non_retryable(err, str(err))
+    raise err
 
 
 class ExecutionContext:
@@ -142,10 +157,14 @@ class ExecutionContext:
             progress: Progress as a float between 0.0 and 1.0
             note: Optional human-readable note (e.g., "Downloading 15 MB dataset")
 
+        An ``Enum`` member whose value is a ``str`` is accepted for
+        ``stage`` and ``note`` and sent as that value.
+
         Raises:
             TypeError: If ``stage`` is not a ``str``, ``note`` is neither
-                ``None`` nor a ``str``, or progress is not a number
-                (``True`` / ``False`` are not numbers here)
+                ``None`` nor a ``str`` (an ``Enum`` with a ``str`` value
+                counts as one), or progress is not a number (``True`` /
+                ``False`` are not numbers here)
             ValueError: If progress is not between 0.0 and 1.0, or
                 ``stage`` / ``note`` holds a lone surrogate (text UTF-8
                 cannot encode, e.g. ``"\\ud800"`` from a JSON request)
@@ -159,18 +178,11 @@ class ExecutionContext:
         # stage and note are text: any other value (a number, a list, an
         # object with no JSON form) is refused before the status is built,
         # like an invalid progress: the same call fails the same way on
-        # every attempt, so it is one Permanent reply, not a retry.
-        for field, value, allowed in (
-            ("stage", stage, "a str"),
-            ("note", note, "None or a str"),
-        ):
-            if isinstance(value, str) or (field == "note" and value is None):
-                continue
-            err = TypeError(
-                f"emit_status() takes {field} as {allowed}, got " f"{type(value).__name__}"
-            )
-            _mark_non_retryable(err, str(err))
-            raise err
+        # every attempt, so it is one Permanent reply, not a retry. An
+        # Enum member whose value is text (class Stage(Enum): DOWNLOADING =
+        # "downloading") is sent as that value, as it was before this check.
+        stage = _status_text("stage", stage, "a str")
+        note = _status_text("note", note, "None or a str")
 
         # bool is an int subclass: True / False are refused, as the
         # envelope's priority refuses them.

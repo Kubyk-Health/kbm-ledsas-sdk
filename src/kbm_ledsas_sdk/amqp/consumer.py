@@ -4,10 +4,10 @@ Consumes LEDSAS commands from RabbitMQ.
 
 import asyncio
 import json
-import logging
+import logging  # noqa: F401
 import re
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable
 from typing import Any, TypeVar
 
@@ -23,8 +23,9 @@ from pydantic import ValidationError
 
 from kbm_ledsas_sdk.models.messages import Command
 from kbm_ledsas_sdk.transport.base import DeliveryLost
+from kbm_ledsas_sdk.utils.logging import _command_fields, masked_logger
 
-logger = logging.getLogger(__name__)
+logger = masked_logger(__name__)
 
 T = TypeVar("T")
 
@@ -140,6 +141,32 @@ def delivery_connection_gone(error: BaseException, message: Any = None) -> bool:
     return _channel_closed(message)
 
 
+def is_consumer_timeout_close(error: BaseException | None) -> bool:
+    """True when ``error`` is the broker closing a channel because a
+    delivery on it stayed unacknowledged longer than the broker's
+    consumer_timeout (RabbitMQ: ``PRECONDITION_FAILED - delivery
+    acknowledgement on channel N timed out``). The broker takes back every
+    unacknowledged delivery of that channel and delivers it again, to this
+    consumer's reopened channel or to another consumer."""
+    if not isinstance(error, AMQPChannelError):
+        return False
+    try:
+        text = str(error)
+    except Exception:
+        return False
+    return "acknowledgement" in text and "timed out" in text
+
+
+def _first_line(error: BaseException) -> str:
+    """The first line of ``str(error)`` (at most 300 characters)."""
+    try:
+        text = str(error)
+    except Exception:
+        text = type(error).__name__
+    lines = text.splitlines()
+    return (lines[0] if lines else "")[:300]
+
+
 class BrokerNotReachable(ConnectionError):
     """A broker round trip was skipped: shutdown is in progress and the
     broker has already been found unreachable."""
@@ -151,7 +178,7 @@ class BrokerShutdownGuard:
     Shared by the transport and its publisher. Shutdown begins when the
     service stops taking new work, before the commands still in flight
     are drained, so it also covers the reply and status publishes those
-    commands make (v0.3.5).
+    commands make.
 
     - Before shutdown, a round trip is awaited without a time limit: a slow
       or flow-controlled broker is legitimate back-pressure in normal
@@ -449,6 +476,19 @@ class AMQPConsumer:
     _SLOW_BODY_READ_S = 0.05
     _SLOW_BODY_READS_KEPT = 32
     _slow_body_reads: "deque[tuple[float, int]] | None" = None
+    # message_ids of commands in progress here whose delivery was on a
+    # channel the broker closed at its consumer_timeout (see
+    # note_channel_closed), oldest first, at most _ACK_TIMED_OUT_KEPT.
+    _ack_timed_out: "OrderedDict[str, None] | None" = None
+    _ACK_TIMED_OUT_KEPT = 10_000
+    # Closes of the consumer channel by the broker at its consumer_timeout.
+    consumer_timeout_closes: int = 0
+    # The identity fields (see _command_fields) of each command held in
+    # pending_messages, for the records of its settlement (see
+    # command_fields). An entry lives exactly as long as its pending entry.
+    _held_ids: "dict[str, dict] | None" = None
+    # Most message_ids named in one record.
+    _MAX_IDS_LOGGED = 20
 
     def __init__(
         self,
@@ -511,6 +551,12 @@ class AMQPConsumer:
 
         # Track pending messages: message_id -> IncomingMessage
         self.pending_messages: dict[str, AbstractIncomingMessage] = {}
+
+        # message_id -> the identity fields of that pending command
+        # (correlation_id, message_id, command_name, trace_id,
+        # idempotency_key, job_id), so the records of its ACK, requeue or
+        # dead-letter carry them too (see command_fields).
+        self._held_ids: dict[str, dict] = {}
 
         # message_ids of pending commands that have finished: their one
         # reply is being sent, and their ACK / dead-letter follows (see
@@ -638,7 +684,7 @@ class AMQPConsumer:
         The cancel is a broker round trip (Basic.Cancel -> Basic.CancelOk).
         On a robust aio-pika channel it first waits for the connection to
         be up, so during a broker outage it would wait for a reconnection
-        that may never come. Hence (v0.3.5):
+        that may never come. Hence:
 
         - if the consumer's channel is already closed (the connection to
           the broker was lost), or the caller already knows the broker is
@@ -694,6 +740,7 @@ class AMQPConsumer:
         if not confirmed:
             abandoned = len(self.pending_messages)
             self.pending_messages.clear()
+            self._held_ids = {}
             self._finishing = set()
             logger.info(
                 "AMQP consumer stopped without broker confirmation " "(broker not reachable)",
@@ -713,6 +760,7 @@ class AMQPConsumer:
 
         # Clear pending messages
         self.pending_messages.clear()
+        self._held_ids = {}
         self._finishing = set()
 
         logger.info(
@@ -739,6 +787,89 @@ class AMQPConsumer:
         reads = list(self._slow_body_reads)
         self._slow_body_reads.clear()
         return reads
+
+    def note_channel_closed(self, error: BaseException | None) -> bool:
+        """The consumer's channel closed (``error``: why; None for a close
+        by this service). Called by the transport.
+
+        When the broker closed it at its consumer_timeout (see
+        :func:`is_consumer_timeout_close`): one WARNING naming the
+        consumer_timeout, and the commands in progress here whose delivery
+        was on that channel are remembered, so that a settlement of one of
+        them that cannot be sent, or its redelivery arriving while it still
+        runs, names the consumer_timeout instead of a lost connection.
+        Returns True for such a close. Any other close is left to the
+        connection's own reporting. Never raises.
+        """
+        if not is_consumer_timeout_close(error):
+            return False
+        affected = [
+            message_id
+            for message_id, message in self.pending_messages.items()
+            if _channel_closed(message)
+        ]
+        for message_id in affected:
+            self._remember_ack_timed_out(message_id)
+        self.consumer_timeout_closes += 1
+        logger.warning(
+            "The AMQP broker closed the consumer channel: a command stayed "
+            "unacknowledged longer than the broker's consumer_timeout. The "
+            "broker delivers the %d command(s) in progress here again: a "
+            "redelivery to this instance is settled by the run still in "
+            "progress, a redelivery to another instance runs the command "
+            "again. Raise the broker's consumer_timeout above the longest "
+            "handler run plus the time a command waits for a worker "
+            "(KBM_LEDSAS_HANDLER_TIMEOUT bounds a handler run)",
+            len(affected),
+            extra={
+                "error": _first_line(error),  # type: ignore[arg-type]
+                "in_progress": len(affected),
+                "message_ids": affected[: self._MAX_IDS_LOGGED],
+            },
+        )
+        return True
+
+    def _remember_ack_timed_out(self, message_id: str) -> None:
+        if self._ack_timed_out is None:
+            self._ack_timed_out = OrderedDict()
+        self._ack_timed_out.pop(message_id, None)
+        if len(self._ack_timed_out) >= self._ACK_TIMED_OUT_KEPT:
+            self._ack_timed_out.popitem(last=False)
+        self._ack_timed_out[message_id] = None
+
+    def _take_ack_timed_out(self, message_id: str) -> bool:
+        """True (once) when ``message_id``'s delivery was on a channel the
+        broker closed at its consumer_timeout."""
+        if not self._ack_timed_out:
+            return False
+        if message_id not in self._ack_timed_out:
+            return False
+        del self._ack_timed_out[message_id]
+        return True
+
+    def _hold(self, message_id: str, message: AbstractIncomingMessage, envelope: Any) -> None:
+        """Keep ``message`` as the pending delivery of the command
+        ``message_id`` and remember the command's identity fields."""
+        self.pending_messages[message_id] = message
+        if not isinstance(self._held_ids, dict):
+            self._held_ids = {}
+        self._held_ids[message_id] = _command_fields(envelope)
+
+    def command_fields(self, message_id: str) -> dict:
+        """The identity fields of the command ``message_id`` held here
+        (``correlation_id``, ``message_id``, ``command_name``, ``trace_id``,
+        ``idempotency_key`` and, when set, ``job_id``; see
+        ``_command_fields``) for the records of its settlement; only
+        ``message_id`` for a command that is not held here."""
+        held = self._held_ids.get(message_id) if self._held_ids else None
+        return dict(held) if held else {"message_id": message_id}
+
+    def _forget_ids(self, message_id: str) -> None:
+        """Drop the identity fields of ``message_id`` once it is no longer
+        pending (a settlement that could not be sent at shutdown keeps it
+        pending, and its fields with it)."""
+        if self._held_ids and message_id not in self.pending_messages:
+            self._held_ids.pop(message_id, None)
 
     async def _on_message(self, message: AbstractIncomingMessage) -> None:
         """
@@ -818,7 +949,7 @@ class AMQPConsumer:
                     "Envelope type %r is not 'command' on command " "exchange; dead-lettering",
                     envelope_type,
                     extra={
-                        "message_id": command.envelope.message_id,
+                        **_command_fields(command.envelope),
                         "envelope_type": envelope_type,
                     },
                 )
@@ -830,7 +961,7 @@ class AMQPConsumer:
             # command that is still in progress here (its handler running,
             # or the command waiting for a worker) is one of two things:
             #
-            # - The broker's redelivery of that same command (v0.3.5). The
+            # - The broker's redelivery of that same command. The
             #   connection it was delivered on was lost while the command
             #   was in progress and has been restored, so the broker
             #   delivered the unacknowledged command again. The original
@@ -861,18 +992,25 @@ class AMQPConsumer:
                 pending = await self._await_settled(message_id, pending)
             if pending is not None:
                 if is_redelivery_of(pending, message):
-                    self.pending_messages[message_id] = message
+                    self._hold(message_id, message, command.envelope)
                     self.redeliveries_adopted += 1
+                    if self._take_ack_timed_out(message_id):
+                        # The broker took the first delivery back at its
+                        # consumer_timeout (the connection is fine).
+                        why = (
+                            "the broker closed the channel of its first "
+                            "delivery at its consumer_timeout"
+                        )
+                    else:
+                        why = "its first delivery was on a broker connection " "that was lost"
                     logger.info(
                         "Redelivered command arrived while it is still in "
-                        "progress here (running or waiting for a worker; its "
-                        "first delivery was on a broker connection that was "
-                        "lost); its outcome settles the redelivery, so the "
-                        "command does not run twice",
+                        "progress here (running or waiting for a worker; %s); "
+                        "its outcome settles the redelivery, so the command "
+                        "does not run twice",
+                        why,
                         extra={
-                            "message_id": message_id,
-                            "correlation_id": command.envelope.correlation_id,
-                            "command_name": command.envelope.name,
+                            **_command_fields(command.envelope),
                             "redelivered": bool(getattr(message, "redelivered", False)),
                         },
                     )
@@ -880,7 +1018,7 @@ class AMQPConsumer:
                 logger.warning(
                     "Duplicate message_id while original still pending; "
                     "rejecting duplicate to DLQ",
-                    extra={"message_id": message_id},
+                    extra=_command_fields(command.envelope),
                 )
                 raise _RejectOnArrivalError
 
@@ -894,18 +1032,16 @@ class AMQPConsumer:
                     "(in-flight=%d, cap=%d). Investigate stuck handlers.",
                     len(self.pending_messages),
                     self.max_pending,
-                    extra={"message_id": message_id},
+                    extra=_command_fields(command.envelope),
                 )
                 raise _RejectOnArrivalError
 
-            self.pending_messages[message_id] = message
+            self._hold(message_id, message, command.envelope)
 
             logger.info(
                 "Received command",
                 extra={
-                    "message_id": message_id,
-                    "correlation_id": command.envelope.correlation_id,
-                    "command_name": command.envelope.name,
+                    **_command_fields(command.envelope),
                 },
             )
 
@@ -1085,11 +1221,13 @@ class AMQPConsumer:
         message = self.pending_messages.pop(message_id, None)
         self.retry_counts.pop(message_id, None)
         self._forget_finishing(message_id)
+        ids = self.command_fields(message_id)
         if not message:
-            logger.warning("Cannot ACK unknown message", extra={"message_id": message_id})
+            self._forget_ids(message_id)
+            logger.warning("Cannot ACK unknown message", extra=ids)
             raise ValueError(f"Unknown message_id: {message_id}")
 
-        logger.debug("Acknowledging message", extra={"message_id": message_id})
+        logger.debug("Acknowledging message", extra=ids)
 
         try:
             await self._settle(message.ack())
@@ -1100,12 +1238,10 @@ class AMQPConsumer:
                 ) from e
             if self._delivery_lost(message_id, message, "ACK", e):
                 raise DeliveryLost("ACK not sent: broker connection lost") from e
-            logger.error(
-                "Failed to ACK message",
-                exc_info=True,
-                extra={"message_id": message_id, "error": str(e)},
-            )
+            logger.error("Failed to ACK message", exc_info=True, extra={**ids, "error": str(e)})
             raise
+        finally:
+            self._forget_ids(message_id)
 
     async def _settle(self, awaitable: Awaitable[Any]) -> Any:
         """Send one ACK / NACK / reject.
@@ -1156,7 +1292,7 @@ class AMQPConsumer:
             operation,
             type(error).__name__,
             extra={
-                "message_id": message_id,
+                **self.command_fields(message_id),
                 "operation": operation,
                 "error_class": type(error).__name__,
             },
@@ -1193,6 +1329,26 @@ class AMQPConsumer:
         """
         if not delivery_connection_gone(error, message):
             return False
+        if self._take_ack_timed_out(message_id):
+            # The connection is fine: the broker closed the channel of this
+            # delivery at its consumer_timeout (see note_channel_closed).
+            logger.warning(
+                "%s not sent: the AMQP broker closed the channel of this "
+                "command's delivery at its consumer_timeout while the command "
+                "was in progress (%s). The broker delivers the command again, "
+                "so it runs again. Raise the broker's consumer_timeout above "
+                "the longest handler run plus the time a command waits for a "
+                "worker.",
+                operation,
+                type(error).__name__,
+                extra={
+                    **self.command_fields(message_id),
+                    "operation": operation,
+                    "error_class": type(error).__name__,
+                    "reason": "consumer_timeout",
+                },
+            )
+            return True
         logger.warning(
             "%s not sent: the connection to the AMQP broker was lost (%s). "
             "The broker delivers the command again, so it runs again "
@@ -1200,7 +1356,7 @@ class AMQPConsumer:
             operation,
             type(error).__name__,
             extra={
-                "message_id": message_id,
+                **self.command_fields(message_id),
                 "operation": operation,
                 "error_class": type(error).__name__,
             },
@@ -1260,6 +1416,9 @@ class AMQPConsumer:
         """
         message = self.pending_messages.pop(message_id, None)
         self._forget_finishing(message_id)
+        self._take_ack_timed_out(message_id)
+        ids = self.command_fields(message_id)
+        self._forget_ids(message_id)
         if message is None or _channel_closed(message):
             return
         try:
@@ -1268,7 +1427,7 @@ class AMQPConsumer:
             logger.debug(
                 "Requeue after a lost connection not sent",
                 exc_info=True,
-                extra={"message_id": message_id},
+                extra=ids,
             )
 
     async def nack(self, message_id: str, requeue: bool = False) -> None:
@@ -1299,8 +1458,10 @@ class AMQPConsumer:
         """
         message = self.pending_messages.pop(message_id, None)
         self._forget_finishing(message_id)
+        ids = self.command_fields(message_id)
         if not message:
-            logger.warning("Cannot NACK unknown message", extra={"message_id": message_id})
+            self._forget_ids(message_id)
+            logger.warning("Cannot NACK unknown message", extra=ids)
             raise ValueError(f"Unknown message_id: {message_id}")
 
         # Capture the retry_count we want to *log* BEFORE mutating
@@ -1320,7 +1481,7 @@ class AMQPConsumer:
         logger.info(
             "Rejecting message",
             extra={
-                "message_id": message_id,
+                **ids,
                 "requeue": requeue,
                 "retry_count": logged_count,
             },
@@ -1349,17 +1510,15 @@ class AMQPConsumer:
                     # terminal outcome on its next failure.
                     self._set_retry_count(message_id, prior_count)
                 raise DeliveryLost(f"{operation} not sent: broker connection lost") from e
-            logger.error(
-                "Failed to NACK message",
-                exc_info=True,
-                extra={"message_id": message_id, "error": str(e)},
-            )
+            logger.error("Failed to NACK message", exc_info=True, extra={**ids, "error": str(e)})
             raise
+        finally:
+            self._forget_ids(message_id)
 
     def _set_retry_count(self, message_id: str, count: int) -> None:
         """Record ``count`` as the message's retry count.
 
-        Bound the map (v0.3.3): a requeued message whose redelivery lands
+        The map is bounded: a requeued message whose redelivery lands
         on ANOTHER replica orphans its slot here forever, so the oldest
         slot is evicted at the cap instead of growing unboundedly.
         Eviction only resets that message's local retry budget.

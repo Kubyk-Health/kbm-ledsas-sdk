@@ -33,7 +33,8 @@ This software includes the following third-party components:
    Copyright: Copyright (c) Individual contributors
    URL: https://github.com/pyca/cryptography
    Note: declared directly in the SDK's metadata as a security floor;
-   the SDK does not import it (azure-core uses it).
+   the SDK does not import it (azure-storage-blob uses it, for
+   client-side encryption).
 
 6. Python Runtime (3.11+)
    License: Python Software Foundation License
@@ -79,11 +80,11 @@ Indirect (transitive) dependencies pulled in by the direct dependencies
 above, annotated with the path that pulls each one:
 
   azure-core            (via azure-storage-blob)
-  cryptography          (via azure-storage-blob -> azure-core; also
-                        declared directly, see 5. above)
+  cryptography          (via azure-storage-blob; also declared
+                        directly, see 5. above)
   cffi                  (via cryptography)
   pycparser             (via cffi)
-  isodate               (via azure-storage-blob -> azure-core)
+  isodate               (via azure-storage-blob)
   requests              (via azure-storage-blob -> azure-core)
   urllib3               (via requests)
   certifi               (via requests)  — License: MPL-2.0 (Mozilla Public
@@ -126,4 +127,4 @@ Each ships its own license file in the install directory (e.g.
 
 All third-party software is used in accordance with their respective licenses.
 
-Last Updated: 2026-10-16
+Last Updated: 2026-10-17

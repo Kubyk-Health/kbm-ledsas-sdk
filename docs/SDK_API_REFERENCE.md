@@ -55,9 +55,11 @@ and its setting keeps its default. The SDK says so in one WARNING when
 the service starts, naming each such variable and the closest setting:
 `Ignoring environment variable(s) that are not settings of this SDK:
 KBM_LEDSAS_PREFECH (did you mean KBM_LEDSAS_PREFETCH?)`. A retired
-variable is never suggested (`KBM_LEDSAS_TRANSPORT_MODE` is named without
-a suggestion): it configures nothing, and its own WARNING asks you to
-remove it. Their values are not logged. The variables Kubernetes sets
+variable is never suggested: `KBM_LEDSAS_TRANSPORT_MODE`, an unknown
+name, is listed without a suggestion rather than with a retired one. The
+retired transport-selection variables (see `CHANGELOG.md`) are not
+listed in this WARNING: they configure nothing, and their own WARNING
+asks you to remove them. Their values are not logged. The variables Kubernetes sets
 for a Service in the namespace
 are not reported: nobody set them. For a Service named
 `kbm-ledsas-<name>` these are `KBM_LEDSAS_<NAME>_SERVICE_HOST`,
@@ -71,21 +73,21 @@ are not reported: nobody set them. For a Service named
 | `KBM_LEDSAS_RABBITMQ_URL` | Required | RabbitMQ connection URL |
 | `KBM_LEDSAS_BLOB_CONN_STRING` | Required | Azure Blob connection string (required even if your handlers never call `ctx.blob` — the blob client initializes at startup). A value the storage client cannot read stops the start with `Configuration error: KBM_LEDSAS_BLOB_CONN_STRING is not a usable storage connection string (...)` (the value is not repeated). So does a string that carries no credential, neither an `AccountKey` nor a `SharedAccessSignature` (or an empty one): the storage client would accept it and send every request without credentials, which storage refuses with HTTP 403. So does an `AccountKey` the storage client cannot decode (for example one whose trailing `=` or `==` was lost in a copy; the storage client would accept it and then fail every request). The check decodes the key the way the storage client does, so a key the client can sign with is accepted (the client ignores anything after the padding); a key that decodes but is not the account's key is not caught here, and every storage request then fails with HTTP 403. A `BlobEndpoint` that is not an `http://` or `https://` URL with a host is refused at start too, with the same `Configuration error` (without a scheme the storage client would silently use `https://`, which the local emulator does not speak). A shared access signature (SAS) connection string (`BlobEndpoint=https://<account>.blob.core.windows.net;SharedAccessSignature=<token>`) works as well as an account-key string and can be limited to the containers and permissions the service needs. |
 | `KBM_LEDSAS_CONTAINER` | `dev` | Informational: logged at startup as `default_container`. The `ctx.blob.upload_*` methods always take an explicit `container` argument and never read this variable; read it yourself if you want a configurable output container. `os.getenv` returns the raw value: under `docker run --env-file` a quoted value keeps its quotes, so remove surrounding whitespace and one matched pair of quotes as the SDK does, for example `v = os.getenv("KBM_LEDSAS_CONTAINER", "").strip(); v = v[1:-1].strip() if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" else v; container = v or "dev"`. |
-| `KBM_LEDSAS_PREFETCH` | `10` | AMQP message prefetch count (`1` to `1000`). Up to this many commands are received, parsed and held at once; see "Memory" under "Malformed message bodies" for what that costs with large bodies. |
-| `KBM_LEDSAS_CONCURRENCY` | `4` | Max concurrent handlers (`1` to `100`) |
+| `KBM_LEDSAS_PREFETCH` | `10` | AMQP message prefetch count (`1` to `1000`). Up to this many commands are received, parsed and held at once; see "Memory" under "Malformed message bodies" for what that costs with large bodies. A command stays unacknowledged while its handler runs, so this also caps the handlers that run at once: at most `min(KBM_LEDSAS_PREFETCH, KBM_LEDSAS_CONCURRENCY)`. Below `KBM_LEDSAS_CONCURRENCY` the SDK logs one WARNING at start (`KBM_LEDSAS_PREFETCH=1 is below KBM_LEDSAS_CONCURRENCY=4: ... at most 1 handler(s) run at once ...`). |
+| `KBM_LEDSAS_CONCURRENCY` | `4` | Max concurrent handlers (`1` to `100`). The handlers that actually run at once are at most `min(KBM_LEDSAS_PREFETCH, KBM_LEDSAS_CONCURRENCY)`: keep `KBM_LEDSAS_PREFETCH` at least this high to use every worker. |
 | `KBM_LEDSAS_LOG_LEVEL` | `INFO` | Logging level. Applied to the `kbm_ledsas_sdk` logger at startup. |
 | `KBM_LEDSAS_LOG_FORMAT` | `json` | `json` (machine-parseable) or `text` (colored human-readable). Applied at startup. |
-| `KBM_LEDSAS_HANDLER_TIMEOUT` | `1800` | Handler timeout in seconds (`0` disables; max `86400` = 1 day) |
+| `KBM_LEDSAS_HANDLER_TIMEOUT` | `1800` | Handler timeout in seconds (`0` disables; max `86400` = 1 day). Above `1800` (or `0`) the SDK logs one WARNING at start: keep RabbitMQ's `consumer_timeout` (30 min by default) above the longest handler run plus the time a command waits for a worker, or the broker takes the command back and delivers it again (see "Handler Timeout" below). |
 | `KBM_LEDSAS_MAX_RETRIES` | `3` | `0` to `100`. Maximum number of retries (NOT counting the initial attempt) for retryable failures (`Retryable`, `Timeout`, unexpected exceptions). Default `3` means a handler that always raises `Retryable` runs **4 times total** (1 initial + 3 retries) before its message goes to DLQ. The caller gets one reply, after the last attempt. The count is kept in the service process (see "Retry Mechanism"). |
 | `KBM_LEDSAS_GENERIC_ERRORS` | `false` | Fallback to generic message when handler did not set `user_message`. A value that is not a boolean stops the start (see above). |
 | `KBM_LEDSAS_HEALTH_PORT` | `8090` | HTTP port for `/health` and `/ready` (`0` disables; at most `65535`). A port in use stops the service at start, with one ERROR naming this setting |
 | `KBM_LEDSAS_HEALTH_HOST` | `127.0.0.1` | Bind address for the health server (loopback only by default): an IPv4 or IPv6 address, or a host name. Write an IPv6 address without brackets (`::`, `::1`). Any other value (e.g. `999.1.1.1`, `[::]`) stops the start with one `Configuration error` line. `0.0.0.0` (all interfaces) is what an orchestrator's HTTP probes need; the SDK then logs one INFO line that the port is reachable from the network (a WARNING if `KBM_LEDSAS_HEALTH_VERBOSE` is also on). |
 | `KBM_LEDSAS_HEALTH_VERBOSE` | `false` | If `true`, health responses include SDK version + service name + per-check status (fingerprintable; opt-in for dev). Default minimal `{"status": ...}`. |
-| `KBM_LEDSAS_MAX_PAYLOAD_BYTES` | `16777216` (16 MiB) | Reject inbound AMQP messages whose body exceeds this size (single WARNING + DLQ), and refuse to send a reply larger than this: a handler result whose serialized reply would exceed it gets one `Permanent` error reply instead (`returned a result too large to send as a reply (... bytes serialized; the limit is ... bytes, KBM_LEDSAS_MAX_PAYLOAD_BYTES)`), see "Payload". A command without `reply_to` gets no reply, so its result is not size-checked. `0` disables both checks. Max `268435456` (256 MiB). Large payloads and results belong in blob storage. **Note:** the effective inbound limit is `min(broker max_message_size, this value)`. RabbitMQ 4.x defaults `max_message_size` to 16 MiB, so a message over the broker cap is refused at *publish* time with a channel-closing `PRECONDITION_FAILED` and never reaches this SDK gate. To exercise the SDK gate (single WARNING + DLQ) the broker cap must be raised above this value. |
+| `KBM_LEDSAS_MAX_PAYLOAD_BYTES` | `16777216` (16 MiB) | Reject inbound AMQP messages whose body exceeds this size (single WARNING + DLQ), and refuse to send a reply larger than this: a handler result whose serialized reply would exceed it gets one `Permanent` error reply instead (`returned a result too large to send as a reply (... bytes serialized; the limit is ... bytes, KBM_LEDSAS_MAX_PAYLOAD_BYTES)`), see "Payload". A command without `reply_to` gets no reply, so its result is not size-checked. It is not serialized either: only its type is checked (see "Return value"). `0` disables both checks. Max `268435456` (256 MiB). Large payloads and results belong in blob storage. **Note:** the effective inbound limit is `min(broker max_message_size, this value)`. RabbitMQ 4.x defaults `max_message_size` to 16 MiB, so a message over the broker cap is refused at *publish* time with a channel-closing `PRECONDITION_FAILED` and never reaches this SDK gate. To exercise the SDK gate (single WARNING + DLQ) the broker cap must be raised above this value. |
 | `KBM_LEDSAS_ALLOW_INSECURE_AMQP` | `0` | If `1` (or `true`), downgrade the SDK's refusal of `amqp://` to non-loopback hosts to a WARNING. Escape hatch for TLS-terminated-upstream deployments. A value that is not a boolean stops the start. |
 | `KBM_LEDSAS_TENANT` | _(unset)_ | Optional tenant identifier for multi-tenant AMQP topology naming. Validated `^[A-Za-z0-9][A-Za-z0-9._\-]*$`, 1..64 chars. See "AMQP Topology" below for how this affects exchange and queue names. |
 | `KBM_LEDSAS_DEBUG` | `0` | If `1` (or `true`), dump the full Python traceback on configuration-error startup failures instead of the one-line message. A value that is not a boolean stops the start. |
-| `KBM_LEDSAS_CONNECT_TIMEOUT` | `15` | Seconds one connection attempt to the AMQP broker may take (`1` to `300`). The SDK logs `Connecting to the AMQP broker at amqp://***:***@<host>:<port>/ (timeout 15s)` first; a broker that does not answer (wrong host, a firewall dropping the packets) then fails the start within this time: one ERROR line naming the cause (`Could not connect to the AMQP broker at ...: no answer within 15s (KBM_LEDSAS_CONNECT_TIMEOUT) ...`), the closing ERROR line `ServiceApp exiting (startup failure already reported above). Reason class: ...` (see "How a failed start ends") and exit code 1, instead of after the operating system's own connect timeout (75 s to over 2 minutes), which a liveness probe may not wait for. Later reconnects use the same bound per attempt. |
+| `KBM_LEDSAS_CONNECT_TIMEOUT` | `15` | Seconds one connection attempt to the AMQP broker may take (`1` to `300`). The SDK logs `Connecting to the AMQP broker at amqp://***:***@<host>:<port>/ (timeout 15s)` first (the URL's user name and password, every value of its query string and its fragment are masked: `amqps://***:***@host:5671/vhost?heartbeat=***`; the same in the `Could not connect` line); a broker that does not answer (wrong host, a firewall dropping the packets) then fails the start within this time: one ERROR line naming the cause (`Could not connect to the AMQP broker at ...: no answer within 15s (KBM_LEDSAS_CONNECT_TIMEOUT) ...`), the closing ERROR line `ServiceApp exiting (startup failure already reported above). Reason class: ...` (see "How a failed start ends") and exit code 1, instead of after the operating system's own connect timeout (75 s to over 2 minutes), which a liveness probe may not wait for. Later reconnects use the same bound per attempt. |
 | `KBM_LASTCOMMITID` | _(platform-injected)_ | Optional build/commit identifier. When set, its value is surfaced verbatim as the `deployment_id` field in `/health` and `/ready` responses, so you can confirm which build is live behind a probe. Usually injected by the deployment platform; leave unset locally (the field is then omitted). See "Health Endpoints" below. |
 
 ### Handler Timeout (`KBM_LEDSAS_HANDLER_TIMEOUT`)
@@ -96,6 +98,18 @@ are not reported: nobody set them. For a Service named
   `await`. Work it started in a thread (`asyncio.to_thread`, an executor)
   or a subprocess is **not** stopped; see "Work in threads and
   processes" under "Timeout Enforcement".
+- **The broker's `consumer_timeout` must be longer.** RabbitMQ takes back
+  a command that stays unacknowledged longer than its `consumer_timeout`
+  (30 minutes by default; a command is acknowledged only when its handler
+  has finished): it closes the service's channel and delivers the command
+  again. So keep the broker's `consumer_timeout` above the longest handler
+  run plus the time a command waits for a worker. When
+  `KBM_LEDSAS_HANDLER_TIMEOUT` is above `1800` or `0` (no limit), the SDK
+  logs one WARNING at start (`KBM_LEDSAS_HANDLER_TIMEOUT=0 (no limit)
+  allows handler runs longer than RabbitMQ's default consumer_timeout (30
+  min): ...`). What happens when the broker does take a command back is
+  described under "The broker's consumer_timeout closed the channel" in
+  "Logging".
 
 ### Max Retries (`KBM_LEDSAS_MAX_RETRIES`)
 
@@ -200,6 +214,20 @@ The SDK expects incoming messages to follow a specific structure with an
 > `"response"` envelope whose `payload` contains an `error` object
 > (`{code, message, retryable}`).
 
+> **Telling an error reply from a result.** A success reply and an error
+> reply are both `"response"` envelopes with the same AMQP properties;
+> only the payload tells them apart. A reply is an error reply when
+> `payload["error"]` is an object (a `dict` in Python) with the keys
+> `code`, `message` and `retryable`, as in `{"error": {"code":
+> "Permanent", "message": "...", "retryable": false}}`; the SDK's error
+> replies carry nothing else in `payload`. Any other reply is the
+> handler's result, and a result may have an `error` key of its own (see
+> "Return value"): `{"valid": false, "error": "field x missing"}` is a
+> success. In Python: `error = payload.get("error")`, then the reply
+> failed when `isinstance(error, dict) and {"code", "message",
+> "retryable"} <= error.keys()`. A handler must therefore not return an
+> `error` object of that shape: raise instead (see "Errors").
+
 > **Invalid envelopes are dead-lettered without a reply.** A command
 > whose envelope fails validation (for example a `deadline` before
 > `sent_at`, a `name` that does not match the pattern above, or a
@@ -297,10 +325,11 @@ The SDK expects incoming messages to follow a specific structure with an
 > command is still being acknowledged) waits for that acknowledgement, at
 > most 10 s, and then runs. The broker's own
 > redelivery of a command is not such a duplicate: if the connection to
-> the broker was lost and restored while the command is still in
-> progress here, the redelivery is handed to that command, which then
-> settles it (see "Broker connection lost while a command runs" under
-> "Logging").
+> the broker was lost and restored, or the broker took the command back
+> at its `consumer_timeout`, while the command is still in progress
+> here, the redelivery is handed to that command, which then settles it
+> (see "Broker connection lost while a command runs" and "The broker's
+> consumer_timeout closed the channel" under "Logging").
 
 ### Replies: one per command
 
@@ -369,7 +398,11 @@ may hold any keys, `error` included: whether the command failed is
 decided by how the handler ended (it returned, or it raised), never by
 the result's keys, so a returned `{"valid": False, "error": "field x
 missing"}` is replied as it is and the command is acknowledged. To fail
-a command, raise (see "Errors").
+a command, raise (see "Errors"). Callers recognise an error reply by
+the shape of `payload["error"]`: an object with `code`, `message` and
+`retryable` (see "Telling an error reply from a result" above). Do not
+return an `error` value of that shape, or the caller takes your result
+for a failure.
 
 - **Keys** follow `json.dumps` at every level, the top level included:
   `str` keys are kept; `int`, `float`, `bool` and `None` keys become the
@@ -378,27 +411,46 @@ a command, raise (see "Errors").
   Any other key type (a tuple, a date, ...) and two keys that become the
   same text (`1` and `"1"`) are refused.
 - **Values** are written as JSON. Besides what `json.dumps` accepts,
-  these are converted, each the same way whatever it holds: `datetime` /
-  `date` / `time` -> ISO 8601 text (UTC `datetime` with a `Z`), `set` /
-  `frozenset` / `tuple` -> list, `Decimal` and `UUID` -> text, an `Enum`
-  -> its value, a pydantic model or a dataclass -> its fields, `NaN` /
-  `Infinity` -> `null`; and, as pydantic (which serializes replies)
-  converts them, a `pathlib.Path` or an IP address -> text, a
-  `timedelta` -> an ISO 8601 duration such as `PT1M30S`, a generator ->
-  the list of its items (read once; the reply carries the items read).
-  Anything else has no JSON form and is refused (`payload["o"] is an
-  instance of Weird, which has no JSON form`).
-- **Binary data (`bytes`, `bytearray`, `memoryview`) is refused at any
-  level, whatever its content** (`payload["b"] is bytes; a reply carries
-  text, not binary data: ...`): bytes that happen to be UTF-8 text are
-  refused too, so a handler tested with text-like bytes cannot fail later
-  on real binary data. Decode text (`data.decode()`), base64-encode
-  binary data (`base64.b64encode(data).decode()`), or store it in a blob
-  and return the reference.
-- **Text** (keys and values) must be valid Unicode text: a string with a
-  lone surrogate (such as `"\ud800"`, which a JSON request can carry and
-  a handler can echo) is refused (`payload["s"] is text with a lone
-  surrogate U+D800 at position 0, which UTF-8 cannot encode`). JSON would
+  pydantic (which serializes replies) converts many values; among them:
+  `datetime` / `date` / `time` -> ISO 8601 text (UTC `datetime` with a
+  `Z`), a `timedelta` -> an ISO 8601 duration such as `PT1M30S`,
+  `Decimal`, `UUID`, `Fraction` and `complex` -> text (`"1.10"`,
+  `"1/3"`, `"1j"`), a `pathlib.Path`, an IP address, network or
+  interface and a compiled regular expression (its pattern) -> text, an
+  `Enum` -> its value, `NaN` / `Infinity` -> `null`; `set` / `frozenset`
+  / `tuple` (a named tuple too) / `deque` -> list; a generator or another
+  iterator (`map(...)`, `zip(...)`, an open text file) -> the list of its
+  items, read once while the reply is built (the reply carries the items
+  read; an exception while reading it refuses the result:
+  `payload["g"]: reading this generator raised ValueError: ...`); a
+  dataclass -> an object of its fields; a pydantic model -> what its own
+  serialization writes (see below). A value with no JSON form is
+  refused (`payload["o"] is an instance of Weird, which has no JSON
+  form`); `range`, `dict_keys` / `dict_values` and `array.array` are
+  among them: convert them with `list(...)`.
+- **Where these rules apply:** in everything written as a JSON object or
+  array, at every level: dicts, lists, tuples, sets, deques, the items of
+  a generator or iterator, a dataclass's fields and an `Enum`'s value.
+  **A pydantic model (or pydantic dataclass) is the exception:** it is
+  written with its own serialization settings, and the SDK does not look
+  inside it for keys or binary data (pydantic writes `bytes` in a model
+  as UTF-8 text unless the model sets `ser_json_bytes`, and refuses other
+  bytes; two of its dict keys that become the same text keep the last).
+  Convert binary data before you put it in a model, or set
+  `ser_json_bytes="base64"` on it. The text rule below applies inside a
+  model too.
+- **Binary data (`bytes`, `bytearray`, `memoryview`) is refused wherever
+  these rules apply, whatever its content** (`payload["b"] is bytes; a
+  reply carries text, not binary data: ...`): bytes that happen to be
+  UTF-8 text are refused too, so a handler tested with text-like bytes
+  cannot fail later on real binary data. Decode text (`data.decode()`),
+  base64-encode binary data (`base64.b64encode(data).decode()`), or store
+  it in a blob and return the reference.
+- **Text** (keys and values) must be valid Unicode text, at every level
+  and inside a pydantic model too: a string with a lone surrogate (such as
+  `"\ud800"`, which a JSON request can carry and a handler can echo) is
+  refused (`payload["s"] is text with a lone surrogate U+D800 at position
+  0, which UTF-8 cannot encode`). JSON would
   write it as an escape that strict JSON readers refuse (.NET's
   System.Text.Json reads the document but throws when the string is
   read). The same applies to `emit_status` and `upload_json`. An error
@@ -407,8 +459,20 @@ a command, raise (see "Errors").
   surrogate is replaced by U+FFFD, the Unicode replacement character, so
   every JSON reader can read the error reply too.
 
-A return value that is not a dict, or a dict with a refused key or
-value, is a bug in the handler: the SDK logs one ERROR, replies with a
+**Without `reply_to`** (a fire-and-forget command) no reply is sent, so
+only the result's type is checked: a `dict` or `None` is accepted, and a
+value that is not a dict, or an awaitable that was never awaited, is
+refused as described below. The rules above do not apply to such a
+result: its keys and values are neither walked nor serialized, so a value
+with no JSON form, binary data, two keys that become the same text or a
+lone surrogate in it is not an error, and the command is acknowledged.
+**With `reply_to`** the result is checked and serialized on the service's
+event loop before the reply is sent: a large result holds the loop for
+that time (the health probes and the other running handlers wait), so
+put large data in blob storage and return its reference.
+
+A return value that is not a dict, or (for a command with `reply_to`) a
+dict with a refused key or value, is a bug in the handler: the SDK logs one ERROR, replies with a
 `Permanent` error and dead-letters the command **without retrying**,
 because the handler's side effects have already happened. The error
 names where: `Handler for <name> returned a dict that is not
@@ -672,8 +736,19 @@ from datetime import datetime, timezone
 import pika
 
 # Same broker as the service.
-connection = pika.BlockingConnection(pika.URLParameters(
-    os.environ.get("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/")))
+params = pika.URLParameters(
+    os.environ.get("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/"))
+try:
+    connection = pika.BlockingConnection(params)
+except pika.exceptions.ProbableAuthenticationError:
+    sys.exit(f"error: the broker at {params.host}:{params.port} refused the "
+             "user name or password in KBM_LEDSAS_RABBITMQ_URL")
+except (pika.exceptions.AMQPConnectionError, OSError) as e:
+    # Not running, wrong host or port, unknown virtual host, ... (pika's
+    # text for a refused connection is empty: its argument names the cause).
+    reason = str(e) or (repr(e.args[0]) if e.args else type(e).__name__)
+    sys.exit(f"error: cannot connect to the broker at {params.host}:{params.port} "
+             f"({reason})")
 channel = connection.channel()
 # Publisher confirms: a command that cannot be delivered raises an error
 # instead of vanishing (an unconfirmed publish to an exchange that does not
@@ -727,7 +802,9 @@ print("command sent:", message["envelope"]["message_id"])
 - `confirm_delivery()` and `mandatory=True` make a command that cannot be
   delivered fail the sender (exit code 1, one `error:` line) instead of
   vanishing: the command exchange is declared by the service when it
-  starts, so before the first start there is nothing to publish to.
+  starts, so before the first start there is nothing to publish to. A
+  broker that cannot be reached, or that refuses the user name and
+  password, also ends the sender with one `error:` line naming the cause.
 
 ---
 
@@ -762,8 +839,10 @@ envelope field that has a direct property is also reachable via
 (`handler.<envelope.name>`). It is **not** configured by the SDK (the
 SDK configures only its own `kbm_ledsas_sdk.*` loggers): without a
 logging configuration of your own, `ctx.logger.info(...)` prints
-nothing. Configure the root logger once at startup, for example with
-the SDK's JSON format (see `json_log_formatter()` below):
+nothing (its WARNING and ERROR records are written in the SDK's format,
+see "When you configure no logging yourself" under "Logging"). Configure
+the root logger once at startup, for example with the SDK's JSON format
+(see `json_log_formatter()` below):
 
 ```python
 import logging
@@ -772,6 +851,7 @@ import kbm_ledsas_sdk
 handler = logging.StreamHandler()
 handler.setFormatter(kbm_ledsas_sdk.json_log_formatter())
 logging.basicConfig(level=logging.INFO, handlers=[handler])
+logging.captureWarnings(True)  # Python warnings as JSON records too
 ```
 
 Structured fields go in `extra={...}`,
@@ -878,7 +958,12 @@ async def handle(ctx, req: dict) -> dict:
 
 ### Methods
 
-#### `emit_status(stage: str, progress: float, note: str | None = None) -> None`
+`emit_status` is a coroutine: call it as `await ctx.emit_status(...)`.
+Called without `await` it does nothing: no update is sent, the handler
+goes on, and the only trace is Python's `RuntimeWarning: coroutine
+'ExecutionContext.emit_status' was never awaited`.
+
+#### `async emit_status(stage: str, progress: float, note: str | None = None) -> None`
 
 Report processing progress back to the orchestrator.
 
@@ -895,9 +980,13 @@ handler continues.
 - `progress` (float): Completion fraction in `[0.0, 1.0]`
 - `note` (str, optional): Human-readable status message
 
+An `Enum` member whose value is a `str` (`class Stage(Enum): DOWNLOADING
+= "downloading"`) is accepted for `stage` and `note` and sent as that
+value.
+
 **Raises:**
 - `TypeError` if `stage` is not a `str`, or `note` is neither `None` nor a `str`
-  (`emit_status() takes stage as a str, got int`).
+  (`emit_status() takes stage as a str, got int`; pass `str(n)` for a number).
 - `ValueError`: if `progress` is outside `[0.0, 1.0]`, `TypeError` if it
   is not a number (`True` and `False` are refused too) — validated at
   call time, before anything is published. Uncaught, either is replied as `Permanent` (not retried).
@@ -927,6 +1016,14 @@ ctx.envelope.trace_id       # Distributed tracing ID
 
 Access via `ctx.blob` for all blob storage operations.
 
+**Await every method except `download_stream`.** The upload and download
+methods are coroutines (`ref = await ctx.blob.upload_bytes(...)`, `data =
+await ctx.blob.download_bytes(...)`; their headings below say `async`).
+Called without `await`, such a method does nothing: nothing is written or
+read, and Python warns `coroutine ... was never awaited`. `download_stream`
+is different: it returns an async iterator, which you read with `async
+for` (see its example) and do not await.
+
 **Stored content type and generated names.** `upload_json` stores the
 blob with the content type `application/json`, and `upload_text` with
 `text/plain; charset=utf-8` (what a browser, a download tool or a
@@ -938,7 +1035,7 @@ streams. Give a `path` to choose the name.
 
 ### Bytes Operations (2)
 
-#### `upload_bytes(container: str, data: bytes, path: str | None = None, overwrite: bool = False) -> BlobRef`
+#### `async upload_bytes(container: str, data: bytes, path: str | None = None, overwrite: bool = False) -> BlobRef`
 Upload raw bytes to blob storage.
 
 **Parameters:**
@@ -963,7 +1060,12 @@ Upload raw bytes to blob storage.
 - `overwrite` (bool, default `False`): If `True`, replace an existing
   blob at `path`. Default `False` refuses to clobber existing blobs
   (raises `azure.core.exceptions.ResourceExistsError`). Set `True` for
-  the idempotency-key replay pattern — see `examples/hello_world_service/`.
+  the idempotency-key replay pattern — see `examples/hello_world_service/`. It must be
+  `True` or `False` (applies to every `upload_*` method): any other value
+  (`"false"`, `"no"`, `0`, `None`) raises `TypeError` before anything is
+  written, so a flag read from the environment or a request field as text
+  cannot replace a blob by accident (convert it first, e.g.
+  `overwrite=value.lower() == "true"`).
 
 **Returns:** `BlobRef` (carries the blob `uri`; `version_id` is populated
 when the container has versioning enabled)
@@ -971,6 +1073,9 @@ when the container has versioning enabled)
 **Raises:**
 - `ValueError`: `path` is not a valid blob path (see above). Nothing is
   written; uncaught, it is replied as `Permanent` (not retried).
+- `TypeError`: `overwrite` is not `True` or `False` (`overwrite must be
+  True or False, got str`). Nothing is written; uncaught, it is replied
+  as `Permanent` (not retried). The same for every `upload_*` method.
 - `azure.core.exceptions.ResourceExistsError`: If `overwrite=False` and the blob already exists.
 
 **Example:**
@@ -987,7 +1092,7 @@ ref = await ctx.blob.upload_bytes(
 print(ref.uri)  # "azblob://results/messages/abc-123.bin"
 ```
 
-#### `download_bytes(blob_ref: str | BlobRef) -> bytes`
+#### `async download_bytes(blob_ref: str | BlobRef) -> bytes`
 Download blob as raw bytes.
 
 **Parameters:**
@@ -1017,7 +1122,7 @@ print(len(data))  # Size in bytes
 
 ### JSON Operations (2)
 
-#### `upload_json(container: str, obj: dict, path: str | None = None, overwrite: bool = False) -> BlobRef`
+#### `async upload_json(container: str, obj: dict, path: str | None = None, overwrite: bool = False) -> BlobRef`
 Upload Python dict/list as JSON blob.
 
 **Parameters:**
@@ -1031,6 +1136,7 @@ Upload Python dict/list as JSON blob.
 **Raises:**
 - `TypeError` (or `ValueError` for a circular reference): if `obj` has no
   JSON form. Uncaught, it is replied as `Permanent` (not retried).
+- `TypeError`: `overwrite` is not `True` or `False` (see `upload_bytes`).
 - `azure.core.exceptions.ResourceExistsError`: If `overwrite=False` and the blob already exists.
 
 **Example:**
@@ -1044,7 +1150,7 @@ ref = await ctx.blob.upload_json(
 )
 ```
 
-#### `download_json(blob_ref: str | BlobRef) -> dict | list`
+#### `async download_json(blob_ref: str | BlobRef) -> dict | list`
 Download and parse JSON blob.
 
 **Parameters:**
@@ -1072,7 +1178,7 @@ print(config["max_retries"])  # 3
 
 ### Text Operations (2)
 
-#### `upload_text(container: str, text: str, path: str | None = None, overwrite: bool = False) -> BlobRef`
+#### `async upload_text(container: str, text: str, path: str | None = None, overwrite: bool = False) -> BlobRef`
 Upload text string to blob storage.
 
 **Parameters:**
@@ -1087,6 +1193,7 @@ Upload text string to blob storage.
 - `TypeError`: If `text` is not a string (e.g., passing a list or dict).
   Use `upload_json()` for dict/list data. Uncaught, it is replied as
   `Permanent` (not retried).
+- `TypeError`: `overwrite` is not `True` or `False` (see `upload_bytes`).
 - `azure.core.exceptions.ResourceExistsError`: If `overwrite=False` and the blob already exists.
 
 **Example:**
@@ -1102,7 +1209,7 @@ ref = await ctx.blob.upload_text(
 )
 ```
 
-#### `download_text(blob_ref: str | BlobRef) -> str`
+#### `async download_text(blob_ref: str | BlobRef) -> str`
 Download blob as text string.
 
 **Parameters:**
@@ -1124,12 +1231,14 @@ for line in content.split("\n"):
 
 ### Streaming Operations (2)
 
-#### `upload_stream(container: str, stream: AsyncIterator[bytes], path: str | None = None, progress_callback: Callable[[int], None] | None = None, overwrite: bool = False) -> BlobRef`
+#### `async upload_stream(container: str, stream: AsyncIterator[bytes], path: str | None = None, progress_callback: Callable[[int], None] | None = None, overwrite: bool = False) -> BlobRef`
 Upload data from async byte stream (for large files).
 
 **Parameters:**
 - `container` (str): Target container
-- `stream` (AsyncIterator[bytes]): Async generator yielding chunks
+- `stream` (AsyncIterator[bytes]): Async generator yielding chunks. Each
+  chunk must be `bytes` (`bytearray` and `memoryview` are accepted too);
+  encode text first (`text.encode()`, or use `upload_text`).
 - `path` (str, optional): Blob path. If omitted, the SDK auto-generates a UUID path.
 - `progress_callback` (callable, optional): Called with the cumulative
   number of bytes uploaded so far after each chunk.
@@ -1138,6 +1247,17 @@ Upload data from async byte stream (for large files).
 **Returns:** `BlobRef`
 
 **Raises:**
+- `TypeError`: a chunk is not `bytes`, `bytearray` or `memoryview`
+  (`upload_stream() got a chunk of type str; the stream must yield
+  bytes`). A `str` chunk is refused too: it is not stored UTF-8 encoded.
+  The upload stops at that chunk and the blob is not written; uncaught,
+  it is replied as `Permanent` (not retried).
+- `TypeError`: `overwrite` is not `True` or `False` (see `upload_bytes`).
+- An exception the `stream` itself raises (your generator failed while
+  reading its source) is passed on unchanged, and the blob is not
+  written. The SDK does not log it as a storage failure: uncaught, it is
+  reported once by the handler layer like any exception of your handler
+  (see "Uncaught exceptions").
 - `azure.core.exceptions.ResourceExistsError`: If `overwrite=False` and the blob already exists.
 
 **Example:**
@@ -1155,7 +1275,8 @@ ref = await ctx.blob.upload_stream(
 ```
 
 #### `download_stream(blob_ref: str | BlobRef, chunk_size: int = 4194304, progress_callback: Callable[[int, int], None] | None = None) -> AsyncIterator[bytes]`
-Download blob as async byte stream (for large files).
+Download blob as async byte stream (for large files). Not a coroutine:
+read the iterator it returns with `async for` (no `await`).
 
 **Parameters:**
 - `blob_ref`: Blob URI string or BlobRef
@@ -1266,12 +1387,47 @@ handler layer logs each attempt as one WARNING, not an ERROR:
   redelivered to another replica or to a restarted process, can log the
   traceback again on that delivery's last attempt.
 
+**Secrets in these records are masked.** An exception's text comes from
+code the SDK does not control and may quote a credential (a client
+library's error that repeats a connection URL or a connection string).
+Every record the SDK writes masks the secrets listed below, in either log
+format: the records of the handler layer (`kbm_ledsas_sdk.runtime.handler`:
+the records above, and the `Permanent` / `Retryable` / non-retryable /
+timeout records below), those of every other SDK module
+(`kbm_ledsas_sdk.*`, for example the storage client's `Failed to
+download blob` ERROR and its traceback) and the records of the AMQP
+client library that the SDK filters (`aio_pika`, `aiormq`; see "Library
+log records" under "Logging"). A record is masked in its message, in
+every text field (`error`, `error_message`, `internal_message`,
+`reason`, `uri`, ...), in its traceback and in its stack. The secrets are
+the user name and password of a URL (`amqp://***:***@host`; everything
+before the `@` that ends them, also when the password holds an
+unencoded `#`, `?` or `/`), every query
+value and the fragment of a broker URL (`amqps://host/?password=***`),
+and the values of `AccountKey=`, `SharedAccessSignature=`,
+`SharedAccessKey=`, `Password=` / `Pwd=` and a `sig=` URL query
+parameter (`***`). The masking fails closed: a text it cannot mask is
+replaced by a placeholder (`<withheld: secret masking failed>` for a
+field, `<record text withheld: secret masking failed>` for the message,
+`<traceback withheld: secret masking failed>` for the traceback), and
+the record is still written. Other secrets (a bare token, an API key)
+are not recognised. The records your own code writes (`ctx.logger`, your
+own loggers) are not masked, except the WARNING and higher records that
+the SDK's last-resort handler writes when you configure no logging
+yourself (see "When you configure no logging yourself" under
+"Logging"); and the reply is not changed: an `errors.Permanent` message
+is sent to the caller as you wrote it.
+
 Any other storage failure, one that is neither transient as above nor
 an HTTP 4xx (for example an HTTP 501, 505 or 507, or a response cut off
 mid-transfer), is retried as `Uncaught exception in handler`, and the
 storage client also logs its own ERROR **with a traceback on every
 attempt**: `Failed to download blob`, `Failed to upload blob`,
-`Streaming download failed` or `Streaming upload failed`.
+`Streaming download failed` or `Streaming upload failed`. An exception
+that the stream you pass to `upload_stream` raises (your generator
+failed reading its source) is not a storage failure: it is reported only
+as your handler's own exception, with no `Streaming upload failed`
+record.
 
 A `TimeoutError` raised inside your handler (your own
 `asyncio.wait_for`, or a client library's timeout) is retried like a
@@ -1319,7 +1475,9 @@ just before it):
   container name or `path` that is not a valid blob path, `upload_bytes`
   given something other than `bytes`, `bytearray` or `memoryview` (a
   `str` belongs in `upload_text`), `upload_stream` given something that
-  is not an async iterable, `upload_text` given a non-string or text with
+  is not an async iterable or a stream that yields a chunk other than
+  `bytes`, `bytearray` or `memoryview` (a `str` chunk too), an `upload_*`
+  `overwrite` that is not `True` or `False`, `upload_text` given a non-string or text with
   a lone surrogate (e.g. `"\ud800"`, which UTF-8 cannot encode),
   `upload_json` given an object with no JSON form (or text with a lone
   surrogate), `emit_status` with a `stage` that is not a `str` or a `note` that is
@@ -1449,7 +1607,7 @@ if ctx.deadline:
     time_remaining = ctx.deadline - datetime.now(timezone.utc)
     if time_remaining < timedelta(seconds=10):
         raise errors.DeadlineExceeded(
-            f"Only {time_remaining.seconds}s remaining - need at least 10s",
+            f"Only {int(time_remaining.total_seconds())}s remaining - need at least 10s",
             user_message="Request arrived too close to deadline",
         )
 ```
@@ -1872,6 +2030,27 @@ export KBM_LEDSAS_LOG_FORMAT=text     # human-readable / colored
 `ctx.logger`) continue to use whatever root logging config you set up
 (usually `logging.basicConfig(...)`).
 
+**When you configure no logging yourself.** If the root logger has no
+handler when `app.run()` starts (your code did not call
+`logging.basicConfig(...)` or add a handler to the root logger), the SDK
+writes the records that no handler takes in `KBM_LEDSAS_LOG_FORMAT` (JSON
+by default) to stderr, and routes Python warnings through logging
+(`logging.captureWarnings(True)`): it replaces Python's last-resort
+handler (`logging.lastResort`, which writes only a record's message) with
+one in its own format. The records of other code then come out in the
+same format as the SDK's, one line each, instead of as plain multi-line
+text between the JSON lines: the event loop's (`Task exception was never
+retrieved`, with its traceback in the record), the client libraries',
+those of your own loggers that have no handler, and warnings (logger
+`py.warnings`). Which records come out does not change: those at WARNING
+or above that no handler takes, so your `INFO` records still need a
+configuration of your own. A logger you gave a handler of your own is
+written by that handler only (no record comes out twice), and a
+`logging.basicConfig(...)` you call later still takes effect. If you
+configure root logging yourself, the SDK leaves it as it is and does not
+capture warnings: call `logging.captureWarnings(True)` yourself if you
+want them in your log stream too (the examples do).
+
 **On expected error cases the SDK now suppresses upstream-library
 traceback noise** (`aio_pika`/`aiormq` `ChannelNotFoundEntity` raised
 by a missing reply_to exchange, and the unroutable-return raised when
@@ -1887,7 +2066,7 @@ again`), in the SDK log format. `/ready` answers 503 in between. Commands
 that were not yet acknowledged are redelivered by the broker. The AMQP
 client library also logs the close and its own reconnect attempts
 (`aio_pika` / `aiormq` loggers, through your root logging
-configuration), all at WARNING: the library logs the broker's close
+configuration, or the SDK's when you configured none), all at WARNING: the library logs the broker's close
 reason (`Unexpected connection close from remote ..., CONNECTION_FORCED
 ...`) as an ERROR, which the SDK lowers to WARNING, since the connection
 is recovered automatically. A routine broker restart therefore produces
@@ -1923,6 +2102,32 @@ the command or log a traceback:
   sent: `ACK not sent: ...` (after a success, including one whose reply
   was published on the restored connection), `Requeue not sent: ...` or
   `Dead-letter not sent: ...`.
+
+**The broker's consumer_timeout closed the channel.** A command left
+unacknowledged longer than the broker's `consumer_timeout` (30 minutes
+by default on RabbitMQ; see "Handler Timeout") is taken back: the broker
+closes the channel the service receives commands on (the connection
+stays up) and delivers every command that was unacknowledged on it
+again. The SDK logs one WARNING that names the cause (`The AMQP broker
+closed the consumer channel: a command stayed unacknowledged longer than
+the broker's consumer_timeout. The broker delivers the N command(s) in
+progress here again: ...`, with the broker's reason in `error`, and
+`in_progress` and `message_ids`); the client library's records about
+deliveries that reached the closed channel (`Got frame for closed
+channel ...`) are WARNINGs too, not ERRORs. The commands in progress then
+end as in the list above: a redelivery that reaches this instance while
+the command still runs is handed to that command (the INFO line says
+`the broker closed the channel of its first delivery at its
+consumer_timeout`), and a settlement that can no longer be sent logs one
+WARNING `ACK not sent: the AMQP broker closed the channel of this
+command's delivery at its consumer_timeout while the command was in
+progress ...` (or `Requeue not sent` / `Dead-letter not sent`), with
+`reason` `consumer_timeout`; the broker delivers that command again and
+it runs again. With several instances the broker may deliver the command
+to another instance, which runs it again, and while every run outlasts
+the `consumer_timeout` this can go on without end. Raise the broker's
+`consumer_timeout` above the longest handler run plus the time a command
+waits for a worker.
 
 So a handler may run twice for one command, and its caller can receive
 two replies (one per run); keep handlers idempotent (key writes on
@@ -2051,10 +2256,33 @@ sent and neither is this line; the transport's WARNING says so, the
 broker delivers the command again and its last attempt runs again: see
 "Broker connection lost while a command runs") and on
 the ERROR lines of non-retryable failures, or on the WARNING records if
-you want to see failed attempts. The `Max retries` ERROR, like the
-`Handling command <name>`, `Sent response for <name>` and `ACKed command
-<name>` records, carries the command's `message_id` and `command_name`
-besides its `correlation_id`. The storage client's ERROR lines above come once per
+you want to see failed attempts. Every record of the handler layer
+about a command (`No handler for <name> v<version>`, `Permanent error in
+handler`, `Retryable error in handler`, `Uncaught exception in handler`,
+`Transient error in handler`, `Non-retryable error in handler (not
+retried)`, `Handler timeout`, `Handler raised TimeoutError`, `Deadline
+already exceeded ...`, `Deadline exceeded in handler ...`, `Handler
+returned an invalid result ...`) and the SDK's
+own per-command records (`Received command`, `Handling command <name>`,
+`Sent response for <name>`, `ACKed command <name>`, `Max retries (N)
+exceeded`, `Command failed with a non-retryable error, sending to DLQ`,
+`Retry k/N ...`, `Reply publish failed for <name> ...`, and the reply and
+status records `Failed to send response to reply_to exchange ...` and
+`Failed to send status to reply_to exchange ...`, and the consumer's
+records about settling the command: `Acknowledging message`, `Rejecting
+message` (each retry requeue and each dead-letter), `Failed to ACK
+message`, `Failed to NACK message`, the WARNING and INFO records saying
+that an ACK, a requeue or a dead-letter was `not sent: the connection to
+the AMQP broker was lost`, `not sent: the AMQP broker closed the channel`
+or `not sent: AMQP broker not reachable during shutdown`, and
+the `Duplicate message_id while original still pending; rejecting
+duplicate to DLQ` and `pending_messages dict at cap; rejecting new message
+to DLQ ...` WARNINGs) carry the command's
+identity: its `correlation_id`, `message_id`, `command_name`,
+`trace_id` and `idempotency_key`, and its `job_id` when it has one, so
+an alert can be joined to the dead-lettered message. A record about a
+`message_id` the service does not hold (`Cannot ACK unknown message`,
+`Cannot NACK unknown message`) carries only that `message_id`. The storage client's ERROR lines above come once per
 attempt, not once per command. An `Uncaught exception in handler`
 record is never an ERROR (it was before v0.3.5, so an alert keyed on
 that message at ERROR level no longer fires). A broker restart the SDK
@@ -2076,12 +2304,15 @@ There is no metrics endpoint; count or alert on these records.
 milliseconds and a `Z` suffix (`2026-10-14T05:43:15.123Z`).
 
 **Text format.** `KBM_LEDSAS_LOG_FORMAT=text` writes one line per record:
-`<timestamp> <LEVEL> <logger>: <message>`, then `[corr=...]` and
-`[trace=...]`, then every other field of the record as `key=value` (the
-same fields the JSON format carries, for example `error_class`,
-`error_message`, `error_location`, `internal_message`, `will_retry`,
-`uri`, `amqp_message_id`, `body_bytes`), so the text format shows why
-something failed just as the JSON one does. Values that are not a plain
+`<timestamp> <LEVEL> <logger>: <message>`, then `[corr=...]` (the
+command's `correlation_id`) and `[trace=...]` (the first 16 characters of
+its `trace_id`) on every per-command record, then every other field of the
+record as `key=value` (the same fields the JSON format carries, for
+example `message_id`, `command_name`, `idempotency_key`, `job_id`,
+`error_class`, `error_message`, `error_location`, `internal_message`,
+`will_retry`, `uri`, `amqp_message_id`, `body_bytes`), so the text format
+shows why something failed just as the JSON one does. The JSON format
+carries the whole `trace_id`. Values that are not a plain
 token are written as JSON strings. Control characters (terminal escape
 sequences, carriage returns, newlines) in the message and in field
 values are written as escapes (`\x1b`, `\n`), so caller-controlled
@@ -2091,9 +2322,16 @@ colored when stderr is a terminal.
 
 **Library log records.** The AMQP and storage client libraries log
 through their own loggers (`aio_pika`, `aiormq`, `azure`), which the SDK
-caps at WARNING; their records go to your root logging configuration. A
-broker URL in such a record has its user name and password replaced by
-`***:***`.
+caps at WARNING; their records go to your root logging configuration
+(or, when you configured none, are written in the SDK's format; see
+"When you configure no logging yourself" above). In the AMQP client
+library's records the SDK masks the same secrets as in its own (see
+"Secrets in these records are masked" under "Uncaught exceptions"): a
+broker URL has its user name and password replaced by `***:***`, and
+every value of its query string and its fragment by `***`
+(`amqps://***:***@host:5671/?heartbeat=***`). Every record the SDK's
+last-resort handler writes (when you configured no logging) is masked
+the same way.
 
 **The JSON formatter always writes valid JSON.** `json_log_formatter()`
 writes each record as one JSON line (RFC 8259) whatever its `extra`
@@ -2113,7 +2351,13 @@ error ---` traceback.
 **When the SDK's records start.** The SDK writes its records in
 `KBM_LEDSAS_LOG_FORMAT` from the moment `app.run()` starts; it logs
 nothing while your module is imported (the handlers are listed once the
-service starts, `Registered handler for <name> v<version>`).
+service starts, `Registered handler for <name> v<version>`). A service
+with no handler registered at that point starts, but logs one WARNING
+instead (`No command handler is registered: every command this service
+receives is replied HandlerNotFound and dead-lettered. Register handlers
+with @app.handler(...) in modules that are imported before app.run()`):
+typically the module with the `@app.handler` functions was never
+imported.
 `KBM_LEDSAS_LOG_LEVEL` applies as soon as the settings have been read
 and checked (before the `Starting <service> service` record). While
 they are being read the level is not known yet, so the SDK writes at
@@ -2584,7 +2828,11 @@ test, and write any check that waits on I/O as `async def`.
   verbose body the user name and password of a URL are masked
   (`amqp://***:***@host`), as are the values of `AccountKey=`,
   `SharedAccessSignature=`, `SharedAccessKey=`, `Password=` / `Pwd=` and
-  a `sig=` query parameter (`***`).
+  a `sig=` URL query parameter (`***`; a bare `sig=` outside a URL query
+  is not masked), and every query value and the fragment of a broker URL
+  (`amqps://host/?password=***`). Every record the SDK writes masks the
+  same secrets, the exceptions of your handlers included (see "Uncaught
+  exceptions").
 - **A check keeps failing:** probes come every few seconds, so a failing
   check is logged once when it starts failing, as one WARNING (`Health
   check 'db' raised RuntimeError: ...` or `... did not finish within

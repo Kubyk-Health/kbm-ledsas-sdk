@@ -21,14 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import logging
+import logging  # noqa: F401
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from ..utils.logging import redact_secrets
+from ..utils.logging import masked_logger, redact_secrets
 
-logger = logging.getLogger(__name__)
+logger = masked_logger(__name__)
 
 CheckCallable = Callable[[], bool | Awaitable[bool]]
 

@@ -10,11 +10,12 @@ preceding the actual ERROR.
 
 from __future__ import annotations
 
-import logging
 import os
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
-logger = logging.getLogger(__name__)
+from kbm_ledsas_sdk.utils.logging import mask_url_secrets, masked_logger
+
+logger = masked_logger(__name__)
 
 
 # Hosts that don't need TLS — credentials never leave the local box.
@@ -116,43 +117,22 @@ def _is_truthy(value: str | None) -> bool:
     return value.strip().lower() in _TRUTHY_BOOL_VALUES
 
 
-def _mask_userinfo(url: str) -> str:
-    """``url`` with everything before the last ``@`` of its authority (the
-    part after ``scheme://`` up to the first ``/``) replaced by
-    ``***:***``. Works on text no URL parser accepts."""
-    scheme, sep, rest = url.partition("://")
-    if not sep:
-        scheme, rest = "", url
-    authority, slash, tail = rest.partition("/")
-    if "@" in authority:
-        authority = "***:***@" + authority.rsplit("@", 1)[1]
-    return f"{scheme}{sep}{authority}{slash}{tail}"
-
-
 def scrub_url_credentials(url: str) -> str:
-    """Return ``url`` with the userinfo (user:password) replaced by ``***``.
+    """Return ``url`` as it may be logged: the userinfo (user:password)
+    replaced by ``***:***``, every value of the query string by ``***``
+    (``amqp://host/?heartbeat=***&password=***``) and the fragment by
+    ``***``; the scheme, host, port and path (the virtual host) are kept.
 
-    Used to log connection URLs without leaking credentials. It fails
-    closed: a URL the parser cannot read (an out-of-range port, unmatched
-    brackets, no scheme) still has everything before the ``@`` of its
-    authority masked, and anything that is not text is replaced by a
+    Used to log connection URLs without leaking credentials. The URL is
+    read as text (see ``mask_url_secrets``), so it fails closed: a URL no
+    parser accepts (an out-of-range port, unmatched brackets, no scheme)
+    is masked the same way, and anything that is not text is replaced by a
     placeholder.
     """
     if not isinstance(url, str):
         return "<unreadable URL>"
     try:
-        parsed = urlparse(url)
-        if parsed.username or parsed.password:
-            # The host and port as written after the last '@' (an IPv6
-            # address keeps its brackets: amqp://***:***@[::1]:5672/);
-            # .hostname would drop them.
-            parsed.port  # an invalid port raises: masked below instead  # noqa: B018
-            netloc = "***:***@" + parsed.netloc.rsplit("@", 1)[1]
-            return urlunparse(parsed._replace(netloc=netloc))
-    except Exception:
-        pass
-    try:
-        return _mask_userinfo(url)
+        return mask_url_secrets(url)
     except Exception:  # pragma: no cover - never return the input unmasked
         return "<unreadable URL>"
 

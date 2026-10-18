@@ -6,17 +6,18 @@ client libraries are only loaded when a service starts.
 
 from __future__ import annotations
 
-import logging
+import logging  # noqa: F401
 import os
 from typing import TYPE_CHECKING
 
+from ..utils.logging import masked_logger
 from .base import Transport
 from .direct import DirectTransport
 
 if TYPE_CHECKING:
     from ..runtime.config import SDKConfig
 
-logger = logging.getLogger(__name__)
+logger = masked_logger(__name__)
 
 
 def warn_unknown_settings() -> None:
@@ -176,14 +177,83 @@ def warn_memory_bound(config: SDKConfig) -> None:
     )
 
 
+# RabbitMQ's default consumer_timeout (seconds): a delivery held
+# unacknowledged longer is taken back by the broker, which closes the
+# channel it was on and delivers it again.
+_BROKER_DEFAULT_CONSUMER_TIMEOUT_S = 1800
+
+
+def _setting(config: SDKConfig, name: str) -> int | None:
+    """``config.<name>`` when it is an int (not a bool), else None."""
+    value = getattr(config, name, None)
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    return value
+
+
+def warn_long_handler_timeout(config: SDKConfig) -> None:
+    """One WARNING when ``KBM_LEDSAS_HANDLER_TIMEOUT`` lets a handler run
+    longer than RabbitMQ's default consumer_timeout (30 min), or without a
+    limit (0). A command held unacknowledged past the broker's
+    consumer_timeout is taken back: the broker closes the channel and
+    delivers the command again. On this instance the run still in progress
+    settles the redelivery; on another instance the command runs again,
+    and with several instances it can go on running again without end."""
+    timeout = _setting(config, "handler_timeout")
+    if timeout is None:
+        return
+    if timeout != 0 and timeout <= _BROKER_DEFAULT_CONSUMER_TIMEOUT_S:
+        return
+    shown = "0 (no limit)" if timeout == 0 else f"{timeout}s"
+    logger.warning(
+        "KBM_LEDSAS_HANDLER_TIMEOUT=%s allows handler runs longer than "
+        "RabbitMQ's default consumer_timeout (30 min): the broker takes back "
+        "a command left unacknowledged longer than its consumer_timeout and "
+        "delivers it again (with several instances, another instance runs "
+        "it again while it still runs here). Raise the broker's "
+        "consumer_timeout above the longest handler run plus the time a "
+        "command waits for a worker",
+        shown,
+        extra={"handler_timeout_s": timeout},
+    )
+
+
+def warn_prefetch_below_concurrency(config: SDKConfig) -> None:
+    """One WARNING when ``KBM_LEDSAS_PREFETCH`` is below
+    ``KBM_LEDSAS_CONCURRENCY``: the broker hands this service at most
+    PREFETCH unacknowledged commands at a time and a command stays
+    unacknowledged while its handler runs, so at most
+    min(PREFETCH, CONCURRENCY) handlers run at once."""
+    prefetch = _setting(config, "prefetch")
+    concurrency = _setting(config, "concurrency")
+    if prefetch is None or concurrency is None or prefetch >= concurrency:
+        return
+    logger.warning(
+        "KBM_LEDSAS_PREFETCH=%d is below KBM_LEDSAS_CONCURRENCY=%d: the "
+        "broker hands this service at most %d unacknowledged command(s) at a "
+        "time, so at most %d handler(s) run at once. Set KBM_LEDSAS_PREFETCH "
+        "to at least KBM_LEDSAS_CONCURRENCY to use every worker",
+        prefetch,
+        concurrency,
+        prefetch,
+        prefetch,
+        extra={"prefetch": prefetch, "concurrency": concurrency},
+    )
+
+
 def build_transport(config: SDKConfig) -> Transport:
     """Construct DirectTransport, validating required connection env vars
     (and warning once about ``KBM_LEDSAS_*`` variables that are not
-    settings, see :func:`warn_unknown_settings`, and about command bodies
+    settings, see :func:`warn_unknown_settings`, about command bodies
     that can exceed the container's memory limit, see
-    :func:`warn_memory_bound`)."""
+    :func:`warn_memory_bound`, about a handler timeout longer than the
+    broker's default consumer_timeout, see
+    :func:`warn_long_handler_timeout`, and about a prefetch that caps the
+    concurrency, see :func:`warn_prefetch_below_concurrency`)."""
     warn_unknown_settings()
     warn_memory_bound(config)
+    warn_long_handler_timeout(config)
+    warn_prefetch_below_concurrency(config)
     if not config.rabbitmq_url:
         raise ValueError(
             "This deployment requires a RabbitMQ connection URL. "

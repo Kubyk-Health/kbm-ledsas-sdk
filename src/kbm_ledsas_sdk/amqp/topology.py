@@ -4,13 +4,15 @@ AMQP topology declaration for RabbitMQ exchanges and queues.
 Declares the RabbitMQ exchanges and queues a service consumes from.
 """
 
-import logging
+import logging  # noqa: F401
 
 from aio_pika import ExchangeType
 from aio_pika.abc import AbstractChannel, AbstractQueue
 from aio_pika.exceptions import AMQPError
 
-logger = logging.getLogger(__name__)
+from kbm_ledsas_sdk.utils.logging import masked_logger
+
+logger = masked_logger(__name__)
 
 
 def build_exchange_name(prefix: str, tenant: str | None, service_name: str) -> str:
@@ -159,7 +161,7 @@ async def declare_topology(
         #
         # NOTE on upgrade: queues declared by an older SDK without these
         # arguments will fail to re-declare with PRECONDITION_FAILED.
-        # Operators upgrading from < v0.1.8-recut1 must delete the
+        # Operators whose DLQ was declared without them must delete the
         # existing DLQ (`dlq.queue.{tenant}.{service}.v1`) once before
         # restarting; the SDK will re-create it with the new arguments.
         # Customers who want different limits can pre-declare the DLQ

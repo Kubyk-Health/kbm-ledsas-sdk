@@ -6,6 +6,7 @@ Blob Storage for blob operations.
 """
 
 import asyncio
+import inspect
 import logging
 import re
 from collections.abc import AsyncIterator
@@ -34,8 +35,9 @@ from kbm_ledsas_sdk.runtime.security import (
     scrub_url_credentials as _scrub_url_credentials,
 )
 from kbm_ledsas_sdk.transport.base import DeliveryLost, Transport, TransportUnavailable
+from kbm_ledsas_sdk.utils.logging import _command_fields, masked_logger
 
-logger = logging.getLogger(__name__)
+logger = masked_logger(__name__)
 
 # The URL-security check and credential scrubber
 # now live in ``kbm_ledsas_sdk.runtime.security`` so SDKConfig's
@@ -382,6 +384,8 @@ class DirectTransport(Transport):
             # Create the consumer/topology channel.
             self.channel = await self.connection.channel()
             logger.debug("RabbitMQ consumer channel created")
+            # Name a close of it by the broker at its consumer_timeout.
+            self._watch_consumer_channel(self.channel)
 
             # Declare topology (exchanges, queues) on the consumer channel
             topology = await declare_topology(
@@ -513,8 +517,7 @@ class DirectTransport(Transport):
                 logger.debug(
                     "Yielding command",
                     extra={
-                        "message_id": command.envelope.message_id,
-                        "correlation_id": command.envelope.correlation_id,
+                        **_command_fields(command.envelope),
                     },
                 )
                 yield command
@@ -537,7 +540,7 @@ class DirectTransport(Transport):
         if not self.consumer:
             raise RuntimeError("Transport not started. Call start() first.")
 
-        logger.debug(f"ACK: {message_id}")
+        logger.debug("ACK: %s", message_id, extra=self._held_command_fields(message_id))
         await self.consumer.ack(message_id)
 
     async def nack(self, message_id: str, requeue: bool) -> None:
@@ -555,8 +558,21 @@ class DirectTransport(Transport):
         if not self.consumer:
             raise RuntimeError("Transport not started. Call start() first.")
 
-        logger.debug(f"NACK: {message_id} (requeue={requeue})")
+        logger.debug(
+            "NACK: %s (requeue=%s)",
+            message_id,
+            requeue,
+            extra=self._held_command_fields(message_id),
+        )
         await self.consumer.nack(message_id, requeue)
+
+    def _held_command_fields(self, message_id: str) -> dict:
+        """The identity fields of the command ``message_id`` the consumer
+        holds (see ``AMQPConsumer.command_fields``); only ``message_id``
+        when the consumer is not an ``AMQPConsumer`` (a test double)."""
+        if isinstance(self.consumer, AMQPConsumer):
+            return self.consumer.command_fields(message_id)
+        return dict(message_id=message_id)  # noqa: C408
 
     async def send_response(self, response: Response) -> bool:
         """
@@ -604,8 +620,7 @@ class DirectTransport(Transport):
             logger.info(
                 "Skipping response send (no reply_to specified)",
                 extra={
-                    "message_id": response.envelope.message_id,
-                    "correlation_id": response.envelope.correlation_id,
+                    **_command_fields(response.envelope),
                 },
             )
             return True
@@ -613,8 +628,7 @@ class DirectTransport(Transport):
         logger.debug(
             "Sending response",
             extra={
-                "message_id": response.envelope.message_id,
-                "correlation_id": response.envelope.correlation_id,
+                **_command_fields(response.envelope),
                 "exchange": exchange_name,
             },
         )
@@ -647,8 +661,7 @@ class DirectTransport(Transport):
                     exchange_name,
                     type(e).__name__,
                     extra={
-                        "message_id": response.envelope.message_id,
-                        "correlation_id": response.envelope.correlation_id,
+                        **_command_fields(response.envelope),
                         "exchange": exchange_name,
                         "error_class": type(e).__name__,
                     },
@@ -670,8 +683,7 @@ class DirectTransport(Transport):
                     exchange_name,
                     type(e).__name__,
                     extra={
-                        "message_id": response.envelope.message_id,
-                        "correlation_id": response.envelope.correlation_id,
+                        **_command_fields(response.envelope),
                         "exchange": exchange_name,
                         "error_class": type(e).__name__,
                     },
@@ -749,8 +761,7 @@ class DirectTransport(Transport):
                 self.reply_publish_failures,
                 action_hint,
                 extra={
-                    "message_id": response.envelope.message_id,
-                    "correlation_id": response.envelope.correlation_id,
+                    **_command_fields(response.envelope),
                     "exchange": exchange_name,
                     "error": error_text,
                     "reply_publish_failures": self.reply_publish_failures,
@@ -784,8 +795,7 @@ class DirectTransport(Transport):
             logger.info(
                 "Skipping status send (no reply_to specified)",
                 extra={
-                    "message_id": status.envelope.message_id,
-                    "correlation_id": status.envelope.correlation_id,
+                    **_command_fields(status.envelope),
                 },
             )
             return
@@ -793,8 +803,7 @@ class DirectTransport(Transport):
         logger.debug(
             "Sending status",
             extra={
-                "message_id": status.envelope.message_id,
-                "correlation_id": status.envelope.correlation_id,
+                **_command_fields(status.envelope),
                 "exchange": exchange_name,
             },
         )
@@ -815,8 +824,7 @@ class DirectTransport(Transport):
                     exchange_name,
                     type(e).__name__,
                     extra={
-                        "message_id": status.envelope.message_id,
-                        "correlation_id": status.envelope.correlation_id,
+                        **_command_fields(status.envelope),
                         "exchange": exchange_name,
                         "error_class": type(e).__name__,
                     },
@@ -846,8 +854,7 @@ class DirectTransport(Transport):
                 error_text,
                 self.status_publish_failures,
                 extra={
-                    "message_id": status.envelope.message_id,
-                    "correlation_id": status.envelope.correlation_id,
+                    **_command_fields(status.envelope),
                     "exchange": exchange_name,
                     "error": error_text,
                     "status_publish_failures": self.status_publish_failures,
@@ -872,6 +879,38 @@ class DirectTransport(Transport):
             reconnect_callbacks.add(self._on_broker_reconnected)
         except Exception:  # pragma: no cover - never block startup on logging
             logger.debug("Could not watch the broker connection state", exc_info=True)
+
+    def _watch_consumer_channel(self, channel: object) -> None:
+        """Register on the consumer channel's close callbacks, so that a
+        close by the broker at its consumer_timeout (a command held
+        unacknowledged too long) is reported as such (see
+        ``AMQPConsumer.note_channel_closed``). The connection stays up and
+        the channel is reopened by the client; only the client library's own
+        records showed the close, and the commands whose delivery the broker
+        took back were later reported as if the connection had been lost."""
+        close_callbacks = getattr(channel, "close_callbacks", None)
+        add = getattr(close_callbacks, "add", None)
+        # A real channel's add() is a plain method; a coroutine function
+        # here is a test double, whose call would never run.
+        if add is None or inspect.iscoroutinefunction(add):
+            return
+        try:
+            add(self._on_consumer_channel_closed)
+        except Exception:  # pragma: no cover - never block startup on logging
+            logger.debug("Could not watch the consumer channel", exc_info=True)
+
+    def _on_consumer_channel_closed(
+        self, _sender: object, error: BaseException | None = None
+    ) -> None:
+        """Close callback of the consumer channel (see
+        ``_watch_consumer_channel``). Never raises."""
+        consumer = self.consumer
+        if consumer is None:
+            return
+        try:
+            consumer.note_channel_closed(error)
+        except Exception:  # pragma: no cover - a callback must not raise
+            logger.debug("Consumer channel close not classified", exc_info=True)
 
     def _on_broker_connection_closed(
         self, _sender: object, error: BaseException | None = None
@@ -1032,9 +1071,9 @@ class DirectTransport(Transport):
         traceback); unacknowledged messages, including commands whose reply
         could not be confirmed or whose ACK / requeue / dead-letter could
         not be sent, are redelivered by the broker, so nothing is lost (a
-        finished command runs again, at-least-once). Before v0.3.5 a
-        SIGTERM during a broker outage waited for a reconnection that never
-        came, until the platform killed the process.
+        finished command runs again, at-least-once). Without these bounds a
+        SIGTERM during a broker outage would wait for a reconnection that
+        never comes, until the platform kills the process.
         """
         logger.info("Stopping DirectTransport")
 

@@ -1,5 +1,5 @@
 """
-Transport factory — builds the transport this package ships.
+Transport factory — builds the service's transport from its configuration.
 
 The transport's builder is imported lazily, so its dependencies are only
 loaded when a service actually starts.
@@ -11,7 +11,7 @@ from .base import Transport
 
 def create_transport(config: SDKConfig) -> Transport:
     """
-    Create the transport instance this package ships.
+    Create the transport for a service from its configuration.
 
     Example:
         >>> config = SDKConfig.from_env(service_name="my_service")

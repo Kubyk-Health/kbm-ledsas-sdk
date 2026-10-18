@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import json
-import logging
+import logging  # noqa: F401
 import os
 import socket
 import time
@@ -17,12 +17,13 @@ from http import HTTPStatus
 from aiohttp import hdrs, web, web_protocol
 from aiohttp.http_exceptions import HttpProcessingError
 
+from ..utils.logging import masked_logger
 from .checks import CheckResult, HealthCheckRegistry
 
-logger = logging.getLogger(__name__)
+logger = masked_logger(__name__)
 # aiohttp's own request-handling records (passed to aiohttp as its logger):
 # a child of the SDK logger, so they use the SDK's log format and level.
-http_logger = logging.getLogger(f"{__name__}.http")
+http_logger = masked_logger(f"{__name__}.http")
 
 ReadinessSignal = Callable[[], Awaitable[CheckResult]]
 LivenessSignal = Callable[[], Awaitable[CheckResult]]
@@ -264,10 +265,12 @@ class HealthServer:
     - GET /health → 200 if all liveness checks pass; 503 otherwise.
     - GET /ready  → 200 if all readiness checks pass; 503 otherwise.
 
-    The server is started before the SDK begins consuming commands and
-    stopped during SDK shutdown. If the configured port is already in use
-    the server logs a warning and continues — the SDK never crashes the
-    customer's service over a health-port collision.
+    The server is started before the SDK runs any command and stopped
+    during SDK shutdown. If the configured address cannot be bound (port in
+    use, permission denied, a host that is not an address of this machine),
+    :meth:`start` logs one ERROR naming the setting to change and raises
+    :class:`HealthServerStartFailure`: the service stops at start, so its
+    probes never report another process's answer as its health.
     """
 
     def __init__(

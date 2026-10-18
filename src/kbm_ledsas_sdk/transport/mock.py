@@ -76,7 +76,7 @@ class MockBlobOperations(BlobOperations):
         if not overwrite and any(k.startswith(path_key) for k in self.blobs):
             try:
                 from azure.core.exceptions import ResourceExistsError
-            except ImportError:  # azure-core is not a dependency of every install
+            except ImportError:  # azure-core not importable: a built-in error stands in
                 raise FileExistsError(f"Blob {path_key} already exists") from None
             raise ResourceExistsError(message=f"Blob {path_key} already exists")
         self.blobs[uri] = data

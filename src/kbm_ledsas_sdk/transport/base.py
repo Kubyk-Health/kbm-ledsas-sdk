@@ -6,21 +6,10 @@ response and status publishing, and provides access to blob operations.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 
 from ..blob.operations import BlobOperations
 from ..models.messages import Command, Response, Status
-
-
-class TransportConnectionLost(ConnectionError):
-    """The transport's underlying connection died and cannot recover
-    in-process.
-
-    Raised from the subscribe iterator so the application exits promptly
-    (fail-fast) instead of consuming from a dead transport forever. The
-    process supervisor (container restart policy, orchestrator) is the
-    recovery mechanism: a fresh process reconnects and resubscribes.
-    """
 
 
 class DeliveryLost(ConnectionError):
@@ -33,6 +22,53 @@ class DeliveryLost(ConnectionError):
     (one WARNING, no traceback); the service lets the command go without
     logging it again.
     """
+
+
+class _ErrorReplySent:
+    """The type of :data:`ERROR_REPLY_SENT`."""
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        # False, like a reply that was not sent: a caller that only tests
+        # the result's truth still dead-letters the command.
+        return False
+
+    def __repr__(self) -> str:
+        return "ERROR_REPLY_SENT"
+
+
+#: What :meth:`Transport.send_response` returns when it did not send the
+#: handler's result but an error reply in its place (the result could not
+#: be sent as a reply; the transport logged that once, as an ERROR): the
+#: caller has its one reply, and the command is dead-lettered. It is falsy,
+#: like ``False``, so the command is dead-lettered either way; compare with
+#: ``is`` to tell it from a reply that could not be sent.
+ERROR_REPLY_SENT = _ErrorReplySent()
+
+
+class _ReplyUnconfirmed:
+    """The type of :data:`REPLY_UNCONFIRMED`."""
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        # True, like a reply that was sent: a caller that only tests the
+        # result's truth goes on to settle the command as before.
+        return True
+
+    def __repr__(self) -> str:
+        return "REPLY_UNCONFIRMED"
+
+
+#: What :meth:`Transport.send_response` returns when it handed the reply on
+#: but could not confirm that it was published (the transport logged that
+#: once, as a WARNING), and an acknowledgement of the command takes effect
+#: only once the reply is confirmed. The service then logs neither ``Sent
+#: response`` nor ``ACKed command`` for it (the command may still be
+#: delivered and run again). It is truthy, like ``True``, so the command is
+#: settled as for a sent reply; compare with ``is`` to tell it apart.
+REPLY_UNCONFIRMED = _ReplyUnconfirmed()
 
 
 class TransportUnavailable(ConnectionError):
@@ -145,6 +181,16 @@ class Transport(ABC):
                   treat the command as Permanent-failed (NACK no-requeue);
                   retrying the handler will produce the same failure.
                   When reply_to is empty / no response is needed, returns True.
+                  :data:`ERROR_REPLY_SENT` (falsy) when the transport sent
+                  an error reply in place of the response (it could not
+                  be sent as a reply): the caller has its reply, and the
+                  command is dead-lettered as for False, without being
+                  reported as a failed publish.
+                  :data:`REPLY_UNCONFIRMED` (truthy) when the transport
+                  handed the reply on but could not confirm it was
+                  published, and applies an acknowledgement only once the
+                  reply is confirmed: the command is settled as for True,
+                  without being reported as sent and acknowledged.
 
         Args:
             response: Response message with envelope and payload
@@ -180,6 +226,14 @@ class Transport(ABC):
             ... )
             >>> await transport.send_status(status)
         """
+
+    def set_handled_commands(self, names: Sequence[str]) -> None:
+        """The command names this service has handlers for (sorted, each
+        once), given by the service before :meth:`start`. A transport may
+        pass them on to where commands are counted, so that the counts of
+        these names are kept apart from those of unknown names. The default
+        does nothing."""
+        return None
 
     @abstractmethod
     def get_blob_operations(self) -> BlobOperations:

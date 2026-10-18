@@ -268,6 +268,36 @@ def _check_upload_stream(stream: Any) -> None:
     _refuse_argument(TypeError(msg), msg)
 
 
+def _check_stream_chunk(chunk: Any) -> bytes:
+    """One chunk an ``upload_stream`` source yielded, as ``bytes``.
+    ``bytearray`` and ``memoryview`` are converted; anything else (a
+    ``str``, ``None``, a number, a dict) is refused (non-retryable
+    TypeError), before it reaches the storage service: a ``str`` was stored
+    UTF-8 encoded without a word, and the other types failed inside the
+    storage client, logged as a storage failure and retried."""
+    if isinstance(chunk, bytes):
+        return chunk
+    if isinstance(chunk, (bytearray, memoryview)):
+        return bytes(chunk)
+    msg = (
+        f"upload_stream() got a chunk of type {type(chunk).__name__}; the "
+        f"stream must yield bytes"
+    )
+    _refuse_argument(TypeError(msg), msg)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _check_overwrite(overwrite: Any) -> None:
+    """Refuse an upload ``overwrite`` that is not a bool (non-retryable
+    TypeError), before anything is written: the storage client reads it by
+    truthiness, so ``overwrite="false"`` (a flag read from the environment
+    or a request field) replaced an existing blob."""
+    if type(overwrite) is bool:
+        return
+    msg = f"overwrite must be True or False, got {type(overwrite).__name__}"
+    _refuse_argument(TypeError(msg), msg)
+
+
 def _encode_text(text: str) -> bytes:
     """UTF-8 bytes of ``text`` for ``upload_text``. Text that UTF-8 cannot
     encode (a lone surrogate such as ``"\\ud800"``, which a JSON request
@@ -403,7 +433,10 @@ class BlobOperations(ABC):
                 class is named in the API reference). Set ``overwrite=True`` when keying
                 output paths on ``ctx.idempotency_key`` so DLQ replays
                 of the same logical request rewrite the same blob
-                instead of being rejected as duplicates.
+                instead of being rejected as duplicates. It must be
+                ``True`` or ``False``: any other value (``"false"``, ``1``,
+                ``None``) is refused before anything is written and,
+                uncaught, is replied as Permanent (not retried).
 
         Returns:
             BlobRef with URI including versionId
@@ -553,15 +586,22 @@ class BlobOperations(ABC):
 
         Raises:
             TypeError: If ``stream`` is not an async iterable, or
-                ``container`` is not a string.
+                ``container`` is not a string (raised before anything is
+                written), or the stream yields a chunk that is not
+                ``bytes``, ``bytearray`` or ``memoryview`` (encode text
+                first: a ``str`` chunk is refused, not stored encoded).
             ValueError: If ``container`` is not a valid container name
                 (3 to 63 characters: lowercase letters, digits and single
-                hyphens) or ``path`` is not a valid blob path.
-                These errors are raised before anything is written and,
-                uncaught, are replied as Permanent (not retried).
+                hyphens) or ``path`` is not a valid blob path (raised
+                before anything is written).
+                These errors are replied as Permanent if uncaught (not
+                retried).
             Exception: When ``overwrite=False`` and ``path`` already exists
                 (the storage service's ``BlobAlreadyExists`` error), and for
-                other storage errors (access denied).
+                other storage errors (access denied). An exception raised
+                by ``stream`` itself (its own read failed) is raised
+                unchanged: it is the handler's own error, not a storage
+                failure.
 
         Example:
             >>> async def file_stream():

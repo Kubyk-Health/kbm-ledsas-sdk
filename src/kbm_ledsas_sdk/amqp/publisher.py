@@ -12,7 +12,7 @@ reopened by the connection's automatic recovery.
 """
 
 import json
-import logging
+import logging  # noqa: F401
 from collections.abc import Awaitable
 from typing import Any, TypeVar
 
@@ -24,8 +24,9 @@ from aio_pika.exceptions import DeliveryError, PublishError
 from kbm_ledsas_sdk.amqp.consumer import BrokerShutdownGuard, is_broker_unreachable
 from kbm_ledsas_sdk.models.envelope import Envelope  # noqa: F401
 from kbm_ledsas_sdk.models.messages import Response, Status
+from kbm_ledsas_sdk.utils.logging import _command_fields, masked_logger
 
-logger = logging.getLogger(__name__)
+logger = masked_logger(__name__)
 
 T = TypeVar("T")
 
@@ -264,8 +265,7 @@ class AMQPPublisher:
             extra={
                 "exchange": exchange_name,
                 "routing_key": routing_key,
-                "message_id": response.envelope.message_id,
-                "correlation_id": response.envelope.correlation_id,
+                **_command_fields(response.envelope),
             },
         )
 
@@ -305,7 +305,7 @@ class AMQPPublisher:
                 extra={
                     "exchange": exchange_name,
                     "routing_key": routing_key,
-                    "message_id": response.envelope.message_id,
+                    **_command_fields(response.envelope),
                 },
             )
 
@@ -324,12 +324,14 @@ class AMQPPublisher:
                     "shutdown (%s); reply_to=%r (upper layer reports it)",
                     type(e).__name__,
                     exchange_name,
+                    extra=_command_fields(response.envelope),
                 )
             elif is_expected:
                 logger.debug(
                     "publish_response: %s; reply_to=%r " "(upper layer will log + DLQ)",
                     reason,
                     exchange_name,
+                    extra=_command_fields(response.envelope),
                 )
             else:
                 logger.error(
@@ -338,7 +340,7 @@ class AMQPPublisher:
                     extra={
                         "exchange": exchange_name,
                         "routing_key": routing_key,
-                        "message_id": response.envelope.message_id,
+                        **_command_fields(response.envelope),
                         "error": str(e),
                     },
                 )
@@ -398,8 +400,7 @@ class AMQPPublisher:
             extra={
                 "exchange": exchange_name,
                 "routing_key": routing_key,
-                "message_id": status.envelope.message_id,
-                "correlation_id": status.envelope.correlation_id,
+                **_command_fields(status.envelope),
             },
         )
 
@@ -435,7 +436,7 @@ class AMQPPublisher:
                 extra={
                     "exchange": exchange_name,
                     "routing_key": routing_key,
-                    "message_id": status.envelope.message_id,
+                    **_command_fields(status.envelope),
                 },
             )
 
@@ -451,6 +452,7 @@ class AMQPPublisher:
                     "shutdown (%s); reply_to=%r (upper layer reports it)",
                     type(e).__name__,
                     exchange_name,
+                    extra=_command_fields(status.envelope),
                 )
             elif is_expected:
                 logger.debug(
@@ -458,6 +460,7 @@ class AMQPPublisher:
                     "(upper layer will log; status is best-effort)",
                     reason,
                     exchange_name,
+                    extra=_command_fields(status.envelope),
                 )
             else:
                 logger.error(
@@ -466,7 +469,7 @@ class AMQPPublisher:
                     extra={
                         "exchange": exchange_name,
                         "routing_key": routing_key,
-                        "message_id": status.envelope.message_id,
+                        **_command_fields(status.envelope),
                         "error": str(e),
                     },
                 )
