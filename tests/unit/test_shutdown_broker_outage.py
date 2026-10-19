@@ -831,7 +831,10 @@ class TestPublisherDuringShutdown:
         guard.begin_shutdown()  # a healthy broker during shutdown, too
         await publisher.publish_response(_response(), REPLY_EXCHANGE)
         assert exchange.publish.await_count == 2
-        assert channel.close.await_count == 2
+        # One pooled channel: kept after the first publish, reused by the
+        # second and closed after it (the transport is shutting down).
+        assert connection.channel.await_count == 1
+        assert channel.close.await_count == 1
         assert connection.channel.await_args.kwargs == {"on_return_raises": True}
         assert guard.broker_unreachable is False
 

@@ -10,12 +10,16 @@ the service/handler side; a caller (orchestrator, test rig, this script)
 just speaks AMQP. aio-pika is already a transitive dependency of the SDK,
 so no extra install is needed in the dev venv.
 
-Reply-to contract (see docs/SDK_API_REFERENCE.md): the caller owns the
+Reply-to contract (see "Replies: one per command" in the SDK API
+reference): the caller owns the
 reply topology. This script declares a reply exchange + queue + binding
 (routing key ``response``), sets ``envelope.reply_to`` to that exchange name,
 and the SDK publishes the handler's return value there. The response is
 matched on ``correlation_id``; the script deletes its reply queue and
-exchange when it exits, whatever happened.
+exchange when it exits (Ctrl+C and SIGTERM included). Should the process be
+killed outright, the broker deletes the queue ``--timeout`` + 60 s after its
+last use, and the exchange with it. The command expires after
+``--timeout``: a service that starts later never runs it.
 
 Usage::
 
@@ -34,12 +38,15 @@ Environment (read from process env; see ../.env.example):
                               broker used is printed at the start, password
                               masked)
 
-Every failure (an invalid broker URL, a broker that does not answer, a
-service that has not started, no reply in time) prints one ``error:`` line;
-``--timeout`` bounds the whole run, the connection attempt included.
+Every failure prints one ``error:`` line: an invalid broker URL, a broker
+that cannot be reached or does not answer, refused credentials, a service
+that has not started (no command exchange), no reply in time, or an error
+reply (``error: <code>: <message>``). ``--timeout`` bounds the whole run,
+the connection attempt included.
 
-Exit codes: 0 = greeting received; 1 = timeout / error; 2 = invalid
-arguments; 130 = interrupted (Ctrl+C).
+Exit codes: 0 = greeting received; 1 = timeout / error / error reply;
+2 = invalid arguments; 130 = interrupted (Ctrl+C); 143 = terminated
+(SIGTERM).
 """
 
 from __future__ import annotations
@@ -48,8 +55,10 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import re
+import signal
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -66,10 +75,23 @@ DEFAULT_RABBITMQ_URL = "amqp://guest:guest@127.0.0.1:5672/"
 # wait must cover the retries: with the SDK defaults (3 retries, 7-10 s of
 # backoff) 30 s covers a handler that fails fast on every attempt.
 DEFAULT_TIMEOUT_S = 30.0
+MAX_TIMEOUT_S = 86400.0
+# The broker deletes a reply queue unused for this long after the wait (a
+# backstop for a process killed before its own cleanup).
+REPLY_QUEUE_GRACE_S = 60
+# One connection attempt may take at most this long (within --timeout): an
+# unreachable or firewalled host otherwise waits for the operating system's
+# own timeout.
+CONNECT_TIMEOUT_S = 10.0
+
+
+class SendError(Exception):
+    """A failure the script reports as one ``error:`` line (exit code 1)."""
 
 
 def build_command_exchange_name(tenant: str | None, service_name: str) -> str:
-    """The service's command exchange, as documented in docs/SDK_API_REFERENCE.md:
+    """The service's command exchange, as documented in the SDK API reference
+    ("AMQP Topology"):
 
     - with tenant:    cmd.{tenant}.{service}.v1
     - without tenant: cmd.{service}.v1
@@ -102,6 +124,29 @@ def idempotency_key_arg(text: str) -> str:
     return text
 
 
+def timeout_arg(text: str) -> float:
+    """argparse type for ``--timeout``: seconds, above 0 and at most a day."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from None
+    if not math.isfinite(value) or not 0 < value <= MAX_TIMEOUT_S:
+        raise argparse.ArgumentTypeError(
+            f"must be a number of seconds above 0 and at most {MAX_TIMEOUT_S:.0f}"
+        )
+    return value
+
+
+def reply_error(payload: Any) -> dict[str, Any] | None:
+    """The ``error`` object of an error reply (``code``, ``message`` and
+    ``retryable``), or ``None`` for a result (see "Telling an error reply from
+    a result" in the SDK API reference)."""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict) and {"code", "message", "retryable"} <= error.keys():
+        return error
+    return None
+
+
 def build_command_envelope(
     *,
     handler_name: str,
@@ -114,7 +159,8 @@ def build_command_envelope(
 ) -> dict[str, Any]:
     """Build a LEDSAS command envelope (the routing/metadata block).
 
-    Matches the message envelope format documented in docs/SDK_API_REFERENCE.md.
+    Matches the message envelope format documented in the SDK API reference
+    ("Message Format").
     """
     sent_at = sent_at or datetime.now(UTC)
     return {
@@ -155,17 +201,20 @@ def build_command_message(
 
 def broker_url_problem(url: str) -> str | None:
     """Why ``url`` cannot name a broker (``None`` when it can): the scheme must
-    be ``amqp://`` or ``amqps://`` and a host must follow it."""
+    be ``amqp://`` or ``amqps://``, a host must follow it, and a port is 1 to
+    65535. Checked before connecting; the text never repeats the URL."""
     try:
         parts = urlsplit(url)
         host = parts.hostname
-        _ = parts.port  # raises ValueError for a port that is not a number
+        port = parts.port  # raises ValueError for a port that is not a number
     except ValueError as e:
         return f"KBM_LEDSAS_RABBITMQ_URL is not a valid URL ({e})"
     if parts.scheme not in ("amqp", "amqps"):
         return "KBM_LEDSAS_RABBITMQ_URL must start with amqp:// or amqps://"
     if not host:
         return "KBM_LEDSAS_RABBITMQ_URL names no host (amqp://user:password@host:5672/)"
+    if port is not None and not 1 <= port <= 65535:
+        return "KBM_LEDSAS_RABBITMQ_URL has a port outside 1-65535"
     return None
 
 
@@ -213,6 +262,7 @@ async def _publish_and_wait(
     reply_queue: str,
     correlation_id: str,
     timeout: float,
+    progress: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """Declare reply topology, publish the command, await the matching reply.
 
@@ -220,34 +270,66 @@ async def _publish_and_wait(
     received, timeout, a failed publish), so a run leaves nothing behind on
     the broker; when the command exchange does not exist, none is created.
     One connection attempt (no reconnecting): a broker that does not answer
-    fails the run.
+    fails the run. ``progress["connected"]`` is set once the connection is
+    open, so a run that times out can tell an unreachable broker from a
+    missing reply.
     """
     import aio_pika
 
-    connection = await aio_pika.connect(env.rabbitmq_url, timeout=timeout)
+    broker = mask_url(env.rabbitmq_url)
+    try:
+        connection = await aio_pika.connect(
+            env.rabbitmq_url, timeout=min(CONNECT_TIMEOUT_S, timeout)
+        )
+    except aio_pika.exceptions.ProbableAuthenticationError:
+        raise SendError(
+            f"the broker at {broker} refused the user name or password in "
+            "KBM_LEDSAS_RABBITMQ_URL"
+        ) from None
+    except (aio_pika.exceptions.AMQPConnectionError, OSError, TimeoutError) as e:
+        # Not running, wrong host or port, unknown virtual host, ... (the
+        # class only: the library's text may quote the URL).
+        raise SendError(f"cannot connect to the broker at {broker} ({type(e).__name__})") from None
+    if progress is not None:
+        progress["connected"] = True
     try:
         channel = await connection.channel()
 
         # Reference the command exchange the service declares (do NOT
         # redeclare it with conflicting args — passive lookup). Looked up
         # first: when the service has never started, nothing is created.
-        cmd_ex = await channel.get_exchange(env.command_exchange, ensure=True)
+        try:
+            cmd_ex = await channel.get_exchange(env.command_exchange, ensure=True)
+        except aio_pika.exceptions.ChannelNotFoundEntity:
+            raise SendError(
+                f"the exchange {env.command_exchange} does not exist: start the "
+                "service first (python main.py), and check KBM_LEDSAS_SERVICE_NAME "
+                "and KBM_LEDSAS_TENANT"
+            ) from None
 
         rx = None
         rq = None
         consumer_tag = None
         try:
             # Caller-owned reply topology (the SDK does NOT declare this).
+            # auto_delete: the broker deletes the exchange once its queue is
+            # gone (see x-expires below).
             rx = await channel.declare_exchange(
-                reply_exchange, aio_pika.ExchangeType.TOPIC, durable=True
+                reply_exchange, aio_pika.ExchangeType.TOPIC, durable=True, auto_delete=True
             )
             # durable=True + auto_delete=False: an auto_delete reply queue
             # vanishes the moment its consumer disconnects, unbinding the
             # exchange — after which every response the SDK publishes is
             # unroutable and dead-letters the command it answers (the SDK
             # publishes replies mandatory). This script owns the queue and
-            # deletes it in the finally below.
-            rq = await channel.declare_queue(reply_queue, durable=True, auto_delete=False)
+            # deletes it in the finally below; x-expires is the backstop
+            # for a process killed before that runs.
+            rq = await channel.declare_queue(
+                reply_queue,
+                durable=True,
+                auto_delete=False,
+                arguments={"x-expires": int((timeout + REPLY_QUEUE_GRACE_S) * 1000)},
+            )
             await rq.bind(rx, routing_key="response")
 
             # Await the matching response.
@@ -271,6 +353,9 @@ async def _publish_and_wait(
                     body=json.dumps(message).encode("utf-8"),
                     content_type="application/json",
                     delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                    # A command not taken within the wait expires: a service
+                    # that starts later never runs it for a caller gone.
+                    expiration=timeout,
                 ),
                 routing_key="command",
             )
@@ -300,11 +385,8 @@ async def _publish_and_wait(
 
 def _error_line(error: BaseException, env: Env) -> str:
     """One line for a failed run (the broker URL is never echoed)."""
-    if type(error).__name__ == "ChannelNotFoundEntity":
-        return (
-            f"error: the exchange {env.command_exchange} does not exist: "
-            "start the service first (python main.py)"
-        )
+    if isinstance(error, SendError):
+        return f"error: {error}"
     text = " ".join(str(error).split()).replace(env.rabbitmq_url, mask_url(env.rabbitmq_url))
     return f"error: publish/receive failed: {type(error).__name__}: {text or 'no details'}"
 
@@ -327,6 +409,7 @@ async def _run(args: argparse.Namespace) -> int:
     print(f"Service:      {env.service_name} (tenant={env.tenant})")
     print(f"Cmd exchange: {env.command_exchange}")
     print(f"Idempotency:  {idempotency_key} (pass --idempotency-key to resend this request)")
+    print(f"Reply to:     {reply_exchange} (queue {reply_queue}; deleted when the run ends)")
 
     message = build_command_message(
         reply_to=reply_exchange,
@@ -336,6 +419,7 @@ async def _run(args: argparse.Namespace) -> int:
     )
 
     print(f"Publishing SayHello, waiting <= {args.timeout:.0f}s for response ...")
+    progress = {"connected": False}
     try:
         # --timeout bounds everything: the connection attempt, the lookup of
         # the command exchange and the wait for the reply.
@@ -347,13 +431,21 @@ async def _run(args: argparse.Namespace) -> int:
                 reply_queue=reply_queue,
                 correlation_id=correlation_id,
                 timeout=args.timeout,
+                progress=progress,
             ),
             timeout=args.timeout,
         )
     except TimeoutError:
+        if not progress["connected"]:
+            print(
+                f"error: cannot connect to the broker at {mask_url(env.rabbitmq_url)} "
+                f"(no answer within {args.timeout:g}s)",
+                file=sys.stderr,
+            )
+            return 1
         print(
             f"error: no response within {args.timeout:.0f}s "
-            "(is the broker reachable, and the service running and consuming?)",
+            "(is the service running and consuming?)",
             file=sys.stderr,
         )
         return 1
@@ -361,10 +453,18 @@ async def _run(args: argparse.Namespace) -> int:
         print(_error_line(e, env), file=sys.stderr)
         return 1
 
-    payload = response.get("payload", {})
+    payload = response.get("payload")
+    error = reply_error(payload)
+    if error is not None:
+        text = " ".join(str(error["message"]).split())
+        print(f"error: {error['code']}: {text}", file=sys.stderr)
+        return 1
+    if not isinstance(payload, dict) or not payload.get("greeting"):
+        print(f"error: the reply carries no greeting: {payload!r}", file=sys.stderr)
+        return 1
     print("\n=== Response ===")
-    print(f"greeting: {payload.get('greeting')}")
-    return 0 if payload.get("greeting") else 1
+    print(f"greeting: {payload['greeting']}")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -379,7 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timeout",
-        type=float,
+        type=timeout_arg,
         default=DEFAULT_TIMEOUT_S,
         help=(
             "Seconds to wait for the response (default %(default)s). The one reply "
@@ -400,6 +500,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+async def _run_until_sigterm(args: argparse.Namespace) -> int:
+    """``_run``, cancelled on SIGTERM so that its cleanup (the reply queue and
+    exchange) runs, as on Ctrl+C. (No SIGTERM handler where the event loop
+    cannot install one, as on Windows.)"""
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    assert task is not None
+    terminated = False
+
+    def on_sigterm() -> None:
+        nonlocal terminated
+        terminated = True
+        task.cancel()
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, on_sigterm)
+        installed = True
+    except (NotImplementedError, RuntimeError):
+        installed = False
+    try:
+        return await _run(args)
+    except asyncio.CancelledError:
+        if not terminated:
+            raise
+        print("terminated", file=sys.stderr)
+        return 143
+    finally:
+        if installed:
+            loop.remove_signal_handler(signal.SIGTERM)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     # The AMQP libraries log their own connection errors (with the broker URL);
@@ -407,7 +538,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("aiormq", "aio_pika"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
     try:
-        return asyncio.run(_run(args))
+        return asyncio.run(_run_until_sigterm(args))
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130

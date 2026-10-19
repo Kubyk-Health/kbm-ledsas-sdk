@@ -274,6 +274,41 @@ def check_broker_url_shape(url: str) -> None:
     check_url_heartbeat(parsed.query)
 
 
+# The TLS options of a broker URL that name a file (or, capath, a
+# directory) the client library opens when it connects.
+_TLS_FILE_OPTIONS = ("cafile", "certfile", "keyfile")
+_TLS_DIR_OPTIONS = ("capath",)
+
+
+def check_tls_files(query: str) -> None:
+    """Refuse an ``amqps://`` URL whose ``?cafile=`` / ``?certfile=`` /
+    ``?keyfile=`` names a file that does not exist or cannot be read (or
+    whose ``?capath=`` is not a directory): the connection would otherwise
+    fail with a generic error that does not name the option. The path is
+    quoted: it is not a secret."""
+    seen: set = set()
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        if key in seen or key not in _TLS_FILE_OPTIONS + _TLS_DIR_OPTIONS:
+            continue
+        seen.add(key)  # the client library reads the first value of a key
+        if key in _TLS_DIR_OPTIONS:
+            if not os.path.isdir(value):
+                raise ValueError(
+                    f"KBM_LEDSAS_RABBITMQ_URL: ?{key}= names a directory that "
+                    f"does not exist: {value!r}"
+                )
+            continue
+        if not os.path.isfile(value):
+            raise ValueError(
+                f"KBM_LEDSAS_RABBITMQ_URL: ?{key}= names a file that does not " f"exist: {value!r}"
+            )
+        if not os.access(value, os.R_OK):
+            raise ValueError(
+                f"KBM_LEDSAS_RABBITMQ_URL: ?{key}= names a file this service "
+                f"cannot read: {value!r}"
+            )
+
+
 # Largest heartbeat interval, in seconds, the SDK accepts (the same bound
 # as KBM_LEDSAS_HEARTBEAT).
 HEARTBEAT_MAX_S = 600

@@ -15,17 +15,20 @@ Send a test command with ``scripts/send_hello.py``.
 """
 
 import logging
+import os
 
 import kbm_ledsas_sdk
 from kbm_ledsas_sdk import ServiceApp
 
-# Our own log records (logger __main__) in the SDK's JSON format, extra=
-# fields included, so the service writes one JSON stream. The SDK writes its
-# own records itself, in KBM_LEDSAS_LOG_FORMAT (JSON by default), once
-# app.run() starts. The azure line quiets the Azure SDK's chatty INFO-level
-# HTTP logger.
+# Our own log records (logger __main__) in the format KBM_LEDSAS_LOG_FORMAT
+# names, as the SDK writes its own once app.run() starts: JSON (the default,
+# extra= fields included) or text. The azure line quiets the Azure SDK's
+# chatty INFO-level HTTP logger.
 _handler = logging.StreamHandler()
-_handler.setFormatter(kbm_ledsas_sdk.json_log_formatter())
+if os.environ.get("KBM_LEDSAS_LOG_FORMAT", "").strip().strip("\"'").lower() == "text":
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+else:
+    _handler.setFormatter(kbm_ledsas_sdk.json_log_formatter())
 logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logging.captureWarnings(True)
 logging.getLogger("azure").setLevel(logging.WARNING)

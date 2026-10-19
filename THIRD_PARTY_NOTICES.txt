@@ -39,9 +39,25 @@ This software includes the following third-party components:
    the SDK does not import it (azure-storage-blob uses it, for
    client-side encryption).
 
-6. Python Runtime (3.11+)
+6. aiormq (v6.8.0+)
+   License: Apache License 2.0
+   Copyright: Dmitry Orlov (the author named in its metadata; its
+   license file carries no copyright line)
+   URL: https://github.com/mosquito/aiormq
+
+7. pamqp (v3.3.0+)
+   License: BSD 3-Clause License
+   Copyright: Copyright (c) 2011-2022 Gavin M. Roy
+   URL: https://github.com/gmr/pamqp
+
+8. azure-core (v1.38.0+)
+   License: MIT License
+   Copyright: Copyright (c) Microsoft Corporation.
+   URL: https://github.com/Azure/azure-sdk-for-python
+
+9. Python Runtime (3.11+)
    License: Python Software Foundation License
-   Copyright: Copyright (c) 2001-2024 Python Software Foundation
+   Copyright: Copyright (c) 2001-2026 Python Software Foundation
    URL: https://www.python.org/
 
 ============================================================================
@@ -82,9 +98,8 @@ project. Open an issue in this repository if you need a notice for the
 base image.
 
 Indirect (transitive) dependencies pulled in by the direct dependencies
-above, annotated with the path that pulls each one:
+above (1. to 8.), annotated with the path that pulls each one:
 
-  azure-core            (via azure-storage-blob)
   cryptography          (via azure-storage-blob; also declared
                         directly, see 5. above)
   cffi                  (via cryptography)  — License: MIT-0 (MIT No
@@ -111,9 +126,6 @@ above, annotated with the path that pulls each one:
                         certifi files.
   charset_normalizer    (via requests)
   idna                  (via requests, yarl)
-
-  aiormq                (via aio-pika)
-  pamqp                 (via aiormq)
 
   multidict             (via aiohttp, yarl)
   yarl                  (via aiohttp)

@@ -69,6 +69,11 @@ class _ValidatedCopyModel(BaseModel):
             )
         return self.model_copy(update=update, deep=deep)
 
+    def __replace__(self: _M, **changes: Any) -> _M:
+        """``copy.replace(message, field=...)`` (Python 3.13): the same as
+        ``model_copy(update={...})``, on every supported pydantic version."""
+        return self.model_copy(update=changes)
+
 
 class Envelope(_ValidatedCopyModel):
     """

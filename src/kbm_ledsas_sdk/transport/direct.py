@@ -31,10 +31,11 @@ from kbm_ledsas_sdk.blob.direct_operations import DirectBlobOperations
 from kbm_ledsas_sdk.blob.operations import BlobOperations
 from kbm_ledsas_sdk.models.messages import Command, Response, Status
 from kbm_ledsas_sdk.runtime.security import (
-    check_transport_security as _check_transport_security,
+    check_tls_files,
+    redacted,
 )
 from kbm_ledsas_sdk.runtime.security import (
-    redacted,
+    check_transport_security as _check_transport_security,
 )
 from kbm_ledsas_sdk.runtime.security import (
     scrub_url_credentials as _scrub_url_credentials,
@@ -307,6 +308,7 @@ class DirectTransport(Transport):
         max_payload_bytes: int = 16 * 1024 * 1024,
         connect_timeout: float = 15.0,
         heartbeat: int | None = 60,
+        publish_channels: int = 4,
     ):
         """
         Initialize Direct transport.
@@ -339,6 +341,9 @@ class DirectTransport(Transport):
                 run blocking work with ``asyncio.to_thread``. ``None``
                 leaves the URL unchanged (the client library's own default
                 applies).
+            publish_channels: How many open channels the publisher keeps
+                for replies and status updates (the handler concurrency,
+                KBM_LEDSAS_CONCURRENCY; at least 1).
         """
         # Held so that no display path (repr of the transport's attributes,
         # pprint, rich.inspect) shows the credentials; see RedactedStr.
@@ -352,13 +357,14 @@ class DirectTransport(Transport):
         self.default_container = default_container
         self.max_payload_bytes = max_payload_bytes
         self.connect_timeout = connect_timeout
+        self.publish_channels = max(1, int(publish_channels))
 
         # AMQP components (initialized in start())
         self.connection: aio_pika.Connection | None = None
-        # Consumer/topology channel. The publisher uses its own transient
-        # channel per publish (see AMQPPublisher) so a publish-side channel
-        # error (e.g. missing reply exchange) cannot interfere with the
-        # consumer's ack flow.
+        # Consumer/topology channel. The publisher uses its own channels
+        # (a small pool, one per publish at a time; see AMQPPublisher) so a
+        # publish-side channel error (e.g. missing reply exchange) cannot
+        # interfere with the consumer's ack flow.
         self.channel: aio_pika.Channel | None = None
         self.consumer: AMQPConsumer | None = None
         self.publisher: AMQPPublisher | None = None
@@ -405,6 +411,16 @@ class DirectTransport(Transport):
         # service consumes again: /ready answers 503 meanwhile.
         self._consumer_cancelled: bool = False
         self._consumer_watch: asyncio.Task[None] | None = None
+        # The consumer channel's protocol-level channel, read through the
+        # client library's get_underlay_channel() (refreshed by the watch
+        # and on every reopen of the channel); the client library's cancel
+        # callback (where it has one) is registered on it.
+        self._consumer_underlay: object | None = None
+        self._cancel_callback_on: object | None = None
+        # The task that waits for the consumer to be back after a cancel.
+        self._consumer_recovery: asyncio.Task[None] | None = None
+        # One WARNING the first time the consumer check cannot run.
+        self._consumer_check_warned: bool = False
 
         # Blob components
         self.azure_client = AzureBlobClient(
@@ -440,6 +456,13 @@ class DirectTransport(Transport):
             # Refuse cleartext AMQP to non-loopback hosts unless
             # explicitly opted in. Raises ValueError on misuse.
             _check_transport_security(self.rabbitmq_url)
+            # A TLS file named in the URL that is missing or unreadable:
+            # one configuration error naming the option, before any
+            # connection attempt (checked here, where the files are opened,
+            # not when the settings are read).
+            parsed_url = urlsplit(str(self.rabbitmq_url))
+            if parsed_url.scheme.lower() == "amqps":
+                check_tls_files(parsed_url.query)
             # Scrub user:password from the URL before logging.
             # KBM_LEDSAS_LOG_LEVEL=DEBUG is exactly the level a stuck
             # customer turns on; the URL in plaintext would put their
@@ -505,15 +528,21 @@ class DirectTransport(Transport):
                 # malformed URL is a ValueError) keeps its own handling.
                 if not _is_connect_failure(e):
                     raise
-                unresolved = _unresolved_host_error(e)
+                unresolved = _unresolved_host_error(e, urlsplit(str(self.rabbitmq_url)).hostname)
                 if unresolved is None and isinstance(e, asyncio.TimeoutError):
                     # A slow or failing name lookup counts in the connect
                     # timeout: tell it apart from a host that does not
                     # answer before blaming a firewall.
                     unresolved = await self._host_lookup_failure()
                 if unresolved is not None:
-                    reason = unresolved
-                elif isinstance(e, asyncio.TimeoutError):
+                    # The reason names the host and what to check: no
+                    # generic advice after it.
+                    raise TransportUnavailable(
+                        "Could not connect to the AMQP broker at "
+                        f"{_scrub_url_credentials(self.rabbitmq_url)}: "
+                        f"{unresolved}."
+                    ) from e
+                if isinstance(e, asyncio.TimeoutError):
                     reason = (
                         f"no answer within {self.connect_timeout:g}s "
                         "(KBM_LEDSAS_CONNECT_TIMEOUT); a firewall may be "
@@ -555,12 +584,16 @@ class DirectTransport(Transport):
             )
 
             # Initialize publisher on the shared connection; each publish
-            # opens its own short-lived channel. The guard bounds its broker
+            # checks out one of its channels. The guard bounds its broker
             # round trips once shutdown begins.
-            self.publisher = AMQPPublisher(self.connection, shutdown_guard=self._shutdown_guard)
+            self.publisher = AMQPPublisher(
+                self.connection,
+                shutdown_guard=self._shutdown_guard,
+                pool_size=self.publish_channels,
+            )
             step = "enabling publisher confirms"
             await self.publisher.enable_confirms()
-            logger.debug("Publisher initialized (transient-channel mode)")
+            logger.debug("Publisher initialized (%d channels)", self.publish_channels)
 
             # Initialize consumer
             step = f"starting to consume from {topology.cmd_queue}"
@@ -574,6 +607,7 @@ class DirectTransport(Transport):
             logger.debug("Consumer started")
             # Notice a cancel of the consumer by the broker (the client
             # library only logs it): see _watch_consumer.
+            await self._refresh_consumer_underlay()
             self._consumer_watch = asyncio.create_task(
                 self._watch_consumer(), name="sdk-consumer-watch"
             )
@@ -1081,8 +1115,21 @@ class DirectTransport(Transport):
             return
         try:
             add(self._on_consumer_channel_closed)
+            reopen = getattr(getattr(channel, "reopen_callbacks", None), "add", None)
+            if reopen is not None and not inspect.iscoroutinefunction(reopen):
+                # A reopened channel has a new protocol-level channel: the
+                # cancel callback goes on it at once (see
+                # _refresh_consumer_underlay).
+                reopen(self._on_consumer_channel_reopened)
         except Exception:  # pragma: no cover - never block startup on logging
             logger.debug("Could not watch the consumer channel", exc_info=True)
+
+    def _on_consumer_channel_reopened(self, *_args: object) -> None:
+        """Reopen callback of the consumer channel. Never raises."""
+        try:
+            asyncio.get_running_loop().create_task(self._refresh_consumer_underlay())
+        except Exception:  # pragma: no cover - a callback must not raise
+            logger.debug("Consumer channel reopen not handled", exc_info=True)
 
     def _on_consumer_channel_closed(
         self, _sender: object, error: BaseException | None = None
@@ -1328,10 +1375,11 @@ class DirectTransport(Transport):
         """
         logger.info("Stopping DirectTransport")
 
-        watch = self._consumer_watch
-        self._consumer_watch = None
-        if watch is not None and not watch.done():
-            watch.cancel()
+        for name in ("_consumer_watch", "_consumer_recovery"):
+            task = getattr(self, name)
+            setattr(self, name, None)
+            if task is not None and not task.done():
+                task.cancel()
 
         step_timeout = self.SHUTDOWN_STEP_TIMEOUT_S
         guard = self._shutdown_guard
@@ -1371,10 +1419,17 @@ class DirectTransport(Transport):
             except Exception:
                 logger.error("Error stopping consumer", exc_info=True)
 
-        # Close consumer/topology channel. Publisher channels are transient
-        # and already closed by AMQPPublisher.publish_*() in their finally.
-        # Skipped when the broker is unreachable: closing the connection
-        # below releases the channel locally without a round trip.
+        # Close the publisher's idle channels, then the consumer/topology
+        # channel. Skipped when the broker is unreachable: closing the
+        # connection below releases the channels locally without a round
+        # trip.
+        if not guard.broker_unreachable and self.publisher is not None:
+            try:
+                await await_bounded(self.publisher.close(), step_timeout)
+            except BROKER_UNREACHABLE_ERRORS as e:
+                guard.mark_unreachable(e)
+            except Exception:
+                logger.debug("Closing the publisher's channels failed", exc_info=True)
         if not guard.broker_unreachable and self.channel and not self.channel.is_closed:
             try:
                 await await_bounded(self.channel.close(), step_timeout)
@@ -1509,7 +1564,9 @@ class DirectTransport(Transport):
         False once the broker cancelled it (Basic.Cancel: the queue was
         deleted, or the queue's node is down), None when it cannot be
         told (not consuming yet, shutting down, the connection or the
-        channel is down, or a test double)."""
+        channel is down, the channel not read yet, or a test double).
+        Reads the protocol-level channel cached by
+        ``_refresh_consumer_underlay``."""
         consumer = self.consumer
         tag = getattr(consumer, "consumer_tag", None)
         if not isinstance(tag, str) or not tag:
@@ -1521,23 +1578,200 @@ class DirectTransport(Transport):
         channel = self.channel
         if channel is None or getattr(channel, "is_closed", True) is not False:
             return None
-        try:
-            underlay = channel.channel
-        except Exception:
+        underlay = self._consumer_underlay
+        if underlay is None or getattr(underlay, "is_closed", False) is True:
             return None
         consumers = getattr(underlay, "consumers", None)
         if not isinstance(consumers, dict):
             return None
         return tag in consumers
 
+    def _warn_consumer_check_once(self, why: str) -> None:
+        if self._consumer_check_warned:
+            return
+        self._consumer_check_warned = True
+        logger.warning(
+            "Cannot check whether the AMQP broker still delivers commands to "
+            "this service (%s): a cancel of the command consumer by the "
+            "broker may go unnoticed.",
+            why,
+        )
+
+    async def _refresh_consumer_underlay(self) -> object | None:
+        """Read the consumer channel's protocol-level channel (cached for
+        ``_consumer_registered``) and register the cancel callback on it
+        where the client library has one. None while it cannot be read (the
+        connection or the channel is down). Never raises."""
+        channel = self.channel
+        if channel is None or self._connection_down():
+            return None
+        if getattr(channel, "is_closed", True) is not False:
+            return None
+        get = getattr(channel, "get_underlay_channel", None)
+        if get is None:
+            self._warn_consumer_check_once("the AMQP client library has no get_underlay_channel()")
+            return None
+        try:
+            underlay = await asyncio.wait_for(
+                get(), timeout=max(0.1, float(self.CONSUMER_CHECK_INTERVAL_S))
+            )
+        except asyncio.CancelledError:
+            raise
+        except (TimeoutError, aiormq.exceptions.AMQPError, ConnectionError):
+            return None  # the channel is being reopened
+        except Exception as e:  # noqa: BLE001 - never crash the watch
+            self._warn_consumer_check_once(_describe_cause(e))
+            return None
+        if not isinstance(getattr(underlay, "consumers", None), dict):
+            self._warn_consumer_check_once(
+                "the AMQP client library's channel has no consumer table"
+            )
+            return None
+        self._consumer_underlay = underlay
+        if underlay is not self._cancel_callback_on:
+            callbacks = getattr(underlay, "on_consumer_cancel_callbacks", None)
+            if callbacks is not None and hasattr(callbacks, "add"):
+                try:
+                    callbacks.add(self._on_consumer_cancel_frame)
+                    self._cancel_callback_on = underlay
+                except Exception:  # pragma: no cover - keep the poll
+                    logger.debug("Cancel callback not registered", exc_info=True)
+        return underlay
+
+    def _on_consumer_cancel_frame(self, frame: object) -> None:
+        """The client library's consumer-cancel callback (aiormq 7 and
+        later): a Basic.Cancel from the broker. Reports a cancel of the
+        command consumer at once and waits for it to be back (see
+        ``_recover_consumer``). Never raises."""
+        try:
+            consumer = self.consumer
+            tag = getattr(consumer, "consumer_tag", None)
+            if (
+                not tag
+                or getattr(frame, "consumer_tag", None) != tag
+                or self._shutdown_guard.stopping
+                or getattr(consumer, "consuming_stopped", False) is True
+                or self._consumer_cancelled
+            ):
+                return
+            self._report_consumer_cancelled()
+            self._consumer_recovery = asyncio.get_running_loop().create_task(
+                self._recover_consumer(), name="sdk-consumer-recovery"
+            )
+        except Exception:  # pragma: no cover - a callback must not raise
+            logger.debug("Consumer cancel not handled", exc_info=True)
+
+    def _queue_name(self) -> str:
+        return getattr(getattr(self.consumer, "queue", None), "name", "the command queue")
+
+    def _report_consumer_cancelled(self) -> None:
+        """One ERROR, and /ready answers 503 until consuming again."""
+        queue_name = self._queue_name()
+        self._consumer_cancelled = True
+        logger.error(
+            "The AMQP broker cancelled the command consumer on %s (the queue "
+            "was deleted, or the node that holds it is down): no command "
+            "arrives, and /ready answers 503. Declaring the queue again and "
+            "consuming again.",
+            queue_name,
+            extra={"queue": queue_name},
+        )
+
+    def _report_consuming_again(self) -> None:
+        self._consumer_cancelled = False
+        queue_name = self._queue_name()
+        logger.info(
+            "Consuming commands from %s again",
+            queue_name,
+            extra={"queue": queue_name},
+        )
+
+    def _library_restores_consumers(self) -> bool:
+        """True when the client library restores a consumer the broker
+        cancelled by itself (aio-pika 10's robust channel, once the queue
+        exists again)."""
+        return callable(getattr(self.channel, "_restore_missing_consumers", None))
+
+    async def _recover_consumer(self) -> None:
+        """After a cancel reported by the client library's callback, wait
+        for the consumer to be back, counting only the time the connection
+        is up.
+
+        Where the client library restores the consumer itself (aio-pika
+        10, under the same tag, retrying until the queue exists), the
+        service does not consume a second time: after
+        2 x ``CONSUMER_CHECK_INTERVAL_S`` it declares its exchanges and
+        queues again, so that the library's restore can succeed, and waits
+        for it (consuming itself only if the consumer is still not back
+        ``CONSUMER_RETRY_MAX_S`` later). Otherwise it declares and consumes
+        again itself (``_consume_again``). One INFO once consuming again."""
+        try:
+            waited = 0.0
+            declared_at: float | None = None
+            delay = float(self.CONSUMER_CHECK_INTERVAL_S)
+            next_declare = 2 * float(self.CONSUMER_CHECK_INTERVAL_S)
+            step = max(0.01, min(0.25, float(self.CONSUMER_CHECK_INTERVAL_S) / 4))
+            while not self._shutdown_guard.stopping:
+                await asyncio.sleep(step)
+                if self._connection_down():
+                    continue  # the client library is reconnecting
+                # The cached channel first: the library restores the
+                # consumer on the same channel, and reading the channel
+                # again can wait on the library's own recovery.
+                registered = self._consumer_registered()
+                if registered is not True:
+                    await self._refresh_consumer_underlay()
+                    registered = self._consumer_registered()
+                if registered is True:
+                    self._report_consuming_again()
+                    return
+                if registered is None:
+                    continue
+                waited += step
+                if not self._library_restores_consumers():
+                    if waited >= 2 * float(self.CONSUMER_CHECK_INTERVAL_S):
+                        await self._consume_again(report=False)
+                        return
+                    continue
+                if declared_at is None and waited >= next_declare:
+                    try:
+                        await declare_topology(
+                            channel=self.channel,
+                            service_name=self.service_name,
+                            tenant=self.tenant,
+                        )
+                        declared_at = waited
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning(
+                            "Could not declare %s again (%s); retrying in %g s",
+                            self._queue_name(),
+                            _describe_cause(e),
+                            delay,
+                            extra={"queue": self._queue_name(), "error_class": type(e).__name__},
+                        )
+                        next_declare = waited + delay
+                        delay = min(delay * 2, self.CONSUMER_RETRY_MAX_S)
+                elif declared_at is not None and waited - declared_at >= float(
+                    self.CONSUMER_RETRY_MAX_S
+                ):
+                    await self._consume_again(report=False)
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - never crash the service
+            logger.debug("The consumer recovery stopped", exc_info=True)
+
     async def _watch_consumer(self) -> None:
         """Notice a cancel of the command consumer by the broker.
 
         The broker cancels a consumer when its queue is deleted (another
         client deleted it, even if it re-created it at once) or the node
-        holding a classic queue goes down. The client library then only
-        logs a WARNING of its own, and the service would consume nothing
-        while ``/ready`` kept answering 200. Checked every
+        holding a classic queue goes down. Where the client library calls
+        back on a cancel (aiormq 7 and later) the callback reports it at
+        once (see ``_on_consumer_cancel_frame``). As a fallback on every
+        version, the consumer's tag is checked every
         ``CONSUMER_CHECK_INTERVAL_S`` (twice in a row, so a reconnect in
         progress is not mistaken for it): one ERROR, ``/ready`` answers
         503, and the service declares its exchanges and queues again and
@@ -1547,6 +1781,11 @@ class DirectTransport(Transport):
         try:
             while not self._shutdown_guard.stopping:
                 await asyncio.sleep(self.CONSUMER_CHECK_INTERVAL_S)
+                await self._refresh_consumer_underlay()
+                recovery = self._consumer_recovery
+                if self._consumer_cancelled and recovery is not None and not recovery.done():
+                    misses = 0
+                    continue  # the callback path handles this cancel
                 registered = self._consumer_registered()
                 if registered is False:
                     misses += 1
@@ -1560,22 +1799,17 @@ class DirectTransport(Transport):
         except Exception:  # pragma: no cover - the watch must never crash the service
             logger.debug("The consumer watch stopped", exc_info=True)
 
-    async def _consume_again(self) -> None:
+    async def _consume_again(self, report: bool = True) -> None:
         """After the broker cancelled the command consumer: declare the
-        topology again and consume again (see ``_watch_consumer``)."""
+        topology again and consume again (see ``_watch_consumer``).
+        ``report=False``: the cancel was already reported."""
         consumer = self.consumer
         if consumer is None or self.channel is None:
             return
-        queue_name = getattr(getattr(consumer, "queue", None), "name", "the command queue")
+        queue_name = self._queue_name()
+        if report:
+            self._report_consumer_cancelled()
         self._consumer_cancelled = True
-        logger.error(
-            "The AMQP broker cancelled the command consumer on %s (the queue "
-            "was deleted, or the node that holds it is down): no command "
-            "arrives, and /ready answers 503. Declaring the queue again and "
-            "consuming again.",
-            queue_name,
-            extra={"queue": queue_name},
-        )
         delay = self.CONSUMER_CHECK_INTERVAL_S
         while not self._shutdown_guard.stopping:
             try:
@@ -1584,7 +1818,11 @@ class DirectTransport(Transport):
                     service_name=self.service_name,
                     tenant=self.tenant,
                 )
-                await consumer.consume_again()
+                # The client library may have restored the consumer
+                # meanwhile: never consume twice under one tag.
+                await self._refresh_consumer_underlay()
+                if self._consumer_registered() is not True:
+                    await consumer.consume_again()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1598,12 +1836,7 @@ class DirectTransport(Transport):
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self.CONSUMER_RETRY_MAX_S)
                 continue
-            self._consumer_cancelled = False
-            logger.info(
-                "Consuming commands from %s again",
-                queue_name,
-                extra={"queue": queue_name},
-            )
+            self._report_consuming_again()
             return
 
     def get_retry_count(self, message_id: str) -> int:

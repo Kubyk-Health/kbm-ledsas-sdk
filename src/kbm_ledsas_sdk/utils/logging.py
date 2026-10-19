@@ -600,6 +600,20 @@ def redact_secrets(text: str) -> str:
     return text
 
 
+def mask_configured_secrets(text: str) -> str:
+    """``text`` with only the secrets the SDK is configured with masked
+    (``***``; see :func:`register_secret`), and no pattern-based masking:
+    for texts a handler wrote for the caller (a ``user_message``, a status
+    ``stage`` / ``note``), which reach the caller as written otherwise."""
+    if not isinstance(text, str) or not _REGISTERED_SECRETS:
+        return text
+    # Longest first, so a secret that contains another is masked whole.
+    for secret in sorted(_REGISTERED_SECRETS, key=len, reverse=True):
+        if secret in text:
+            text = text.replace(secret, "***")
+    return text
+
+
 def register_secret(value: Any) -> None:
     """Mask ``value`` (and its percent-encoded and percent-decoded forms)
     wherever a record or a reply text quotes it, in addition to the
@@ -1047,7 +1061,18 @@ def json_log_formatter(datefmt: str | None = None) -> logging.Formatter:
     Returns:
         A ``logging.Formatter`` that emits one JSON object per record,
         including every caller-supplied ``extra={...}`` key.
+
+    Raises:
+        TypeError: ``datefmt`` is not a ``str`` (or None). Every record
+            would otherwise fail to format and be dropped.
     """
+    if datefmt is not None and not isinstance(datefmt, str):
+        from ..models.errors import ArgumentTypeError
+
+        raise ArgumentTypeError(
+            "json_log_formatter(datefmt=...): datefmt is a strftime format "
+            f"string (or None), got {type(datefmt).__name__}"
+        )
     return JSONFormatter(datefmt=datefmt)
 
 

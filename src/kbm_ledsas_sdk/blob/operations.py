@@ -9,6 +9,7 @@ import functools
 import inspect
 import json
 import math
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterable, AsyncIterator, Callable
 from typing import Any, Union
@@ -339,19 +340,43 @@ def _replace_non_finite(value: Any) -> Any:
     return value
 
 
+def _json_dumps_as_reply(obj: Any) -> str:
+    """``obj`` as JSON text by the rules of a reply payload (a datetime, a
+    UUID, a Decimal, a set, a dataclass, an Enum, a pydantic model, ...
+    have a JSON form; binary data does not). Raises when it has none."""
+    from ..runtime.handler import _JSONABLE, _normalize_result
+
+    normalized = _normalize_result(obj, "obj", set())
+    return json.dumps(_JSONABLE.dump_python(normalized, mode="json"), allow_nan=False)
+
+
 def _json_dumps_for_blob(obj: Any) -> str:
     """Standard JSON (RFC 8259) for ``upload_json``: NaN and Infinity,
     which have no JSON form, are written as ``null``, as in replies.
-    Text with a lone surrogate (which UTF-8 cannot encode) is refused with
-    a ValueError naming where it is, as in replies. Other ``json.dumps``
-    errors (an object with no JSON form, a circular reference) propagate
-    unchanged."""
+    A value ``json.dumps`` has no form for is written as a reply writes it
+    (a datetime as ISO 8601 text, a UUID or a Decimal as text, a set as an
+    array, a dataclass or a pydantic model as an object, ...), so
+    ``upload_json`` accepts what a reply accepts. Text with a lone
+    surrogate (which UTF-8 cannot encode) is refused with a ValueError
+    naming where it is, as in replies. A value with no JSON form at all
+    (and a circular reference) raises the ``json.dumps`` error unchanged."""
     try:
         text = json.dumps(obj, allow_nan=False)
+    except TypeError as e:
+        try:
+            text = _json_dumps_as_reply(obj)
+        except Exception:  # noqa: BLE001 - no reply form either
+            raise e from None
     except ValueError as e:
         if "Out of range float values" not in str(e):
             raise
-        text = json.dumps(_replace_non_finite(obj), allow_nan=False)
+        try:
+            text = json.dumps(_replace_non_finite(obj), allow_nan=False)
+        except TypeError:
+            try:
+                text = _json_dumps_as_reply(obj)
+            except Exception:  # noqa: BLE001 - no reply form either
+                raise e from None
     # json.dumps writes every non-ASCII character as an escape, so a lone
     # surrogate can only be present when the text holds "\ud".
     if "\\ud" in text:
@@ -764,6 +789,10 @@ def parse_allowed_containers(raw: str | None) -> "frozenset[str] | None":
     return frozenset(names)
 
 
+# AllowedContainersBlobOperations -> the operations it restricts.
+_UNRESTRICTED: "weakref.WeakKeyDictionary[Any, BlobOperations]" = weakref.WeakKeyDictionary()
+
+
 class AllowedContainersBlobOperations(BlobOperations):
     """``ctx.blob`` when ``KBM_LEDSAS_ALLOWED_CONTAINERS`` is set: every
     operation first checks that its container (the ``container`` argument
@@ -773,7 +802,9 @@ class AllowedContainersBlobOperations(BlobOperations):
     unchanged."""
 
     def __init__(self, inner: BlobOperations, allowed: "frozenset[str]") -> None:
-        self._inner = inner
+        # The unrestricted operations are kept outside the instance, so no
+        # attribute of ``ctx.blob`` hands them out (see __getattr__).
+        _UNRESTRICTED[self] = inner
         self._allowed = frozenset(allowed)
 
     @property
@@ -808,13 +839,13 @@ class AllowedContainersBlobOperations(BlobOperations):
         return ref
 
     async def download_bytes(self, blob_ref: str | BlobRef) -> bytes:
-        return await self._inner.download_bytes(self._ref(blob_ref, "download"))
+        return await _UNRESTRICTED[self].download_bytes(self._ref(blob_ref, "download"))
 
     async def download_json(self, blob_ref: str | BlobRef) -> JSONValue:
-        return await self._inner.download_json(self._ref(blob_ref, "download"))
+        return await _UNRESTRICTED[self].download_json(self._ref(blob_ref, "download"))
 
     async def download_text(self, blob_ref: str | BlobRef) -> str:
-        return await self._inner.download_text(self._ref(blob_ref, "download"))
+        return await _UNRESTRICTED[self].download_text(self._ref(blob_ref, "download"))
 
     async def download_stream(
         self,
@@ -823,7 +854,7 @@ class AllowedContainersBlobOperations(BlobOperations):
         progress_callback: DownloadProgressCallback | None = None,
     ) -> AsyncIterator[bytes]:
         ref = self._ref(blob_ref, "download")
-        async for chunk in self._inner.download_stream(
+        async for chunk in _UNRESTRICTED[self].download_stream(
             ref, chunk_size=chunk_size, progress_callback=progress_callback
         ):
             yield chunk
@@ -836,7 +867,7 @@ class AllowedContainersBlobOperations(BlobOperations):
         overwrite: bool = False,
     ) -> BlobRef:
         self._require(container, "upload")
-        return await self._inner.upload_bytes(container, data, path, overwrite=overwrite)
+        return await _UNRESTRICTED[self].upload_bytes(container, data, path, overwrite=overwrite)
 
     async def upload_json(
         self,
@@ -846,7 +877,7 @@ class AllowedContainersBlobOperations(BlobOperations):
         overwrite: bool = False,
     ) -> BlobRef:
         self._require(container, "upload")
-        return await self._inner.upload_json(container, obj, path, overwrite=overwrite)
+        return await _UNRESTRICTED[self].upload_json(container, obj, path, overwrite=overwrite)
 
     async def upload_text(
         self,
@@ -856,7 +887,7 @@ class AllowedContainersBlobOperations(BlobOperations):
         overwrite: bool = False,
     ) -> BlobRef:
         self._require(container, "upload")
-        return await self._inner.upload_text(container, text, path, overwrite=overwrite)
+        return await _UNRESTRICTED[self].upload_text(container, text, path, overwrite=overwrite)
 
     async def upload_stream(
         self,
@@ -867,30 +898,41 @@ class AllowedContainersBlobOperations(BlobOperations):
         overwrite: bool = False,
     ) -> BlobRef:
         self._require(container, "upload")
-        return await self._inner.upload_stream(
+        return await _UNRESTRICTED[self].upload_stream(
             container, stream, path, progress_callback=progress_callback, overwrite=overwrite
         )
 
     def __getattr__(self, name: str) -> Any:
-        # Anything else (an implementation's own attribute) is the
-        # underlying operations'. An implementation's own public coroutine
-        # method that names a container or a blob (a ``container`` or a
-        # ``blob_ref`` parameter, as the methods above do) is checked the
-        # same way before it runs, so no method of ``ctx.blob`` reaches a
-        # container outside the list.
-        attr = getattr(self._inner, name)
-        if name.startswith("_") or not inspect.iscoroutinefunction(attr):
-            return attr
+        # Only the blob operations are forwarded: an implementation's own
+        # public coroutine method that names a container or a blob (a
+        # ``container`` or a ``blob_ref`` parameter, as the methods above
+        # do) is checked the same way before it runs. Any other attribute
+        # of the underlying operations (its storage client, its private
+        # state, a method that names no container) is not available, so no
+        # attribute of ``ctx.blob`` reaches a container outside the list.
+        refused = AttributeError(
+            f"ctx.blob has no attribute {name!r} while {ALLOWED_CONTAINERS_ENV} "
+            "is set: only the blob operations are available"
+        )
+        if name.startswith("_"):
+            raise refused
+        try:
+            unrestricted = _UNRESTRICTED[self]
+        except KeyError:
+            raise refused from None
+        attr = getattr(unrestricted, name)
+        if not inspect.iscoroutinefunction(attr):
+            raise refused
         try:
             signature = inspect.signature(attr)
         except (TypeError, ValueError):
-            return attr
+            raise refused from None
         if "container" in signature.parameters:
             target = "container"
         elif "blob_ref" in signature.parameters:
             target = "blob_ref"
         else:
-            return attr
+            raise refused
 
         @functools.wraps(attr)
         async def checked(*args: Any, **kwargs: Any) -> Any:

@@ -372,6 +372,11 @@ class BlobRef(BaseModel):
             raise TypeError("BlobRef.copy() takes no include / exclude (uri is its only field)")
         return self.model_copy(update=update, deep=deep)
 
+    def __replace__(self, **changes: Any) -> "BlobRef":
+        """``copy.replace(ref, uri=...)`` (Python 3.13): the same as
+        ``model_copy(update={...})``, on every supported pydantic version."""
+        return self.model_copy(update=changes)
+
     @classmethod
     def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> "BlobRef":
         """Build a BlobRef from ``uri=...``, checked as :meth:`from_uri`

@@ -100,7 +100,7 @@ class Response(_ValidatedCopyModel):
           },
           "payload": {
             "error": {
-              "code": "BadInput",
+              "code": "Permanent",
               "message": "Missing required field",
               "retryable": false
             }

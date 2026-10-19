@@ -19,9 +19,13 @@ import asyncio
 import collections
 import collections.abc
 import dataclasses
+import decimal
 import enum
+import fractions
 import inspect
+import ipaddress
 import json
+import math
 import os
 import re
 import sys
@@ -30,7 +34,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from ..blob.operations import (
     NON_RETRYABLE_MARKER,
@@ -40,19 +44,30 @@ from ..blob.operations import (
     _mark_non_retryable,
 )
 from ..models.envelope import Envelope
-from ..models.errors import ArgumentTypeError, DeadlineExceeded, Permanent, Retryable
+from ..models.errors import (
+    ArgumentTypeError,
+    ContainerNotAllowed,
+    DeadlineExceeded,
+    Permanent,
+    Retryable,
+)
 from ..models.messages import Command, Response
 
 # _command_fields: the identity of a command on every per-command record
 # (correlation_id, message_id, command_name, trace_id, idempotency_key and
 # job_id); imported from here by the service layer too.
-from ..utils.logging import _command_fields, masked_logger, redact_secrets
+from ..utils.logging import _command_fields, mask_configured_secrets, masked_logger, redact_secrets
 from .context import ExecutionContext
 
-# Type alias for handler functions. A handler returns a JSON-serializable
-# dict (the reply payload); returning None is accepted and treated as an
-# empty result ({}), which suits fire-and-forget handlers.
-HandlerFunc = Callable[[ExecutionContext, dict[str, Any]], Awaitable[dict[str, Any] | None]]
+# Type alias for handler functions (also the bound of ServiceApp.handler's
+# type variable). A handler is called with (ctx, payload) and returns a
+# JSON-serializable dict (the reply payload); returning None is accepted
+# and treated as an empty result ({}), which suits fire-and-forget
+# handlers. The payload is Any (a handler may annotate it as a dict, a
+# TypedDict or a model); the result is dict[Any, Any] so the documented
+# non-str keys type-check, and a read-only Mapping (refused at run time) is
+# a type error.
+HandlerFunc = Callable[[ExecutionContext, Any], Awaitable[dict[Any, Any] | None]]
 
 # A handler's exception text is quoted by this logger's records (internal
 # message, error message, traceback): secrets in it are masked by default,
@@ -255,7 +270,11 @@ def _normalize_result(value: Any, path: str, active: set[int]) -> Any:
     dicts, lists, tuples, sets, frozensets, deques, a dataclass's fields
     (the dataclass becomes the dict of its fields), an ``Enum``'s value, and
     generators and other iterators, which are read here once into a list
-    (the reply carries that list, so they are never read twice). A pydantic
+    (the reply carries that list, so they are never read twice). A deque
+    becomes a list, and a ``Fraction``, a ``complex`` and an IP address,
+    network or interface become their text (:func:`_text_form`), here
+    rather than in the serializer, so the reply is the same on every
+    supported pydantic version. A pydantic
     model (or pydantic dataclass) is not walked: it is written with its own
     serialization settings. Other containers are copied only where
     something changes.
@@ -309,6 +328,10 @@ def _normalize_result(value: Any, path: str, active: set[int]) -> Any:
                         items[i] = new_item
         finally:
             active.discard(id(value))
+        if isinstance(value, collections.deque):
+            # Written as a list by the SDK itself, the same on every
+            # pydantic version.
+            return list(value) if items is None else items
         return value if items is None else items
     if hasattr(type(value), "__pydantic_serializer__"):
         # A pydantic model or pydantic dataclass: its own serializer and
@@ -321,6 +344,17 @@ def _normalize_result(value: Any, path: str, active: set[int]) -> Any:
             return value
         new_inner = _normalize_result(inner, f"{path}.value", active)
         return value if new_inner is inner else new_inner
+    if isinstance(value, _TEXT_FORM_TYPES):
+        # A Fraction, an IP address / network / interface or a complex
+        # number: written as text by the SDK itself, the same on every
+        # pydantic version ("1/3", "10.0.0.0/8", "1j").
+        try:
+            return _text_form(value)
+        except Exception as e:
+            raise _ResultProblem(
+                f"{path}: writing this {_type_name(value)} as text raised "
+                f"{type(e).__name__}: {_short_text(e)}"
+            ) from None
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         # Written as a JSON object of its fields, in their order: it is
         # replaced by that dict (the same JSON), so the later checks of
@@ -369,8 +403,64 @@ _SEQUENCES = (list, tuple, set, frozenset, collections.deque)
 # Types whose values hold nothing to walk (no key, no binary data).
 _LEAF_TYPES = frozenset({str, int, float, bool, type(None)})
 
+# Values written as text (_text_form). IPv4Interface / IPv6Interface are
+# subclasses of the address classes.
+_TEXT_FORM_TYPES = (
+    fractions.Fraction,
+    complex,
+    ipaddress.IPv4Address,
+    ipaddress.IPv6Address,
+    ipaddress.IPv4Network,
+    ipaddress.IPv6Network,
+)
+
 # The types _normalize_result looks into, besides dataclass instances.
-_WALKED_TYPES = (dict, *_SEQUENCES, *_BINARY, enum.Enum, collections.abc.Iterator)
+_WALKED_TYPES = (
+    dict,
+    *_SEQUENCES,
+    *_BINARY,
+    enum.Enum,
+    collections.abc.Iterator,
+    *_TEXT_FORM_TYPES,
+)
+
+
+def _float_text(x: float) -> str:
+    """``x`` without an exponent (``1e+20`` -> ``100000000000000000000``,
+    ``1.0`` -> ``1``, ``nan`` -> ``NaN``, ``inf`` -> ``inf``)."""
+    if x != x:
+        return "NaN"
+    if x in (float("inf"), float("-inf")):
+        return "inf" if x > 0 else "-inf"
+    text = format(decimal.Decimal(repr(x)), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _complex_text(value: complex) -> str:
+    """A complex number as text: ``1j``, ``1.5+0j``, ``1-2j`` (the real
+    part only when it is not 0)."""
+    real, imag = float(value.real), float(value.imag)
+    text = f"{_float_text(imag)}j"
+    if real != 0.0:
+        # The imaginary part's own text carries its minus sign (-0 too).
+        sign = "" if not math.isnan(imag) and math.copysign(1.0, imag) < 0 else "+"
+        text = f"{_float_text(real)}{sign}{text}"
+    return text
+
+
+def _text_form(value: Any) -> str:
+    """The text a value of _TEXT_FORM_TYPES is written as."""
+    if isinstance(value, complex):
+        return _complex_text(value)
+    if isinstance(value, fractions.Fraction):
+        return (
+            f"{value.numerator}/{value.denominator}"
+            if value.denominator != 1
+            else str(value.numerator)
+        )
+    return str(value)
 
 
 def _walked(value: Any) -> bool:
@@ -540,6 +630,9 @@ def _non_retryable_reason(exc: BaseException) -> str | None:
         and status not in _RETRYABLE_4XX
     ):
         return f"blob storage rejected the request (HTTP {status}, {type(exc).__name__})"
+    frozen = _frozen_model_reason(exc)
+    if frozen is not None:
+        return frozen
     if isinstance(exc, ValidationError) and getattr(exc, "title", "") == "BlobRef":
         errors = exc.errors()
         msg = str(errors[0].get("msg", "")) if errors else ""
@@ -550,7 +643,82 @@ def _non_retryable_reason(exc: BaseException) -> str | None:
     marker = getattr(exc, NON_RETRYABLE_MARKER, None)
     if isinstance(marker, str) and marker:
         return marker
+    # Every ContainerNotAllowed is permanent, also one the handler raised
+    # (or re-raised) itself: the allowlist does not change between attempts.
+    if isinstance(exc, ContainerNotAllowed):
+        container = str(getattr(exc, "container", ""))[:80]
+        return f"container {container!r} is not allowed (KBM_LEDSAS_ALLOWED_CONTAINERS)"
     return None
+
+
+def _sdk_model_names() -> "frozenset[str]":
+    from .. import models
+
+    names = set()
+    for name in dir(models):
+        value = getattr(models, name, None)
+        if isinstance(value, type) and issubclass(value, BaseModel):
+            names.add(value.__name__)
+    return frozenset(names)
+
+
+def _frozen_model_reason(exc: BaseException) -> str | None:
+    """The reason for an assignment to a field of an SDK model (they are
+    read-only), else None: the same assignment fails on every attempt."""
+    if not isinstance(exc, ValidationError):
+        return None
+    title = getattr(exc, "title", "")
+    try:
+        errors = exc.errors()
+    except Exception:  # pragma: no cover - a broken error object
+        return None
+    if (
+        not errors
+        or any(e.get("type") not in ("frozen_instance", "frozen_field") for e in errors)
+        or title not in _sdk_model_names()
+    ):
+        return None
+    fields = ", ".join(
+        ".".join(str(p) for p in e.get("loc", ()) if p is not None) or "?" for e in errors
+    )
+    return (
+        f"SDK models are read-only (assignment to {title}.{fields}): " "use model_copy(update=...)"
+    )
+
+
+def _sdk_group_leaf(exc: BaseException) -> BaseException | None:
+    """For an exception group whose leaves are all SDK errors (``Permanent``,
+    ``DeadlineExceeded``, ``Retryable``, ``ContainerNotAllowed``): its most
+    severe leaf (the first of the highest rank), else None."""
+    if not isinstance(exc, BaseExceptionGroup):
+        return None
+    leaves: list[BaseException] = []
+
+    def walk(group: BaseExceptionGroup) -> None:
+        for item in group.exceptions:
+            if isinstance(item, BaseExceptionGroup):
+                walk(item)
+            else:
+                leaves.append(item)
+
+    walk(exc)
+    if not leaves:
+        return None
+
+    def rank(leaf: BaseException) -> int:
+        if isinstance(leaf, (Permanent, ContainerNotAllowed)):
+            return 3
+        if isinstance(leaf, DeadlineExceeded):
+            return 2
+        if isinstance(leaf, Retryable):
+            return 1
+        return 0
+
+    ranks = [rank(leaf) for leaf in leaves]
+    if min(ranks) == 0:
+        return None
+    best = max(ranks)
+    return leaves[ranks.index(best)]
 
 
 def _not_async_reason(handler: Any) -> str | None:
@@ -636,6 +804,45 @@ def _call_signature_problem(func: Any, arguments: int) -> str | None:
     return None
 
 
+def _check_command_name_and_version(command_name: object, version: object) -> None:
+    """Raise as ``HandlerRegistry.register`` does for a command name or a
+    message version a command envelope cannot carry (``ServiceApp.handler``
+    calls it at once, before it returns the decorator)."""
+    if callable(command_name) and not isinstance(command_name, str):
+        raise ArgumentTypeError(
+            "app.handler takes the command name: use "
+            '@app.handler("ProcessDataset") (with parentheses and the '
+            f"command name), not @app.handler; got {type(command_name).__name__}"
+        )
+    if not isinstance(command_name, str):
+        raise ArgumentTypeError(
+            f"Invalid command name {command_name!r}: a command name is a "
+            f"string (a letter followed by letters, digits or underscores, "
+            f"e.g. 'ProcessDataset'), got {type(command_name).__name__}"
+        )
+    if not isinstance(version, str):
+        raise ArgumentTypeError(
+            f"Invalid message version {version!r} for {command_name}: a "
+            f"version is a string such as '1.0', got {type(version).__name__}"
+        )
+    if len(command_name) > _COMMAND_NAME_MAX_LENGTH or not _COMMAND_NAME_PATTERN.fullmatch(
+        command_name
+    ):
+        raise ValueError(
+            f"Invalid command name {command_name!r}: use a letter "
+            f"followed by letters, digits or underscores (at most "
+            f"{_COMMAND_NAME_MAX_LENGTH} characters), e.g. "
+            f"'ProcessDataset' or 'process_data'. Command envelopes "
+            f"with any other name are rejected, so the handler could "
+            f"never be called."
+        )
+    if not _MESSAGE_VERSION_PATTERN.fullmatch(version):
+        raise ValueError(
+            f"Invalid message version {version!r} for {command_name}: "
+            f"use '<major>.<minor>' digits, e.g. '1.0'."
+        )
+
+
 class HandlerRegistry:
     """
     Registry for command handlers.
@@ -704,33 +911,7 @@ class HandlerRegistry:
         Example:
             registry.register("ProcessDataset", "1.0", my_handler)
         """
-        if not isinstance(command_name, str):
-            raise ArgumentTypeError(
-                f"Invalid command name {command_name!r}: a command name is a "
-                f"string (a letter followed by letters, digits or underscores, "
-                f"e.g. 'ProcessDataset'), got {type(command_name).__name__}"
-            )
-        if not isinstance(version, str):
-            raise ArgumentTypeError(
-                f"Invalid message version {version!r} for {command_name}: a "
-                f"version is a string such as '1.0', got {type(version).__name__}"
-            )
-        if len(command_name) > _COMMAND_NAME_MAX_LENGTH or not _COMMAND_NAME_PATTERN.fullmatch(
-            command_name
-        ):
-            raise ValueError(
-                f"Invalid command name {command_name!r}: use a letter "
-                f"followed by letters, digits or underscores (at most "
-                f"{_COMMAND_NAME_MAX_LENGTH} characters), e.g. "
-                f"'ProcessDataset' or 'process_data'. Command envelopes "
-                f"with any other name are rejected, so the handler could "
-                f"never be called."
-            )
-        if not _MESSAGE_VERSION_PATTERN.fullmatch(version):
-            raise ValueError(
-                f"Invalid message version {version!r} for {command_name}: "
-                f"use '<major>.<minor>' digits, e.g. '1.0'."
-            )
+        _check_command_name_and_version(command_name, version)
         not_async = _not_async_reason(handler)
         if not_async is not None:
             raise TypeError(
@@ -827,7 +1008,10 @@ class HandlerRegistry:
         if user_message is _UNUSABLE_USER_MESSAGE:
             return GENERIC_ERROR_MESSAGES.get(code, "An error occurred")
         if isinstance(user_message, str):
-            return _encodable_text(user_message)
+            # The handler's own text, sent as written, except the secrets
+            # the SDK is configured with (the broker password, a storage
+            # key or SAS signature): those never leave the process.
+            return mask_configured_secrets(_encodable_text(user_message))
         if self._generic_errors:
             return GENERIC_ERROR_MESSAGES.get(code, "An error occurred")
         # The internal text goes to the caller: mask the secrets it may
@@ -1094,50 +1278,10 @@ class HandlerRegistry:
             )
 
         except Retryable as e:
-            # Retryable error - will be retried with backoff. Caller-controlled
-            # text travels via extra={"error_message": ...}: the JSON
-            # formatter escapes any control characters, and the text
-            # formatter escapes them in its key=value pairs.
-            text = _safe_str(e)
-            logger.warning(
-                "Retryable error in handler",
-                extra={
-                    **_command_fields(envelope),
-                    "error_message": text,
-                    **_attempt_fields(final_attempt, attempt),
-                },
-            )
-            return self._error_outcome(
-                envelope,
-                {
-                    "code": "Retryable",
-                    "message": self._get_error_message("Retryable", text, _safe_user_message(e)),
-                    "retryable": True,
-                },
-                error_class=type(e).__name__,
-                error_message=text,
-            )
+            return self._retryable_outcome(e, envelope, final_attempt, attempt)
 
         except Permanent as e:
-            # Permanent error - goes to DLQ. See Retryable branch above for
-            # why ``error_message`` rides in ``extra`` rather than the
-            # message string.
-            text = _safe_str(e)
-            logger.error(
-                "Permanent error in handler",
-                extra={
-                    **_command_fields(envelope),
-                    "error_message": text,
-                },
-            )
-            return self._error_outcome(
-                envelope,
-                {
-                    "code": "Permanent",
-                    "message": self._get_error_message("Permanent", text, _safe_user_message(e)),
-                    "retryable": False,
-                },
-            )
+            return self._permanent_outcome(e, envelope)
 
         except DeadlineExceeded as e:
             # Deadline exceeded - NOT retryable (deadline already passed).
@@ -1189,6 +1333,19 @@ class HandlerRegistry:
             )
 
         except Exception as e:
+            # An exception group (asyncio.TaskGroup, ExceptionGroup) whose
+            # leaves are all SDK errors is classified like its most severe
+            # leaf: Permanent (or ContainerNotAllowed), then
+            # DeadlineExceeded, then Retryable.
+            leaf = _sdk_group_leaf(e)
+            if isinstance(leaf, Permanent):
+                return self._permanent_outcome(leaf, envelope)
+            if isinstance(leaf, DeadlineExceeded):
+                return self._deadline_exceeded_outcome(envelope, leaf)
+            if isinstance(leaf, Retryable):
+                return self._retryable_outcome(leaf, envelope, final_attempt, attempt)
+            if leaf is not None:
+                e = leaf  # ContainerNotAllowed: classified below
             # Uncaught exceptions that can never succeed on a retry
             # (missing blob, invalid blob URI, non-JSON blob content in
             # download_json — see _non_retryable_reason) are classified
@@ -1231,6 +1388,54 @@ class HandlerRegistry:
             # one reply - so it can never leave the command unsettled.
             internal_msg = f"Unexpected error ({type(e).__name__}): {_safe_str(e)}"
             return self._unexpected_error_outcome(e, envelope, internal_msg, final_attempt, attempt)
+
+    def _retryable_outcome(
+        self, e: Retryable, envelope: Envelope, final_attempt: Any, attempt: Any
+    ) -> HandlerOutcome:
+        """A ``Retryable`` the handler raised: retried with backoff.
+        Caller-controlled text travels via extra={"error_message": ...}:
+        the JSON formatter escapes any control characters, and the text
+        formatter escapes them in its key=value pairs."""
+        text = _safe_str(e)
+        logger.warning(
+            "Retryable error in handler",
+            extra={
+                **_command_fields(envelope),
+                "error_message": text,
+                **_attempt_fields(final_attempt, attempt),
+            },
+        )
+        return self._error_outcome(
+            envelope,
+            {
+                "code": "Retryable",
+                "message": self._get_error_message("Retryable", text, _safe_user_message(e)),
+                "retryable": True,
+            },
+            error_class=type(e).__name__,
+            error_message=text,
+        )
+
+    def _permanent_outcome(self, e: Permanent, envelope: Envelope) -> HandlerOutcome:
+        """A ``Permanent`` the handler raised: goes to the DLQ. See
+        ``_retryable_outcome`` for why ``error_message`` rides in
+        ``extra`` rather than the message string."""
+        text = _safe_str(e)
+        logger.error(
+            "Permanent error in handler",
+            extra={
+                **_command_fields(envelope),
+                "error_message": text,
+            },
+        )
+        return self._error_outcome(
+            envelope,
+            {
+                "code": "Permanent",
+                "message": self._get_error_message("Permanent", text, _safe_user_message(e)),
+                "retryable": False,
+            },
+        )
 
     def _error_outcome(
         self,

@@ -43,6 +43,20 @@ def section(text: str, heading: str, level: int = 2) -> str:
     return "\n".join(out) + "\n"
 
 
+# Directories a repository scan skips: git's own, virtual environments and
+# build output (a clone that followed the example README has a .venv in it).
+SKIPPED_DIRS = {".git", ".venv", "venv", "build", "dist", ".tox", "node_modules", "__pycache__"}
+
+
+def repository_files(base: Path, pattern: str = "*", root: Path = ROOT) -> list[Path]:
+    """Files under ``base`` matching ``pattern``, outside ``SKIPPED_DIRS``."""
+    return sorted(
+        path
+        for path in base.rglob(pattern)
+        if path.is_file() and not set(path.relative_to(root).parts) & SKIPPED_DIRS
+    )
+
+
 def steps(workflow: str) -> list[str]:
     """The text of each step of a workflow (split on the step list items)."""
     return re.split(r"\n(?=      - (?:name|uses): )", read(f".github/workflows/{workflow}"))[1:]
@@ -140,9 +154,13 @@ def test_readme_send_command_reports_failures_in_one_line():
     for needed in (
         "except ChannelNotFoundEntity:",
         "except TimeoutError:",
-        "except KeyboardInterrupt:",
+        "except (KeyboardInterrupt, asyncio.CancelledError):",
+        "add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)",
         "expiration=WAIT",
         "aio_pika.connect(",
+        '{"code", "message", "retryable"} <= error.keys()',  # an error reply: one line, exit 1
+        '"x-expires": (WAIT + 60) * 1000',  # a killed run: the broker removes the queue
+        "auto_delete=True",
     ):
         assert needed in code, needed
     assert "connect_robust" not in code  # one attempt: an unreachable broker fails at once
@@ -212,7 +230,8 @@ def test_compatibility_exception_paragraph_lists_the_wire_changes():
     )
     assert match, f"no 'Exception in {VERSION}' paragraph"
     para = match.group(1)
-    for change in ("one reply per command", "priority", "reply_to", "health port"):
+    # COMPATIBILITY names the change classes and links the upgrade guide, which has the detail
+    for change in ("one reply per command", "envelope types", "reply_to", "health port"):
         assert change in para, change
     assert "UPGRADING.md" in para
 
@@ -259,7 +278,9 @@ def test_contributing_documents_the_integration_tests():
     assert "self-contained" not in text
     assert "don't add new type errors" not in text
     marker = tomllib.loads(read("pyproject.toml"))["tool"]["pytest"]["ini_options"]["markers"]
-    assert not [m for m in marker if "Azurite" in m]
+    [integration] = [m for m in marker if m.startswith("integration:")]
+    for needed in ("LEDSAS_TEST_RABBITMQ_URL", "LEDSAS_TEST_BLOB_CONN_STRING", "Azurite"):
+        assert needed in integration, needed
 
 
 def test_security_policy_has_one_private_channel_and_targets():
@@ -557,14 +578,14 @@ def test_readme_configuration_lists_the_heartbeat():
 
 
 def test_upgrading_tells_the_changes_that_can_break_a_deployment():
-    text = section(read("UPGRADING.md"), f"Upgrading to {VERSION}")
+    text = " ".join(section(read("UPGRADING.md"), f"Upgrading to {VERSION}").split())
     for needed in (
         "`amq.",  # reply_to naming a reserved broker exchange is refused
         "no_verify_ssl",
         "?cafile=",
         "KBM_LEDSAS_HEARTBEAT",
         f"default `{heartbeat_default()}` seconds",
-        "counts toward\n  `KBM_LEDSAS_MAX_RETRIES`",
+        "counts toward `KBM_LEDSAS_MAX_RETRIES`",
         "invalid `?heartbeat=`",
         "asyncio.to_thread",
         "Message models and `BlobRef` are read-only",
@@ -576,13 +597,13 @@ def test_upgrading_tells_the_changes_that_can_break_a_deployment():
     assert "send_response()" not in read("UPGRADING.md")
 
 
-def test_compatibility_exception_paragraph_lists_the_other_changes():
-    text = read("COMPATIBILITY.md")
-    para = text.split(f"**Exception in {VERSION}:**", 1)[1].split("\n## ", 1)[0]
+def test_upgrade_guide_lists_the_other_changes():
+    # The list lives in the upgrade guide only (COMPATIBILITY links to it).
+    para = section(read("UPGRADING.md"), f"Upgrading to {VERSION}")
     for change in ("`amq.…`", "no_verify_ssl", "KBM_LEDSAS_HEARTBEAT", "read-only", "ASCII digits"):
         assert change in para, change
     flat = " ".join(para.split())
-    assert "BlobRef` are read-only" in flat and "BlobRef(version_id=...)" in flat
+    assert "`BlobRef` are read-only" in flat and "BlobRef(uri=..., version_id=...)" in flat
     assert "counts toward `KBM_LEDSAS_MAX_RETRIES`" in flat
     assert "like `BlobRef` " + "already was" not in " ".join(read("UPGRADING.md").split())
 
@@ -613,6 +634,7 @@ PUBLIC_TYPED_MODULES = (
     "src/kbm_ledsas_sdk/blob/operations.py",
     "src/kbm_ledsas_sdk/blob/direct_operations.py",
     "src/kbm_ledsas_sdk/utils/logging.py",
+    "src/kbm_ledsas_sdk/app.py",
 )
 
 
@@ -669,7 +691,10 @@ def test_upgrading_and_compatibility_state_the_old_heartbeat_as_the_library_defa
     for rel in ("UPGRADING.md", "COMPATIBILITY.md"):
         text = " ".join(read(rel).split())
         assert "broker's interval " + "applied" not in text, rel
-        assert "AMQP client library's default of 60 seconds applied" in text, rel
+    # stated in the upgrade guide (COMPATIBILITY only links to it)
+    assert "AMQP client library's default of 60 seconds applied" in " ".join(
+        read("UPGRADING.md").split()
+    )
 
 
 def test_upgrading_states_the_heartbeat_detection_time():
@@ -726,9 +751,7 @@ def test_contributing_documents_the_live_test_broker_variable():
 
 
 def test_every_compose_up_in_the_documents_waits_for_the_stack():
-    for path in sorted(ROOT.rglob("*.md")) + sorted(ROOT.rglob("docker-compose*.yml")):
-        if set(path.relative_to(ROOT).parts) & {".git", ".venv", "venv", "build", "dist"}:
-            continue
+    for path in repository_files(ROOT, "*.md") + repository_files(ROOT, "docker-compose*.yml"):
         text = path.read_text(encoding="utf-8")
         for no, line in enumerate(text.splitlines(), 1):
             if re.search(r"docker compose\b.*\bup\b.*\s-d\b", line):
@@ -821,6 +844,7 @@ def test_example_healthcheck_reports_a_503_in_one_line(tmp_path):
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
     finally:
         server.shutdown()
+        server.server_close()
     assert r.returncode == 1
     assert "Traceback" not in r.stderr
     assert r.stderr.strip().splitlines() == ["not ready: HTTP Error 503: Service Unavailable"]
@@ -837,32 +861,24 @@ def test_upgrading_and_compatibility_keep_no_verify_ssl_zero_apart():
     # The client library verifies the certificate when no_verify_ssl is "0" (or
     # absent), and the SDK accepts that value: only other values are refused.
     for rel in ("UPGRADING.md", "COMPATIBILITY.md"):
-        text = " ".join(read(rel).split())
-        assert "any value except `0`" in text, rel
-        assert "whatever its " + "value" not in text, rel
+        assert "whatever its " + "value" not in " ".join(read(rel).split()), rel
+    assert "any value except `0`" in " ".join(read("UPGRADING.md").split())
 
 
 def test_the_0_3_6_behaviour_changes_are_in_the_upgrade_and_compatibility_guides():
     upgrading = " ".join(section(read("UPGRADING.md"), f"Upgrading to {VERSION}").split())
     for needed in (
         "New, optional `KBM_LEDSAS_ALLOWED_CONTAINERS`",
-        "kbm_ledsas_sdk.errors.ContainerNotAllowed",
+        "`errors.ContainerNotAllowed` (`from kbm_ledsas_sdk import errors`;",
         "`download_json` and `upload_json` take only a JSON object or array",
         "`Command`, `Response` and `Status` check their envelope's `type`",
         "A consumer the broker cancels is noticed",
-        "Configured secrets are masked wherever they appear",
+        "Configured secrets are masked",
         "`'**redacted**'`",
     ):
         assert needed in upgrading, needed
     compat = " ".join(read("COMPATIBILITY.md").split(f"**Exception in {VERSION}:**", 1)[1].split())
-    for needed in (
-        "KBM_LEDSAS_ALLOWED_CONTAINERS",
-        "take only a JSON object or array",
-        "a consumer the broker cancels is noticed",
-        "'**redacted**'",
-        "another `type`",
-    ):
-        assert needed in compat, needed
+    assert "UPGRADING.md#upgrading-to-036-from-033" in compat  # the list is in the upgrade guide
 
 
 def test_readme_documents_the_container_allowlist():
@@ -887,9 +903,7 @@ def test_no_test_or_example_writes_a_password_url_other_than_amqp():
     ``amqp://`` URL with the broker's local default user stays literal."""
     hits = []
     for base in ("tests", "examples"):
-        for path in sorted((ROOT / base).rglob("*")):
-            if not path.is_file() or "__pycache__" in path.parts:
-                continue
+        for path in repository_files(ROOT / base):
             if path.suffix not in _SCANNED_SUFFIXES and not path.name.startswith(".env"):
                 continue
             text = path.read_text(encoding="utf-8")
@@ -898,6 +912,16 @@ def test_no_test_or_example_writes_a_password_url_other_than_amqp():
                     if match.group(1) not in ("amqp", "amqps"):
                         hits.append(f"{path.relative_to(ROOT)}:{number}: {match.group(0)}")
     assert hits == []
+
+
+def test_repository_scans_skip_virtual_environments(tmp_path):
+    example = tmp_path / "examples" / "hello_world_service"
+    (example / ".venv" / "lib").mkdir(parents=True)
+    url = "https://" + ":".join(("u", "p")) + "@h/"  # built from parts (secret scanners)
+    (example / ".venv" / "lib" / "dep.py").write_text(f"URL = {url!r}\n")
+    (example / "main.py").write_text("print()\n")
+    found = repository_files(tmp_path / "examples", root=tmp_path)
+    assert found == [example / "main.py"]
 
 
 def test_the_release_notes_name_the_numeric_example_user():
@@ -911,3 +935,276 @@ def test_the_release_notes_name_the_numeric_example_user():
     )
     assert "ends with the numeric `USER 1000:1000`" in entry
     assert "`runAsNonRoot: true` and no `runAsUser` is admitted" in entry
+
+
+# --------------------------------------------------------------------------- #
+# Texts and names the documents quote are the package's own
+# --------------------------------------------------------------------------- #
+def _logged_text(source: str, prefix: str) -> str:
+    """The concatenated string literal of the call in ``source`` whose text
+    starts with ``prefix`` (up to its first ``%s``)."""
+    import ast
+
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value.startswith(prefix):
+                return node.value
+    raise AssertionError(f"no string starting with {prefix!r}")
+
+
+def test_upgrading_quotes_the_consumer_cancel_records_of_the_source():
+    source = read("src/kbm_ledsas_sdk/transport/direct.py")
+    error = _logged_text(source, "The AMQP broker cancelled the command consumer")
+    info = _logged_text(source, "Consuming commands from")
+    upgrading = " ".join(read("UPGRADING.md").split())
+    quoted_error = error.split("%s", 1)[0] + "<queue> ..."
+    quoted_info = info.replace("%s", "<queue>")
+    assert f"one ERROR (`{quoted_error}`)" in upgrading, quoted_error
+    assert f"one INFO `{quoted_info}`" in upgrading, quoted_info
+
+
+_DOTTED = re.compile(r"\bkbm_ledsas_sdk(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+
+
+def resolves_as_written(dotted: str) -> bool:
+    """True when ``dotted`` names a module, or an attribute of the module its
+    longest importable prefix names (``kbm_ledsas_sdk.errors.X`` passes only
+    when ``kbm_ledsas_sdk.errors`` is a module)."""
+    import importlib
+
+    parts = dotted.split(".")
+    for cut in range(len(parts), 0, -1):
+        try:
+            obj = importlib.import_module(".".join(parts[:cut]))
+        except ImportError:
+            continue
+        rest = parts[cut:]
+        if len(rest) > 1:
+            return False  # a dotted path through a non-module
+        return not rest or hasattr(obj, rest[0])
+    return False
+
+
+@pytest.mark.parametrize("rel", ["README.md", "UPGRADING.md", "COMPATIBILITY.md"])
+def test_every_dotted_package_name_in_the_guides_resolves(rel):
+    names = sorted(set(_DOTTED.findall(read(rel))))
+    assert [n for n in names if not resolves_as_written(n)] == []
+
+
+def test_resolves_as_written_refuses_a_path_through_an_attribute():
+    assert resolves_as_written("kbm_ledsas_sdk.models.errors.ContainerNotAllowed")
+    assert resolves_as_written("kbm_ledsas_sdk.json_log_formatter")
+    assert not resolves_as_written("kbm_ledsas_sdk.models.BlobRef.from_uri")
+    assert not resolves_as_written("kbm_ledsas_sdk.no_such_name")
+
+
+def test_upgrading_quotes_the_registration_errors_of_the_package():
+    from kbm_ledsas_sdk import ServiceApp
+
+    handlers = section(read("UPGRADING.md"), "Handlers", level=3)
+    block = re.search(r"```text\n(.*?)```", handlers, re.S).group(1)
+    quoted = [line.strip() for line in block.splitlines() if line.strip()]
+
+    async def one(ctx):
+        return None
+
+    def not_async(ctx, payload):
+        return None
+
+    raised = []
+    for name, version, handler in (
+        ("Process-CSV", "1.0", one),
+        ("ProcessCSV", "1", one),
+        ("ProcessCSV", "1.0", not_async),
+        ("ProcessCSV", "1.0", one),
+    ):
+        with pytest.raises((TypeError, ValueError)) as info:
+            ServiceApp(service_name="svc").handler(name, version=version)(handler)
+        raised.append(f"{type(info.value).__name__}: {info.value}")
+    assert len(quoted) == len(raised)
+    for line, actual in zip(quoted, raised, strict=True):
+        expected = line[:-3].rstrip() if line.endswith("...") else line
+        assert actual.startswith(expected), (line, actual)
+
+
+def test_upgrading_tells_how_a_handler_that_assigns_a_model_field_ends():
+    text = " ".join(read("UPGRADING.md").split())
+    assert "in a handler the command is then replied `Permanent` (not retried)" in text
+    assert "naming `model_copy(update=...)`" in text
+
+
+def test_upgrading_names_what_is_masked_and_what_is_not():
+    text = " ".join(read("UPGRADING.md").split())
+    for needed in ("error messages", "`user_message`", "status `stage` / `note`"):
+        assert needed in text, needed
+    assert "a handler's result is sent as returned" in text
+    assert "wherever they appear" not in text and "reply texts" not in text
+
+
+def test_waits_cover_a_storage_outage():
+    callers = " ".join(section(read("UPGRADING.md"), "Callers", level=3).split())
+    assert "Unreachable storage adds about 7.5 seconds per attempt" in callers
+    send = section(section(README, "Quickstart"), "Send it a command", level=3)
+    assert "are the broker and storage reachable?" in send
+    assert "(is my_service.py running?)" not in send
+
+
+# --------------------------------------------------------------------------- #
+# The README quickstart and container section run as written
+# --------------------------------------------------------------------------- #
+def test_readme_rabbitmq_wait_is_bounded_and_stops_on_a_dead_container():
+    shell = bash_blocks(section(README, "Quickstart"))[0]
+    assert not re.search(r"^\s*until ", shell, re.M)  # an unbounded wait
+    loop = re.search(r"^for i in \$\(seq ([0-9]+)\); do\n(.*?)^done$", shell, re.M | re.S)
+    assert loop, shell
+    assert int(loop.group(1)) * 2 <= 300
+    assert "{{.State.Running}}" in loop.group(2) and "|| break" in loop.group(2)
+
+
+def test_readme_dockerfile_copies_only_files_the_quickstart_names():
+    container = section(README, "Container base image")
+    dockerfile = re.search(r"```dockerfile\n(.*?)```", container, re.S).group(1)
+    named = " ".join(section(README, "Quickstart").split()) + " " + " ".join(container.split())
+    sources = [
+        src
+        for line in dockerfile.splitlines()
+        if line.startswith("COPY ")
+        for src in line.split()[1:-1]
+    ]
+    assert sources and "my_service.py" in sources
+    for src in sources:
+        assert f"`{src}`" in named, src
+    assert 'CMD ["python", "my_service.py"]' in dockerfile
+
+
+def test_readme_quickstart_logs_in_the_configured_format():
+    service = re.search(r"^```python\n(.*?)^```", section(README, "Quickstart"), re.M | re.S).group(
+        1
+    )
+    assert "KBM_LEDSAS_LOG_FORMAT" in service and '== "text"' in service
+    assert "json_log_formatter()" in service
+
+
+def test_container_guidance_names_the_memory_setting_and_a_restart_policy():
+    container = " ".join(section(README, "Container base image").split())
+    example = " ".join(section(EXAMPLE_README, "Container image").split())
+    for text in (container, example):
+        assert "KBM_LEDSAS_MAX_PAYLOAD_BYTES" in text
+        assert "restart policy" in text and "--restart on-failure" in text
+        assert "exits with code 1" in text
+    env = read("examples/hello_world_service/.env.example")
+    assert re.search(r"^KBM_LEDSAS_MAX_PAYLOAD_BYTES=1048576$", env, re.M)
+
+
+# --------------------------------------------------------------------------- #
+# Contributor flow, workflows and pins
+# --------------------------------------------------------------------------- #
+# Words for a process outside this repository ("mono" + "repo": the scans of
+# this file's own text must not find the word either).
+_INTERNAL_PROCESS = re.compile(
+    r"\b(?:sync(?:ed|ing)?|mirror(?:ed)?|upstream|" + "mono" + r"repo)\b", re.I
+)
+
+
+def test_contributor_files_describe_only_processes_of_this_repository():
+    files = [ROOT / "CONTRIBUTING.md", *repository_files(ROOT / ".github")]
+    hits = [
+        f"{path.relative_to(ROOT)}:{no}: {line.strip()}"
+        for path in files
+        for no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if _INTERNAL_PROCESS.search(line)
+    ]
+    assert hits == []
+
+
+def test_contributing_names_the_release_link_step():
+    releases = " ".join(section(read("CONTRIBUTING.md"), "Releases (maintainers)").split())
+    assert "Change every `blob/v<previous>/` and `tree/v<previous>/` link" in releases
+    release = read(".github/workflows/release.yml")
+    assert 'grep -v "/v${VERSION}/$"' in release  # a link to another tag fails
+
+
+def test_every_variable_the_integration_tests_read_is_documented():
+    contributing = read("CONTRIBUTING.md")
+    names = set()
+    for path in repository_files(ROOT / "tests" / "integration", "*.py"):
+        names |= set(
+            re.findall(
+                r"""environ(?:\.get\(|\[)\s*["']([A-Z][A-Z0-9_]+)["']""",
+                path.read_text(encoding="utf-8"),
+            )
+        )
+    names -= {"KBM_LEDSAS_RABBITMQ_URL", "KBM_LEDSAS_BLOB_CONN_STRING", "KBM_LEDSAS_TENANT"}
+    assert {"LEDSAS_TEST_RABBITMQ_URL", "LEDSAS_TEST_BLOB_CONN_STRING"} <= names
+    assert [n for n in sorted(names) if n not in contributing] == []
+
+
+def test_ci_runs_the_integration_tests_with_azurite_and_no_skip():
+    jobs = _jobs("ci.yml")
+    integration = jobs["integration"]
+    assert "AZURITE_IMAGE: mcr.microsoft.com/azure-storage/azurite:" in integration
+    assert '"$AZURITE_IMAGE"' in integration and "--skipApiVersionCheck" in integration
+    assert "skipped' integration.out" in integration and "exit 1" in integration
+
+
+def test_ci_unit_tests_fail_on_a_warning_and_cover_aio_pika_9():
+    unit = [s for s in steps("ci.yml") if '-m "not integration"' in s]
+    assert unit and all("-W error" in s for s in unit), unit
+    test_job = _jobs("ci.yml")["test"]
+    assert 'aio-pika: "9"' in test_job and '"aio-pika>=9.4.0,<10"' in test_job
+
+
+def test_every_tool_table_in_pyproject_is_a_tool_the_repository_installs():
+    data = tomllib.loads(read("pyproject.toml"))
+    installed = {
+        re.match(r"[A-Za-z0-9_.-]+", r).group(0).lower()
+        for r in data["project"]["optional-dependencies"]["dev"] + data["build-system"]["requires"]
+    }
+    for tool in data["tool"]:
+        assert tool.lower() in installed, tool
+
+
+def _image(ref: str) -> str:
+    return ref.split("@", 1)[0]
+
+
+def test_the_quickstart_images_are_the_compose_and_ci_images():
+    compose = read("examples/hello_world_service/deploy/local/docker-compose.yml")
+    compose_images = set(re.findall(r"^\s+image: (\S+)$", compose, re.M))
+    quickstart = "\n".join(bash_blocks(section(README, "Quickstart")))
+    readme_images = set(
+        re.findall(r"((?:mcr\.microsoft\.com/\S+|rabbitmq):[0-9][\w.-]*)", quickstart)
+    )
+    ci = read(".github/workflows/ci.yml")
+    ci_images = {_image(i) for i in re.findall(r"(?:image:|AZURITE_IMAGE:)\s*(\S+)", ci)}
+    assert len(compose_images) == 2
+    assert readme_images == compose_images == ci_images, (readme_images, compose_images, ci_images)
+
+
+def test_requirements_headers_name_the_workflows_that_install_them():
+    workflows = {p.name: p.read_text(encoding="utf-8") for p in WORKFLOWS.glob("*.yml")}
+    for req in sorted((ROOT / ".github").glob("*-requirements.txt")):
+        header = " ".join(
+            ln.lstrip("# ")
+            for ln in req.read_text(encoding="utf-8").splitlines()
+            if ln.startswith("#")
+        )
+        users = {name for name, text in workflows.items() if f".github/{req.name}" in text}
+        named = set(re.findall(r"\.github/workflows/([a-z-]+\.yml)", header))
+        if "CI build job" in header:
+            named.add("ci.yml")
+        assert users and named == users, (req.name, named, users)
+
+
+def test_upgrading_and_the_changelog_name_the_security_floors_of_pyproject():
+    deps = tomllib.loads(read("pyproject.toml"))["project"]["dependencies"]
+    raw = read("pyproject.toml")
+    floors = {
+        re.match(r"[a-z-]+", d).group(0)
+        for d in deps
+        if re.search(rf'Security floor[^\n]*\n(?:\s*#[^\n]*\n)*\s*"{re.escape(d)}"', raw)
+    }
+    assert floors == {"azure-core", "aiohttp", "cryptography"}, floors
+    checklist = section(read("UPGRADING.md"), "Checklist", level=3).split("\n2.", 1)[0]
+    for name in floors:
+        assert f"`{name}` below" in checklist, name

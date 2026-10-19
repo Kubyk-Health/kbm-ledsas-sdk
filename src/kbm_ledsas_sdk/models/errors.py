@@ -8,7 +8,28 @@ These error types control retry behavior and DLQ routing:
   is in the past, so a retry would just exceed it again; goes to DLQ)
 """
 
-__all__ = ["SDKError", "Retryable", "Permanent", "DeadlineExceeded", "ContainerNotAllowed"]
+__all__ = [
+    "SDKError",
+    "Retryable",
+    "Permanent",
+    "DeadlineExceeded",
+    "ContainerNotAllowed",
+    "ArgumentTypeError",
+]
+
+
+def _checked_text(owner: str, name: str, value: object) -> str:
+    """``value`` as given, or a TypeError marked non-retryable: an SDK
+    error's message (and a refused container name) is text. Checked when
+    the error is built, so a wrong type is reported where the handler made
+    the error, not later as a reply that cannot be written."""
+    if isinstance(value, str):
+        return value
+    err = TypeError(f"{owner}: {name} must be a str, got {type(value).__name__}")
+    from ..blob.operations import _mark_non_retryable
+
+    _mark_non_retryable(err, str(err))
+    raise err
 
 
 def _checked_user_message(user_message: object) -> "str | None":
@@ -46,8 +67,15 @@ class ContainerNotAllowed(PermissionError):
     """
 
     def __init__(self, message: str, container: str) -> None:
-        super().__init__(message)
-        self.container = container
+        super().__init__(_checked_text(type(self).__name__, "message", message))
+        self.container = _checked_text(type(self).__name__, "container", container)
+
+    def __reduce__(self) -> "tuple[object, ...]":
+        # Pickle / copy re-create it with both arguments (the default
+        # passes only ``args``, the message, and fails on the missing
+        # ``container``); the instance state (``container``, marks) follows.
+        message = self.args[0] if self.args else ""
+        return (type(self), (message, self.container), self.__dict__)
 
 
 class SDKError(Exception):
@@ -64,7 +92,7 @@ class SDKError(Exception):
     """
 
     def __init__(self, message: str = "", user_message: str | None = None):
-        super().__init__(message)
+        super().__init__(_checked_text(type(self).__name__, "message", message))
         self.user_message: str | None = _checked_user_message(user_message)
 
 

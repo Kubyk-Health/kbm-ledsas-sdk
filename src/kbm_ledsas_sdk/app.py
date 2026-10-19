@@ -40,23 +40,29 @@ import random
 import re
 import signal
 import sys
-from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, TypeVar
+from collections.abc import AsyncIterator, Callable, Coroutine
+from typing import Any, TypeVar, cast
 
 from pydantic import ValidationError
 
-from .health.checks import CheckResult, HealthCheckRegistry
+from .health.checks import CheckResult, HealthCheckRegistry, _check_registration
 from .health.server import HealthServer, HealthServerStartFailure, _deployment_id, _host_port
 from .models.messages import Command
 from .runtime.config import SDKConfig, _shown_setting, describe_config_errors, service_name_problem
 from .runtime.context import ExecutionContext
 
 # HandlerFunc stays importable from this module (it has always been).
-from .runtime.handler import HandlerFunc, HandlerRegistry, _command_fields  # noqa: F401
+from .runtime.handler import HandlerFunc, HandlerRegistry, _check_command_name_and_version
 from .runtime.security import _is_truthy, _read_env
 from .transport.base import ERROR_REPLY_SENT, REPLY_UNCONFIRMED, DeliveryLost, Transport
 from .transport.factory import create_transport
-from .utils.logging import SecretMaskFilter, install_root_handler, masked_logger, setup_logging
+from .utils.logging import (
+    SecretMaskFilter,
+    _command_fields,
+    install_root_handler,
+    masked_logger,
+    setup_logging,
+)
 
 logger = masked_logger(__name__)
 
@@ -340,13 +346,11 @@ def _quiet_noisy_libraries() -> None:
 
 # The function a decorator returns unchanged (a handler: an async function;
 # a health check: a function taking no arguments).
-# A handler: called with (ctx, payload), returns a dict (or another str-keyed
-# mapping) or None. The payload is Any so a handler may annotate it as a
-# dict, a TypedDict or a model it builds itself.
-H = TypeVar(
-    "H",
-    bound=Callable[[ExecutionContext, Any], Awaitable[Mapping[str, Any] | None]],
-)
+# A handler: called with (ctx, payload), returns a dict or None (any other
+# value, a read-only Mapping included, is refused at run time). The payload
+# is Any so a handler may annotate it as a dict, a TypedDict or a model it
+# builds itself; dict[Any, Any] so the documented non-str keys type-check.
+H = TypeVar("H", bound=HandlerFunc)
 C = TypeVar("C", bound=Callable[[], object])
 
 
@@ -371,9 +375,11 @@ class ServiceApp:
         app.run()
 
     The public API is the constructor, the ``handler`` /
-    ``liveness_check`` / ``readiness_check`` decorators, ``run()`` and the
-    ``service_name`` attribute. Attributes other than ``service_name`` are
-    internal and may change.
+    ``liveness_check`` / ``readiness_check`` decorators, ``run()``, the
+    ``health_server_running`` property and the read-only ``service_name``
+    attribute. The other attributes (``registry``, ``config``,
+    ``transport``, ``health_server``, ``liveness_checks``,
+    ``readiness_checks``, ...) are internal and may change.
     """
 
     def __init__(self, service_name: str):
@@ -400,7 +406,7 @@ class ServiceApp:
         if problem is not None:
             error_class = TypeError if not isinstance(service_name, str) else ValueError
             raise error_class(f"ServiceApp(service_name={_shown_setting(service_name)}): {problem}")
-        self.service_name: str = service_name
+        self._service_name: str = service_name
         self.registry: HandlerRegistry = HandlerRegistry()
         self.config: SDKConfig | None = None
         self.transport: Transport | None = None
@@ -427,7 +433,7 @@ class ServiceApp:
         # The command tasks the execution loop is running (handlers, and
         # commands waiting for a worker), and the stop signals received: a
         # second SIGTERM / SIGINT cancels the running handlers.
-        self._active_tasks: set[asyncio.Task] = set()
+        self._active_tasks: set[asyncio.Task[Any]] = set()
         self._stop_signals = 0
         # The command tasks whose handler is running (inside
         # registry.execute). A second stop signal cancels only these: a task
@@ -435,18 +441,32 @@ class ServiceApp:
         # delivery, and is left to finish (each broker round trip is bounded
         # once shutdown has begun), so a command that was answered is never
         # given back and run again.
-        self._tasks_in_handler: set[asyncio.Task] = set()
+        self._tasks_in_handler: set[asyncio.Task[Any]] = set()
         # "<name> <message_id>" of each task in _tasks_in_handler, for the
         # record that names the handlers cancelled when the connection is
         # lost while stopping (_drain_active_tasks).
-        self._handler_task_commands: dict[asyncio.Task, str] = {}
+        self._handler_task_commands: dict[asyncio.Task[Any], str] = {}
         # The transport's start while it runs: a stop signal that arrives
         # then cancels it (see _start_transport).
-        self._start_task: asyncio.Task | None = None
+        self._start_task: asyncio.Task[Any] | None = None
         # The event-loop watchdog (see _watch_event_loop) and the
         # "<name> <message_id>" of the handlers started since its last tick.
-        self._loop_watchdog: asyncio.Task | None = None
+        self._loop_watchdog: asyncio.Task[Any] | None = None
         self._handlers_started_since_tick: set[str] = set()
+
+    @property
+    def service_name(self) -> str:
+        """The service name given to the constructor (read-only:
+        ``KBM_LEDSAS_SERVICE_NAME``, read when ``app.run()`` starts,
+        overrides it for the queue and the logs)."""
+        return self._service_name
+
+    @service_name.setter
+    def service_name(self, value: object) -> None:
+        raise AttributeError(
+            "ServiceApp.service_name is read-only: pass the name to "
+            "ServiceApp(service_name=...), or set KBM_LEDSAS_SERVICE_NAME"
+        )
 
     @property
     def _stop_starting_commands(self) -> bool:
@@ -476,6 +496,10 @@ class ServiceApp:
                 # Handler logic
                 return {"result": "success"}
         """
+        # Checked now, not when decorating: ``@app.handler`` without
+        # parentheses (or a name that is not a string) would otherwise
+        # return the inner decorator and register nothing.
+        _check_command_name_and_version(command_name, version)
 
         def decorator(func: H) -> H:
             self.registry.register(command_name, version, func)
@@ -502,6 +526,7 @@ class ServiceApp:
             def event_loop_responsive():
                 return True  # reaching here proves the event loop runs
         """
+        _check_registration(name, timeout, "liveness_check")
 
         def decorator(func: C) -> C:
             self.liveness_checks.register(name, func, timeout=timeout)
@@ -532,6 +557,7 @@ class ServiceApp:
             async def _():
                 return await db.ping()
         """
+        _check_registration(name, timeout, "readiness_check")
 
         def decorator(func: C) -> C:
             self.readiness_checks.register(name, func, timeout=timeout)
@@ -684,7 +710,7 @@ class ServiceApp:
         except Exception:  # pragma: no cover - never block the error line
             pass
 
-    async def _run_async(self):
+    async def _run_async(self) -> None:
         """
         Async entry point for the service.
 
@@ -836,7 +862,7 @@ class ServiceApp:
     async def _start_transport(self) -> bool:
         """Start the transport. False when a stop signal stopped the start
         (the transport has closed what it opened; nothing else to stop)."""
-        start = asyncio.ensure_future(self.transport.start())
+        start = asyncio.ensure_future(cast(Transport, self.transport).start())
         self._start_task = start
         try:
             await start
@@ -864,7 +890,7 @@ class ServiceApp:
                 e,
             )
 
-    def _setup_signal_handlers(self):
+    def _setup_signal_handlers(self) -> None:
         """
         Set up signal handlers for graceful shutdown.
 
@@ -889,7 +915,7 @@ class ServiceApp:
 
         # Register signal handlers
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda s=sig: self._on_stop_signal(s))
+            loop.add_signal_handler(sig, self._on_stop_signal, sig)
 
     def _on_stop_signal(self, sig: int) -> None:
         """SIGTERM / SIGINT: the first starts the graceful shutdown, any
@@ -945,7 +971,7 @@ class ServiceApp:
         for task in running:
             task.cancel()
 
-    async def _execution_loop(self):
+    async def _execution_loop(self) -> None:
         """
         Main execution loop.
 
@@ -976,7 +1002,9 @@ class ServiceApp:
         # next message arrives, and container shutdowns hard-kill on
         # every terminationGracePeriodSeconds boundary.
         shutdown_wait = asyncio.create_task(self._shutdown_event.wait(), name="sdk-shutdown-wait")
-        sub_iter = self.transport.subscribe().__aiter__()
+        sub_iter = cast(
+            AsyncIterator[Command], cast(Transport, self.transport).subscribe()
+        ).__aiter__()
         self._in_execution_loop = True
         self._give_back_ready.clear()
         # A command the transport handed over at the moment shutdown was
@@ -985,7 +1013,10 @@ class ServiceApp:
 
         try:
             while True:
-                next_cmd = asyncio.create_task(sub_iter.__anext__(), name="sdk-next-command")
+                next_cmd: asyncio.Task[Command] = asyncio.create_task(
+                    cast("Coroutine[Any, Any, Command]", sub_iter.__anext__()),
+                    name="sdk-next-command",
+                )
                 done, _pending = await asyncio.wait(
                     {next_cmd, shutdown_wait},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -1076,7 +1107,7 @@ class ServiceApp:
     # broker (see _drain_active_tasks).
     _DRAIN_CHECK_INTERVAL_S = 0.5
 
-    async def _drain_active_tasks(self, tasks: set[asyncio.Task]) -> None:
+    async def _drain_active_tasks(self, tasks: set[asyncio.Task[Any]]) -> None:
         """Wait for the command tasks still running at shutdown to end.
 
         If, while they run, the transport reports that it can no longer
@@ -1153,7 +1184,7 @@ class ServiceApp:
             if callable(release):
                 await release(envelope.message_id)
             else:
-                await self.transport.nack(envelope.message_id, requeue=True)
+                await cast(Transport, self.transport).nack(envelope.message_id, requeue=True)
         except Exception:
             logger.debug(
                 "Giving back an unstarted command failed (the broker "
@@ -1200,7 +1231,7 @@ class ServiceApp:
         return self._stop_starting_commands or self._shutdown_event.is_set()
 
     @contextlib.asynccontextmanager
-    async def _worker_slot(self, semaphore: asyncio.Semaphore):
+    async def _worker_slot(self, semaphore: asyncio.Semaphore) -> AsyncIterator[bool]:
         """Hold a worker slot (``semaphore``) for the body.
 
         Yields True with the slot held, or False without one when the
@@ -1224,13 +1255,14 @@ class ServiceApp:
         if not semaphore.locked():
             await semaphore.acquire()  # a worker is free: no wait
             return True
-        acquire = asyncio.ensure_future(semaphore.acquire())
+        acquire: asyncio.Future[bool] = asyncio.ensure_future(semaphore.acquire())
         stop_waits = [
             asyncio.ensure_future(self._stop_starting_event.wait()),
             asyncio.ensure_future(self._shutdown_event.wait()),
         ]
         try:
-            await asyncio.wait({acquire, *stop_waits}, return_when=asyncio.FIRST_COMPLETED)
+            waits: set[asyncio.Future[Any]] = {acquire, *stop_waits}
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
         except BaseException:
             for wait in stop_waits:
                 wait.cancel()
@@ -1259,7 +1291,7 @@ class ServiceApp:
         if cls._acquired(acquire):
             semaphore.release()
 
-    async def _settle_after_escape(self, envelope) -> None:
+    async def _settle_after_escape(self, envelope: Any) -> None:
         """Settle a delivery whose command task is ending on a
         BaseException that escaped the SDK (the task was cancelled, or a
         SystemExit / KeyboardInterrupt came from outside the handler): give
@@ -1270,7 +1302,7 @@ class ServiceApp:
             if callable(release):
                 await release(envelope.message_id)
             else:
-                await self.transport.nack(envelope.message_id, requeue=True)
+                await cast(Transport, self.transport).nack(envelope.message_id, requeue=True)
         except BaseException:
             logger.debug(
                 "Settling a command whose task ended early failed",
@@ -1278,7 +1310,7 @@ class ServiceApp:
                 extra=_command_fields(envelope),
             )
 
-    async def _handle_command(self, command: Command, semaphore: asyncio.Semaphore):
+    async def _handle_command(self, command: Command, semaphore: asyncio.Semaphore) -> None:
         """
         Handle a single command.
 
@@ -1317,7 +1349,9 @@ class ServiceApp:
                     transport=self.transport,
                     envelope=envelope,
                     payload=command.payload,
-                    allowed_containers=(allowed if isinstance(allowed, (set, frozenset)) else None),
+                    allowed_containers=(
+                        frozenset(allowed) if isinstance(allowed, (set, frozenset)) else None
+                    ),
                 )
 
                 # Get timeout from config
@@ -1429,7 +1463,7 @@ class ServiceApp:
                 # Terminal outcome: reply once (only if reply_to is set).
                 reply_unconfirmed = False
                 if envelope.reply_to:
-                    reply_publish_ok = await self.transport.send_response(response)
+                    reply_publish_ok: object = await self.transport.send_response(response)
                     if reply_publish_ok is REPLY_UNCONFIRMED:
                         # The transport handed the reply on but could not
                         # confirm it was published (it says so in its own
@@ -1777,7 +1811,7 @@ class ServiceApp:
                 + (", ".join(shown) if shown else "none")
                 + (f" (and {more} more)" if more > 0 else "")
             )
-        extra: dict = {
+        extra: dict[str, Any] = {
             "loop_blocked_s": round(held, 3),
             "blocks_not_logged": not_logged,
         }
@@ -1791,7 +1825,7 @@ class ServiceApp:
         only an explicit True counts)."""
         return getattr(self.transport, "broker_unreachable_at_shutdown", False) is True
 
-    async def _shutdown(self):
+    async def _shutdown(self) -> None:
         """
         Graceful shutdown.
 
@@ -1830,7 +1864,7 @@ class ServiceApp:
 
         logger.info("ServiceApp shutdown complete")
 
-    async def _start_health_server(self):
+    async def _start_health_server(self) -> None:
         """Boot the SDK health server, unless disabled by config."""
         assert self.config is not None  # set in _run_async before this call
         if self.config.health_port == 0:
@@ -1926,7 +1960,7 @@ class ServiceApp:
         base_delay = 1.0
         max_delay = 60.0
         jitter = random.uniform(0, 1)
-        delay = min(base_delay * (2**retry_count) + jitter, max_delay)
+        delay: float = min(base_delay * (2**retry_count) + jitter, max_delay)
         return delay
 
     def __repr__(self) -> str:

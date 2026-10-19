@@ -67,6 +67,32 @@ def _checked_timeout(name: str, timeout: float | None) -> float:
     return float(timeout)
 
 
+def _check_check_name(name: object, decorator: str = "") -> None:
+    """Raise for a health check name that is not a non-empty string
+    (``ServiceApp.liveness_check`` / ``readiness_check`` call it at once,
+    before they return the decorator, with ``decorator`` set to their
+    name)."""
+    if callable(name) and not isinstance(name, str) and decorator:
+        raise ArgumentTypeError(
+            f"app.{decorator} takes the check name: use "
+            f'@app.{decorator}("name") (with parentheses and a name), not '
+            f"@app.{decorator}; got {type(name).__name__}"
+        )
+    if not isinstance(name, str):
+        raise ArgumentTypeError(
+            f"Health check name must be a non-empty string, got {type(name).__name__}"
+        )
+    if not name:
+        raise ValueError("Health check name must be a non-empty string")
+
+
+def _check_registration(name: object, timeout: object, decorator: str) -> None:
+    """The eager argument checks of ``ServiceApp.liveness_check`` /
+    ``readiness_check``: the name, then the timeout."""
+    _check_check_name(name, decorator)
+    _checked_timeout(name, timeout)  # type: ignore[arg-type]
+
+
 def _seconds(value: float) -> str:
     return f"{value:g}s"
 
@@ -106,12 +132,7 @@ class HealthCheckRegistry:
         Raises TypeError when ``check`` is not callable or cannot be called
         without arguments (it would fail on every probe).
         """
-        if not isinstance(name, str):
-            raise ArgumentTypeError(
-                f"Health check name must be a non-empty string, got {type(name).__name__}"
-            )
-        if not name:
-            raise ValueError("Health check name must be a non-empty string")
+        _check_check_name(name)
         if name in self._checks:
             raise ValueError(f"Health check already registered: {name!r}")
         if not callable(check):

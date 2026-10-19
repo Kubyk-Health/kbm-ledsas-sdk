@@ -1,5 +1,5 @@
-# Hash-pinned toolchain of .github/workflows/release.yml (and the CI build
-# job), installed with pip install --require-hashes. Regenerate after editing
+# Hash-pinned SBOM generator of .github/workflows/release.yml (sbom job),
+# installed with pip install --require-hashes. Regenerate after editing
 # sbom-requirements.in (Dependabot proposes the updates):
 #   uv pip compile --generate-hashes --python-version 3.11 --no-header \
 #     .github/sbom-requirements.in -o .github/sbom-requirements.txt

@@ -102,11 +102,17 @@ jobs:
       - name: Check that the package page and the source link a release tag
         run: |
           set -euo pipefail
-          # The links are written at sync time, in the commit that is tagged
-          # (README.md is the PyPI page; the source's error messages and
-          # docstrings point at the API reference): none may name main.
+          # README.md (the PyPI page), pyproject.toml and the source's messages
+          # and docstrings link the release tag (v<version>), never main or
+          # another tag.
           if grep -rn '/blob/main/\|/tree/main/' README.md pyproject.toml src; then
             echo "::error::README.md, pyproject.toml or src/ links to main instead of a release tag"
+            exit 1
+          fi
+          VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          VERSION="${VERSION%.dev*}"
+          if grep -rnoIE 'kbm-ledsas-sdk/(blob|tree)/[^/]+/' README.md pyproject.toml src | grep -v "/v${VERSION}/$"; then
+            echo "::error::README.md, pyproject.toml or src/ links to a tag other than v${VERSION}"
             exit 1
           fi
       - name: Build sdist + wheel

@@ -2,8 +2,9 @@
 
 Covers the ``say_hello`` handler (mocked ctx), the sender's pure
 envelope/exchange helpers, its reply-topology cleanup and its error
-reporting (aio_pika faked), and the example's own files (compose stack,
-.dockerignore). The README is yours to rewrite: nothing here reads it.
+reporting (aio_pika faked; one run against a closed local port), and the
+example's own files (compose stack, .dockerignore, pytest.ini). The README
+is yours to rewrite: nothing here reads it.
 
 No broker, no Azurite, no SDK runtime required.
 """
@@ -90,7 +91,8 @@ def test_service_name_matches_env_example() -> None:
 
 
 def test_command_exchange_name_matches_the_documented_topology() -> None:
-    # The documented names (docs/SDK_API_REFERENCE.md): cmd.[{tenant}.]{service}.v1.
+    # The documented names (SDK API reference, "AMQP Topology"):
+    # cmd.[{tenant}.]{service}.v1.
     service = "hello-world"
     assert sender.build_command_exchange_name(None, service) == f"cmd.{service}.v1"
     assert sender.build_command_exchange_name("acme", service) == f"cmd.acme.{service}.v1"
@@ -98,11 +100,13 @@ def test_command_exchange_name_matches_the_documented_topology() -> None:
 
 def test_tests_use_only_the_public_api() -> None:
     # The example must not lean on SDK internals (the AMQP helpers are not public API).
-    for path in (
-        Path(__file__),
-        EXAMPLE_ROOT / "scripts" / "send_hello.py",
-        EXAMPLE_ROOT / "main.py",
-    ):
+    files = [
+        *EXAMPLE_ROOT.glob("*.py"),
+        *EXAMPLE_ROOT.glob("scripts/*.py"),
+        *EXAMPLE_ROOT.glob("tests/*.py"),
+    ]
+    assert len(files) >= 3
+    for path in files:
         assert "kbm_ledsas_sdk." + "amqp" not in path.read_text(encoding="utf-8"), path
 
 
@@ -172,7 +176,19 @@ def test_default_timeout_allows_for_the_retries() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fake_aio_pika(monkeypatch, *, get_exchange_error=None, publish_error=None):
+class _FakeAMQPConnectionError(Exception):
+    pass
+
+
+class _FakeAuthError(_FakeAMQPConnectionError):
+    pass
+
+
+class _FakeNotFound(Exception):
+    pass
+
+
+def _fake_aio_pika(monkeypatch, *, get_exchange_error=None, publish_error=None, connect_error=None):
     rx, rq, cmd_ex = MagicMock(), MagicMock(), MagicMock()
     rx.delete = AsyncMock()
     rq.delete, rq.bind, rq.cancel = AsyncMock(), AsyncMock(), AsyncMock()
@@ -186,7 +202,12 @@ def _fake_aio_pika(monkeypatch, *, get_exchange_error=None, publish_error=None):
     connection.channel = AsyncMock(return_value=channel)
     connection.close = AsyncMock()
     fake = SimpleNamespace(
-        connect=AsyncMock(return_value=connection),
+        connect=AsyncMock(side_effect=connect_error, return_value=connection),
+        exceptions=SimpleNamespace(
+            AMQPConnectionError=_FakeAMQPConnectionError,
+            ProbableAuthenticationError=_FakeAuthError,
+            ChannelNotFoundEntity=_FakeNotFound,
+        ),
         ExchangeType=SimpleNamespace(TOPIC="topic"),
         DeliveryMode=SimpleNamespace(PERSISTENT=2),
         Message=lambda **kw: kw,
@@ -233,7 +254,7 @@ def test_timeout_deletes_the_reply_queue_and_exchange(monkeypatch) -> None:
     fake.rx.delete.assert_awaited()
 
 
-async def _never():
+async def _never(*args, **kwargs):
     await asyncio.Event().wait()
 
 
@@ -269,6 +290,8 @@ _USERINFO = ":".join(("guest", "guest"))
         "http://" + f"{_USERINFO}@127.0.0.1:5672/",
         "amqp:///",
         "amqp://" + f"{_USERINFO}@127.0.0.1:notaport/",
+        "amqp://" + f"{_USERINFO}@127.0.0.1:0/",
+        "amqp://" + f"{_USERINFO}@[::1/",
     ],
 )
 def test_an_invalid_broker_url_is_one_line_and_no_connection(monkeypatch, capsys, url) -> None:
@@ -282,7 +305,7 @@ def test_an_invalid_broker_url_is_one_line_and_no_connection(monkeypatch, capsys
 
 
 def test_a_failure_is_one_line_without_the_password(monkeypatch, capsys) -> None:
-    url = "amqp://guest:s3cret-pw@127.0.0.1:5672/"
+    url = "amqp://guest:" + "s3cret-pw@127.0.0.1:5672/"
     fake = _fake_aio_pika(monkeypatch)
     sys.modules["aio_pika"].connect = AsyncMock(
         side_effect=ConnectionError(f"Connect call failed for {url}")
@@ -298,19 +321,90 @@ def test_a_failure_is_one_line_without_the_password(monkeypatch, capsys) -> None
 
 
 def test_a_service_that_never_started_is_named(monkeypatch, capsys) -> None:
-    class ChannelNotFoundEntity(Exception):
-        pass
-
-    _fake_aio_pika(monkeypatch, get_exchange_error=ChannelNotFoundEntity("NOT_FOUND"))
+    fake = _fake_aio_pika(monkeypatch, get_exchange_error=_FakeNotFound("NOT_FOUND"))
     monkeypatch.delenv("KBM_LEDSAS_RABBITMQ_URL", raising=False)
     assert sender.main(["--timeout", "5"]) == 1
     out = capsys.readouterr()
     assert out.err.strip() == (
-        "error: the exchange cmd.hello-world.v1 does not exist: "
-        "start the service first (python main.py)"
+        "error: the exchange cmd.hello-world.v1 does not exist: start the service "
+        "first (python main.py), and check KBM_LEDSAS_SERVICE_NAME and KBM_LEDSAS_TENANT"
     )
+    fake.connection.close.assert_awaited()
     # The broker used is printed when the variable is unset.
     assert "(KBM_LEDSAS_RABBITMQ_URL is unset: the default)" in out.out
+
+
+@pytest.mark.parametrize(
+    "error, text",
+    [
+        (
+            _FakeAMQPConnectionError("refused amqp://guest:" + "s3cret-pw@host"),
+            "cannot connect to the broker at",
+        ),
+        (_FakeAuthError("ACCESS_REFUSED"), "refused the user name or password"),
+        (OSError("Connect call failed"), "cannot connect to the broker at"),
+    ],
+)
+def test_a_failed_connection_is_one_error_line(monkeypatch, capsys, error, text) -> None:
+    fake = _fake_aio_pika(monkeypatch, connect_error=error)
+    monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:" + "s3cret-pw@127.0.0.1:5672/")
+    assert sender.main(["--timeout", "30"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ") and text in err and err.count("\n") == 1, err
+    assert "s3cret-pw" not in err
+    # One attempt, bounded below --timeout (a firewalled host fails sooner).
+    assert sys.modules["aio_pika"].connect.await_args.kwargs["timeout"] == sender.CONNECT_TIMEOUT_S
+    fake.channel.declare_queue.assert_not_called()
+
+
+def test_a_broker_that_never_answers_is_named_as_such(monkeypatch, capsys) -> None:
+    _fake_aio_pika(monkeypatch)
+    sys.modules["aio_pika"].connect = AsyncMock(side_effect=_never)
+    monkeypatch.delenv("KBM_LEDSAS_RABBITMQ_URL", raising=False)
+    assert sender.main(["--timeout", "0.2"]) == 1
+    err = capsys.readouterr().err
+    assert (
+        err.startswith("error: cannot connect to the broker at") and "no answer within 0.2s" in err
+    )
+    assert err.count("\n") == 1
+
+
+def test_no_reply_in_time_is_one_error_line(monkeypatch, capsys) -> None:
+    fake = _fake_aio_pika(monkeypatch)
+    monkeypatch.delenv("KBM_LEDSAS_RABBITMQ_URL", raising=False)
+    assert sender.main(["--timeout", "0.2"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: no response within") and err.count("\n") == 1, err
+    fake.rq.delete.assert_awaited()
+
+
+def test_the_sender_uses_one_plain_connection() -> None:
+    source = (EXAMPLE_ROOT / "scripts" / "send_hello.py").read_text(encoding="utf-8")
+    assert "connect_robust" not in source
+    assert "aio_pika.connect(" in source
+
+
+def test_an_unreachable_broker_ends_promptly_without_a_traceback(tmp_path) -> None:
+    """Run as written against a closed local port: one line, exit 1."""
+    pytest.importorskip("aio_pika")
+    import os
+    import subprocess
+
+    env = dict(os.environ, KBM_LEDSAS_RABBITMQ_URL="amqp://guest:" + "guest@127.0.0.1:1/")
+    proc = subprocess.run(
+        [sys.executable, str(EXAMPLE_ROOT / "scripts" / "send_hello.py"), "--timeout", "5"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=tmp_path,
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "Traceback" not in proc.stderr
+    assert proc.stderr.count("\n") == 1 and proc.stderr.startswith(
+        "error: cannot connect"
+    ), proc.stderr
+    assert "guest:guest" not in proc.stderr
 
 
 def test_ctrl_c_is_one_line_and_exit_130(monkeypatch, capsys) -> None:
@@ -340,6 +434,114 @@ def test_mask_url() -> None:
     assert sender.mask_url("amqp://u:p@h:5672/v?x=1") == "amqp://u:***@h:5672/v?***"
     assert sender.mask_url("amqps://h/") == "amqps://h/"
     assert sender.mask_url("amqp://u@h/") == "amqp://u@h/"
+
+
+# ---------------------------------------------------------------------------
+# sender: replies, --timeout, expiry of the command, SIGTERM
+# ---------------------------------------------------------------------------
+
+
+def _reply(monkeypatch, payload):
+    async def fake(env, **kwargs):
+        return {"envelope": {}, "payload": payload}
+
+    monkeypatch.setattr(sender, "_publish_and_wait", fake)
+
+
+def test_an_error_reply_is_one_error_line_and_exit_1(monkeypatch, capsys) -> None:
+    _reply(
+        monkeypatch, {"error": {"code": "Permanent", "message": "bad\nname", "retryable": False}}
+    )
+    assert sender.main(["--timeout", "5"]) == 1
+    out = capsys.readouterr()
+    assert out.err.strip().splitlines() == ["error: Permanent: bad name"]
+    assert "greeting:" not in out.out
+
+
+def test_a_result_with_its_own_error_key_is_not_an_error_reply() -> None:
+    assert sender.reply_error({"error": "field x missing"}) is None
+    assert sender.reply_error({"error": {"code": "X"}}) is None
+    assert sender.reply_error(None) is None
+
+
+def test_a_greeting_is_printed_and_exit_0(monkeypatch, capsys) -> None:
+    _reply(monkeypatch, {"greeting": "hello Ada"})
+    assert sender.main(["Ada", "--timeout", "5"]) == 0
+    assert "greeting: hello Ada" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "1e300", "soon"])
+def test_an_invalid_timeout_is_a_usage_error_and_nothing_is_sent(monkeypatch, value) -> None:
+    fake = _fake_aio_pika(monkeypatch)
+    with pytest.raises(SystemExit) as info:
+        sender.main(["--timeout", value])
+    assert info.value.code == 2
+    sys.modules["aio_pika"].connect.assert_not_called()
+    fake.channel.declare_queue.assert_not_called()
+
+
+def test_the_command_expires_after_the_wait(monkeypatch) -> None:
+    fake = _fake_aio_pika(monkeypatch)
+    with pytest.raises(TimeoutError):
+        _run(_publish_and_wait())
+    cmd_ex = fake.channel.get_exchange.return_value
+    message = cmd_ex.publish.await_args.args[0]
+    assert message["expiration"] == 0.01
+
+
+def test_the_broker_deletes_a_reply_topology_left_by_a_killed_run(monkeypatch) -> None:
+    fake = _fake_aio_pika(monkeypatch)
+    with pytest.raises(TimeoutError):
+        _run(_publish_and_wait())
+    queue_args = fake.channel.declare_queue.await_args.kwargs
+    assert queue_args["durable"] is True and queue_args["auto_delete"] is False
+    assert queue_args["arguments"] == {"x-expires": int((0.01 + 60) * 1000)}
+    assert fake.channel.declare_exchange.await_args.kwargs["auto_delete"] is True
+
+
+def test_sigterm_cleans_up_and_exits_143(monkeypatch, capsys) -> None:
+    import os
+    import signal
+
+    cleaned = []
+
+    async def killed(args):
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(5)
+        finally:
+            await asyncio.sleep(0)  # an await in the cleanup still runs
+            cleaned.append(True)
+        return 0
+
+    monkeypatch.setattr(sender, "_run", killed)
+    before = signal.getsignal(signal.SIGTERM)
+    assert sender.main([]) == 143
+    assert cleaned == [True]
+    assert capsys.readouterr().err.strip() == "terminated"
+    assert signal.getsignal(signal.SIGTERM) == before
+
+
+@pytest.mark.parametrize("log_format", ["json", "text"])
+def test_the_service_logs_in_the_configured_format(log_format) -> None:
+    import json
+    import os
+    import subprocess
+
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('m', {str(EXAMPLE_ROOT / 'main.py')!r})\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "m.logger.info('Greeting requested')\n"
+    )
+    env = dict(os.environ, KBM_LEDSAS_LOG_FORMAT=log_format)
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    [line] = [ln for ln in r.stderr.splitlines() if "Greeting requested" in ln]
+    if log_format == "json":
+        assert json.loads(line)["message"] == "Greeting requested"
+    else:
+        assert not line.startswith("{") and line.endswith(" INFO m: Greeting requested"), line
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +651,29 @@ def test_sender_message_drives_real_handler() -> None:
     assert result == {"greeting": "hello LEDSAS"}
 
 
-def test_compose_port_variables_are_the_documented_ones() -> None:
+def test_compose_header_names_every_port_variable() -> None:
+    # The header comment's example command moves every published port.
     compose = COMPOSE.read_text(encoding="utf-8")
-    for var in ("HELLO_WORLD_AMQP_PORT", "HELLO_WORLD_MGMT_PORT", "HELLO_WORLD_BLOB_PORT"):
-        assert "${" + var + ":-" in compose, var
+    header = compose.split("\nservices:", 1)[0]
+    variables = re.findall(r"\$\{([A-Z_]+):-[0-9]+\}", compose)
+    assert len(variables) >= 3
+    for var in variables:
+        assert f"{var}=" in header, var
+
+
+def test_pytest_ini_makes_the_example_its_own_test_root() -> None:
+    import configparser
+
+    ini = configparser.ConfigParser()
+    ini.read(EXAMPLE_ROOT / "pytest.ini")
+    assert ini.get("pytest", "testpaths").split() == ["tests"]
+
+
+def test_sender_message_drives_the_real_handler() -> None:
+    msg = sender.build_command_message(
+        reply_to="reply-ex-hello-test",
+        idempotency_key=sender.build_idempotency_key(),
+        name="LEDSAS",
+    )
+    result = _run(hello_main.say_hello(_ctx(), msg["payload"]))
+    assert result == {"greeting": "hello LEDSAS"}

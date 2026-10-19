@@ -7,10 +7,14 @@ consumes commands from RabbitMQ, runs the handler, and
 (optionally) publishes the response back to the caller.
 
 Quick Start:
+    A minimal service (the README's "Quick start" has the complete one,
+    with blob input and output in fixed containers and the
+    KBM_LEDSAS_ALLOWED_CONTAINERS allowlist; the SDK API reference,
+    https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/v0.3.6/docs/SDK_API_REFERENCE.md, has the full API):
+
     import logging
     import kbm_ledsas_sdk
     from kbm_ledsas_sdk import ServiceApp, errors
-    from kbm_ledsas_sdk.models import BlobRef
 
     # Your own log records in the SDK's JSON format, extra= fields
     # included. The SDK writes its own records itself, in
@@ -19,34 +23,19 @@ Quick Start:
     handler.setFormatter(kbm_ledsas_sdk.json_log_formatter())
     logging.basicConfig(level=logging.INFO, handlers=[handler])
 
-    app = ServiceApp(service_name="csv-processor")
+    app = ServiceApp(service_name="word-counter")
 
-    @app.handler("ProcessCSV")
+    @app.handler("CountWords")
     async def handle(ctx, req: dict) -> dict:
-        csv_uri = req.get("csv_uri")
-        if not csv_uri:
+        text = req.get("text")
+        if not isinstance(text, str):
             # user_message is what the caller sees; the internal
             # `message` always goes to logs.
             raise errors.Permanent(
-                "Validation: csv_uri missing",
-                user_message="csv_uri is required",
+                "Validation: text missing",
+                user_message="text (a string) is required",
             )
-
-        text = await ctx.blob.download_text(csv_uri)
-        # Take the container from BlobRef, never from a hand-split string:
-        # with blob versioning enabled the URI carries a ?versionId= query.
-        container = BlobRef.from_uri(csv_uri).container
-        out = await ctx.blob.upload_json(
-            container=container,
-            obj={"rows": len(text.splitlines()) - 1},
-            # idempotency_key (not message_id) so a DLQ replay of the
-            # same logical request overwrites the same blob. overwrite=True
-            # is required for that pattern — without it, a replay would
-            # fail because the blob already exists.
-            path=f"result-{ctx.idempotency_key}.json",
-            overwrite=True,
-        )
-        return {"result_uri": out.uri}
+        return {"words": len(text.split())}
 
     # Optional liveness / readiness hooks. The SDK already exposes
     # sensible defaults; these layer on top. Readiness only decides what
@@ -75,10 +64,9 @@ bind on all interfaces). See the SDK API reference
 (https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/v0.3.6/docs/SDK_API_REFERENCE.md) for the full API.
 """
 
-from . import models
+from . import errors, models
 from .app import ServiceApp
 from .blob.operations import BlobOperations
-from .models import errors
 from .runtime.context import ExecutionContext
 from .utils.logging import json_log_formatter
 

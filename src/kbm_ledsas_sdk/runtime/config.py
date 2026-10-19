@@ -35,6 +35,29 @@ from kbm_ledsas_sdk.utils.logging import masked_logger, register_connection_secr
 _logger = masked_logger(__name__)
 
 
+# Free-text settings: any value is accepted, so an inline "# comment" that
+# ``docker run --env-file`` passes through verbatim would be kept in them
+# without a word (the broker URL refuses it, a number does not parse, the
+# service name and tenant are refused by their pattern).
+_FREE_TEXT_SETTINGS = ("KBM_LEDSAS_DEPLOYMENT_ID", "KBM_LASTCOMMITID", "KBM_LEDSAS_CONTAINER")
+_INLINE_COMMENT = re.compile(r"\s#")
+
+
+def _warn_inline_comments() -> None:
+    """One WARNING naming the free-text settings whose value looks like it
+    carries an inline ``# comment`` (the value is kept, and not logged)."""
+    found = [name for name in _FREE_TEXT_SETTINGS if _INLINE_COMMENT.search(_env(name) or "")]
+    if found:
+        _logger.warning(
+            "%s looks like it carries an inline '# comment' (a space then "
+            "'#'): docker run --env-file passes the rest of the line "
+            "through verbatim, so the comment is part of the value. Put "
+            "comments on their own line.",
+            " / ".join(found),
+            extra={"settings": found},
+        )
+
+
 def _env(name: str, default: str | None = None) -> str | None:
     """Read a ``KBM_LEDSAS_*`` variable the same way however it was set.
 
@@ -629,6 +652,8 @@ class SDKConfig(BaseModel):
         """
         tenant_value = _env("KBM_LEDSAS_TENANT", tenant or "")
         tenant_final = tenant_value if tenant_value else None
+
+        _warn_inline_comments()
 
         # KBM_LEDSAS_DEBUG is read when a startup error is reported; an
         # unrecognized value is refused here, like every other setting.

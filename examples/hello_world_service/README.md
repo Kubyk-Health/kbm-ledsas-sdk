@@ -1,14 +1,10 @@
 # hello-world — a minimal LEDSAS service
 
-The smallest possible LEDSAS service: it answers every `SayHello` command with
-`{"greeting": "hello <name>"}` (default `"hello world"`). Use this folder as the starting
-point for your own service.
-
-The service connects to **RabbitMQ** and **Azure Blob Storage** (Azurite locally),
-configured entirely through `KBM_LEDSAS_*` environment variables. Its container image
-builds `FROM` the LEDSAS base image `ghcr.io/kebormed/kbm-ledsas-base-direct`, which
-comes with the SDK and its runtime dependencies installed (the image tag is the SDK
-version); for local development you install the same SDK from PyPI into a venv.
+The smallest LEDSAS service: it answers every `SayHello` command with
+`{"greeting": "hello <name>"}` (default `"hello world"`). Copy this folder to start your own
+service. It is configured through `KBM_LEDSAS_*` environment variables; its image builds `FROM`
+the LEDSAS base image `ghcr.io/kebormed/kbm-ledsas-base-direct`, which has the SDK installed
+(the tag is the SDK version).
 
 ## Layout
 
@@ -28,47 +24,37 @@ hello_world_service/
 ## Run it locally
 
 ```bash
-# 1. Start the local infrastructure (RabbitMQ + Azurite). It uses the host
-#    ports 5672, 15672 and 10000; if another local stack uses them, stop it
-#    first or pick other ports (HELLO_WORLD_AMQP_PORT, HELLO_WORLD_MGMT_PORT,
-#    HELLO_WORLD_BLOB_PORT; see deploy/local/docker-compose.yml) and use the
-#    same ports in .env. --wait returns once both are healthy (the broker
-#    accepts connections), so the service can connect at step 4.
+# 1. Start RabbitMQ + Azurite (host ports 5672, 15672, 10000; to move them, set
+#    HELLO_WORLD_AMQP_PORT, HELLO_WORLD_MGMT_PORT, HELLO_WORLD_BLOB_PORT and use the same
+#    ports in .env). --wait returns once both are healthy.
 cd deploy/local && docker compose up -d --wait && cd ../..
 
-# 2. Create a venv and install the SDK. Standalone, install it from PyPI:
-python3.11 -m venv .venv     # any Python 3.11+, e.g. python3.12
+# 2. A venv with the SDK (inside a clone you can use .venv/bin/pip install -e ../.. instead):
+python3.11 -m venv .venv     # any Python 3.11+
 .venv/bin/pip install kbm-ledsas-sdk==0.3.6
-#    Inside a clone of this repository you can install the SDK from source
-#    instead (../.. is the repository root): .venv/bin/pip install -e ../..
 
-# 3. Configure the environment.
+# 3. The local settings.
 cp .env.example .env
 
-# 4. Run the service, with .env loaded for this command only (a subshell;
-#    set -a exports everything `.` reads), so the values do not stay in
-#    your shell.
+# 4. The service, with .env loaded for this command only:
 (set -a; . ./.env; set +a; exec .venv/bin/python main.py)
 
-# 5. In a SECOND terminal, the same way:
+# 5. In a SECOND terminal:
 (set -a; . ./.env; set +a; exec .venv/bin/python scripts/send_hello.py Ada)
 # === Response ===
 # greeting: hello Ada
 
-# 6. Health endpoints (service running):
+# 6. Health (service running):
 curl http://127.0.0.1:8090/health
 
-# 7. Shut down: Ctrl+C (or SIGTERM). The SDK stops taking commands; when
-#    idle it exits within about a second, and with commands running it
-#    waits for them, up to KBM_LEDSAS_HANDLER_TIMEOUT (30 min by default).
-#    Then:
+# 7. Stop with Ctrl+C (running commands get up to KBM_LEDSAS_HANDLER_TIMEOUT,
+#    30 min by default), then:
 cd deploy/local && docker compose down -v
 ```
 
 ## Tests
 
-No broker or Azurite needed. Run them from this directory (it is its own pytest
-root directory, see `pytest.ini`):
+No broker or Azurite needed; run them from this directory (its own pytest root):
 
 ```bash
 .venv/bin/pip install pytest
@@ -81,11 +67,8 @@ root directory, see `pytest.ini`):
 docker build -t hello-world-service:dev .
 ```
 
-Provide the `KBM_LEDSAS_*` environment variables at runtime (see `.env.example`). Inside
-a container, `127.0.0.1` is the container itself: point `KBM_LEDSAS_RABBITMQ_URL` and the
-`BlobEndpoint` of `KBM_LEDSAS_BLOB_CONN_STRING` at addresses the container can reach. To
-run the image against the local stack of "Run it locally" (started, and `.env` created),
-join the stack's network and use its service names:
+Inside a container, `127.0.0.1` is the container itself. To run the image against the local
+stack of "Run it locally", join the stack's network and use its service names:
 
 ```bash
 docker run --rm --network hello-world-net --env-file .env \
@@ -98,50 +81,38 @@ docker run --rm --network hello-world-net --env-file .env \
   hello-world-service:dev
 ```
 
-- **`KBM_LEDSAS_ALLOW_INSECURE_AMQP=1`** acknowledges the cleartext `amqp://` URL: the SDK
-  refuses `amqp://` to any host other than loopback without it. Use it only on a local
-  Docker network like this one; anywhere else use `amqps://` (TLS) and leave it unset
-  (see "Transport security" in `docs/SDK_API_REFERENCE.md`).
-- **`KBM_LEDSAS_HEALTH_HOST=0.0.0.0`** makes the health endpoints reachable from outside
-  the container (`curl http://127.0.0.1:8090/ready` on the host, through `-p`); the
-  default `127.0.0.1` answers only inside it.
-- **Give it time to stop.** On SIGTERM the service stops taking commands and waits for
-  the handlers already running (each bounded by `KBM_LEDSAS_HANDLER_TIMEOUT`). `docker
-  stop` kills the container after 10 seconds by default: set `--stop-timeout` (as above),
-  `docker stop -t`, Compose `stop_grace_period` or Kubernetes
-  `terminationGracePeriodSeconds` above your longest handler run. A command still
-  running when the container is killed gets no reply and runs again after the
-  restart.
-- **Health check.** The `Dockerfile` declares no `HEALTHCHECK`, so that the platform's
-  probes decide. For plain Docker or Compose, add one that asks `/ready` from inside the
-  container (it works with either `KBM_LEDSAS_HEALTH_HOST`, uses the image's own Python,
-  and writes one line, not a traceback, into the health log when the answer is not
-  `200`):
+- **`KBM_LEDSAS_ALLOW_INSECURE_AMQP=1`** acknowledges cleartext `amqp://` to a host other than
+  loopback; use it only on a local Docker network, and `amqps://` everywhere else.
+- **`KBM_LEDSAS_HEALTH_HOST=0.0.0.0`** makes the health endpoints reachable through `-p`.
+- **Give it time to stop:** set `--stop-timeout` (as above), `docker stop -t`, Compose
+  `stop_grace_period` or Kubernetes `terminationGracePeriodSeconds` above your longest handler
+  run. A command still running when the container is killed runs again after the restart.
+- **Restart policy:** a failed start (for example the broker not reachable yet) exits with code 1
+  and is not retried. `--rm` above suits a local try; elsewhere run the service under a restart
+  policy (`docker run --restart on-failure` instead of `--rm`, Compose `restart: on-failure`,
+  Kubernetes `restartPolicy`).
+- **Memory:** `.env.example` sets `KBM_LEDSAS_MAX_PAYLOAD_BYTES=1048576` (1 MiB); with the SDK
+  default (16 MiB) up to `KBM_LEDSAS_PREFETCH` bodies take about 4 GiB once parsed, and a start
+  under a smaller memory limit logs a WARNING. Size both to the memory you give the container.
+- **Health check.** The `Dockerfile` declares no `HEALTHCHECK`, so that your orchestrator's own
+  probes decide. For plain Docker or Compose, add one that asks `/ready` and writes one line
+  into the health log when the answer is not `200`:
 
   ```dockerfile
   HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
     CMD ["python", "-c", "import sys, urllib.request\ntry:\n    urllib.request.urlopen('http://127.0.0.1:8090/ready', timeout=4)\nexcept Exception as e:\n    sys.exit(f'not ready: {e}')"]
   ```
 
-  The port is the health server's, `KBM_LEDSAS_HEALTH_PORT` (`8090` by default): change
-  it in the URL when you set another port (with `0` there is no health server to ask).
-  `/ready` answers `503` during a broker outage and while the service stops, so Docker
-  marks the container unhealthy then (`not ready: HTTP Error 503: Service Unavailable`
-  in `docker inspect --format '{{json .State.Health}}'`); Docker itself never restarts
-  an unhealthy container.
+  Change the port when you set another `KBM_LEDSAS_HEALTH_PORT`. `/ready` answers `503`
+  during a broker outage and while the service stops; Docker never restarts an unhealthy
+  container itself.
 
 ### Base image
 
-The `Dockerfile` is a single stage on top of the LEDSAS base image
-`ghcr.io/kebormed/kbm-ledsas-base-direct:<SDK version>` (Python 3.11 on Alpine Linux),
-which comes with the SDK and its runtime dependencies installed:
-
-- **The tag is the SDK version.** `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6`
-  runs SDK 0.3.6; change the tag to move the service to another SDK release. The tag is
-  written literally so that a dependency bot can propose the next one once you copy
-  this folder into your own repository: for Dependabot, add a `docker` entry for the
-  folder that holds the `Dockerfile` to your repository's `.github/dependabot.yml`
-  (this repository has none for the example, whose tag moves with each SDK release):
+- **The tag is the SDK version:** `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6` runs SDK
+  0.3.6. Pin the digest too for a reproducible build
+  (`...:0.3.6@sha256:<digest>`), and never build on `latest`. Once you copy this folder into
+  your own repository, a `docker` entry in its `.github/dependabot.yml` proposes the next tag:
 
   ```yaml
     - package-ecosystem: docker
@@ -150,59 +121,37 @@ which comes with the SDK and its runtime dependencies installed:
         interval: weekly
   ```
 
-  `latest` moves with every release, so do not build on it. For a fully reproducible build, pin the digest as well:
-  `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6@sha256:<digest>`.
-- **Do not install the SDK again.** Never list `kbm-ledsas-sdk` in `requirements.txt`,
-  and never copy an SDK wheel into the image. The base image pins its SDK version, so a
-  requirement for a different version fails the build instead of silently replacing it.
-  The pin is a pip constraints file that the base image names in its `PIP_CONSTRAINT`
-  (and `UV_CONSTRAINT`) environment variable: it holds `kbm-ledsas-sdk==<version>` and
-  the `cryptography>=50.0.0` floor the SDK itself requires, and a pip error that says
-  `(constraint)` comes from it. The variables stay set in the built image; nothing uses
-  them once pip is removed.
-- **User and paths.** The image runs as the non-root user `kbmuser` (uid 1000) in
-  `/app`. The `Dockerfile` switches to `USER root` only around `pip install` (the base
-  image turns off per-user site-packages, so packages go into the system site-packages)
-  and the final pip-removal step, then back to `USER 1000:1000` (`kbmuser` by
-  number: Kubernetes `runAsNonRoot` can only verify a numeric user, so the pod
-  starts without a `runAsUser`). It makes `/app` owned by
-  root and copies `main.py` without `--chown`, so the running service can neither change
-  nor replace its code; the service writes no files in `/app` (use `/tmp` for scratch
-  files). Its `LABEL` instruction clears the base image's labels (title, version,
-  license, links): add your service's own there.
-- **pip is removed at the end of the build.** pip is only needed while building the
-  image, never at runtime, so the last root step of the `Dockerfile` uninstalls it. Keep
-  every `pip` command above that step (below it pip is gone, so a `pip` command fails the
-  build), and install into the base image's Python, not into a virtual environment: the
-  step's check fails the build if pip is still installed anywhere in the image. The base
-  image ships without `setuptools`, `wheel` and Python's bundled installer archive under
-  `ensurepip`: pip is the only installer left for the build, and this step removes it. A
-  service must not install packages while it runs: install everything it needs at build
-  time, through `requirements.txt`.
-- **One stage.** Keep a single `FROM` line, on this base image.
+- **Do not install the SDK again:** never list `kbm-ledsas-sdk` in `requirements.txt`. The base
+  image's `PIP_CONSTRAINT` file pins `kbm-ledsas-sdk==<version>` and the `cryptography>=50.0.0`
+  floor, so a requirement for another version fails the build (a pip error that says
+  `(constraint)`).
+- **User and paths:** the image runs as `kbmuser` (uid 1000) in `/app`. The `Dockerfile` switches
+  to `USER root` only to install and to remove pip, then ends with the numeric `USER 1000:1000`
+  (Kubernetes `runAsNonRoot` can only verify a numeric user). `/app` and `main.py` are root-owned,
+  so the service cannot change its code; write scratch files to `/tmp`. Its `LABEL` clears the
+  base image's labels: add your own.
+- **pip is removed at the end of the build:** keep every `pip` command above that step, and
+  install into the base image's Python (not a venv); the step fails the build if pip is left
+  anywhere. The base image ships without `setuptools`, `wheel` and Python's bundled installer
+  under `ensurepip`, so nothing can install packages at runtime: put everything in
+  `requirements.txt`.
+- **One stage:** keep a single `FROM` line, on this base image.
 
 #### Third-party packages on Alpine (musl libc)
 
-Alpine uses musl libc instead of glibc. pip installs a package as a binary only if it is
-pure Python or publishes a `musllinux` wheel; otherwise pip tries to compile it from
-source, which usually fails.
+pip installs a binary only for a pure-Python package or one with a `musllinux` wheel:
 
 | Install cleanly (pure Python, or `musllinux` wheels for amd64 and arm64) | No `musllinux` wheels: do not install on this base image |
 |---|---|
 | numpy, pandas, scipy, pillow, scikit-image, pyarrow, pydicom | torch, onnxruntime, tensorflow, opencv-python(-headless), scikit-learn, SimpleITK, python-gdcm, pylibjpeg-* |
 
-(Checked on PyPI for Python 3.11 in October 2026. Wheel availability changes between
-releases, so re-check a package before you depend on it.)
-
-**PyTorch index trap.** `pip install torch --index-url https://download.pytorch.org/whl/cpu`
-can look like it worked: some older wheels on that index carry the generic
-`linux_x86_64` tag, which pip on Alpine accepts, but they are built against glibc, so
-`import torch` fails afterwards.
+(Checked on PyPI for Python 3.11 in October 2026; re-check before you depend on a package.)
+Beware `pip install torch --index-url https://download.pytorch.org/whl/cpu`: some older wheels
+there install on Alpine but are built for glibc, so `import torch` fails.
 
 ## Updating the SDK version
 
-1. Change the SDK version everywhere this folder names it: the base image tag on
-   the `FROM` line of the `Dockerfile` (and in "Base image" above), the
-   `kbm-ledsas-sdk==` pin in "Run it locally", and the same pin in the docstring
-   of `main.py`.
-2. Re-run the tests and one local round-trip (steps above).
+1. Change the version everywhere this folder names it: the `FROM` tag in the `Dockerfile` (and in
+   "Base image" above), the `kbm-ledsas-sdk==` pin in "Run it locally", and the pin in the
+   docstring of `main.py`.
+2. Re-run the tests and one local round-trip.

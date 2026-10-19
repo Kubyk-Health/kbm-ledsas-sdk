@@ -296,4 +296,5 @@ def build_transport(config: SDKConfig) -> Transport:
         max_payload_bytes=config.max_payload_bytes,
         connect_timeout=config.connect_timeout,
         heartbeat=config.heartbeat,
+        publish_channels=config.concurrency,
     )

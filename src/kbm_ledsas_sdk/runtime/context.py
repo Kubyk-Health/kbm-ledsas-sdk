@@ -13,7 +13,7 @@ The context is scoped to a single command execution and is immutable after creat
 import enum
 import logging
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from ..blob.operations import (
     AllowedContainersBlobOperations,
@@ -24,7 +24,7 @@ from ..blob.operations import (
 from ..models.envelope import Envelope
 from ..models.messages import Status
 from ..transport.base import Transport
-from ..utils.logging import masked_logger
+from ..utils.logging import mask_configured_secrets, masked_logger
 
 
 class _TextValuedEnum(Protocol):
@@ -261,9 +261,14 @@ class ExecutionContext:
                 _mark_non_retryable(surrogate_error, str(surrogate_error))
                 raise surrogate_error
 
-        payload: dict[str, Any] = {"stage": stage_text, "progress": progress}
+        # Sent as written, except the secrets the SDK is configured with
+        # (the broker password, a storage key or SAS signature).
+        payload: dict[str, Any] = {
+            "stage": mask_configured_secrets(cast(str, stage_text)),
+            "progress": progress,
+        }
         if note is not None:
-            payload["note"] = note
+            payload["note"] = mask_configured_secrets(note)
 
         # Build a fresh envelope with type="status" rather than
         # reusing the command's envelope verbatim. The command envelope

@@ -34,7 +34,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "pydantic>=2.5.0,<3.0",
+    # 2.8.0: the first pydantic whose pydantic-core has wheels for Python 3.13.
+    "pydantic>=2.8.0,<3.0",
     "aio-pika>=9.4.0,<11.0",
     # Imported directly (exceptions, and the protocol decoders the SDK
     # makes tolerant of non-UTF-8 message properties), so declared with the
@@ -95,7 +96,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 markers = [
-    "integration: live tests that need a RabbitMQ (127.0.0.1:5672, or LEDSAS_TEST_RABBITMQ_URL; skipped when none answers)",
+    "integration: live tests against a RabbitMQ (127.0.0.1:5672, or LEDSAS_TEST_RABBITMQ_URL) and Azurite (127.0.0.1:10000, or LEDSAS_TEST_BLOB_CONN_STRING); a test skips when what it needs does not answer",
 ]
 
 [tool.mypy]
@@ -128,7 +129,3 @@ ignore = ["E501", "B008"]
 # B007 / F841 (loop variables and locals kept for readability) and C416 (a
 # comprehension kept for symmetry with its neighbours) are test idioms.
 "tests/**" = ["B007", "B011", "B017", "B018", "C408", "C416", "F841", "UP031"]
-
-[tool.coverage.run]
-source = ["kbm_ledsas_sdk"]
-omit = ["*/tests/*", "*/__pycache__/*"]
