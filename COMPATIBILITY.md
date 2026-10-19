@@ -61,14 +61,22 @@ carries. What it contains:
   version fails the build;
 - **the non-root user `kbmuser` (uid 1000)** and the working directory `/app`.
 
-The image is rebuilt from the same recipe to pick up Alpine and Python security
-patches; a rebuild keeps the tag and changes the digest, so pin the digest you
-tested (`docker buildx imagetools inspect ghcr.io/kebormed/kbm-ledsas-base-direct:<tag>`
-prints it).
+The image is built and published by the project maintainers. Its build recipe
+is maintained by them and is not published, so the image carries no
+`org.opencontainers.image.source` label; its
+`org.opencontainers.image.documentation` label names this project. Verify an
+image by its digest: each release lists the image's digest in the table below
+(`docker buildx imagetools inspect ghcr.io/kebormed/kbm-ledsas-base-direct:<tag>`
+prints the digest of a tag), and, where the table says the image carries an SBOM
+attestation, read it with
+`docker buildx imagetools inspect ghcr.io/kebormed/kbm-ledsas-base-direct@<digest> --format '{{json .SBOM}}'`.
+
+The image is rebuilt to pick up Alpine and Python security patches; a rebuild
+keeps the tag and changes the digest, so pin the digest you tested.
 
 | Image tag | kbm-ledsas-sdk | Python | OS | Platforms | Digest at release |
 |-----------|----------------|--------|----|-----------|-------------------|
-| `0.3.6`   | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | listed here when the image is published |
+| `0.3.6`   | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | listed here when the image is published, with whether it carries an SBOM attestation |
 | `latest`  | the newest release | | | | |
 
 There is no image for a version number that was not released (no `0.3.4` or

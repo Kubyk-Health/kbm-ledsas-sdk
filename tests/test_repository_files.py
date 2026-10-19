@@ -228,6 +228,19 @@ def test_compatibility_describes_the_base_image():
         assert fact in base, fact
 
 
+def test_compatibility_says_how_to_verify_the_base_image_without_its_recipe():
+    """The recipe is not published: the text says so, names no recipe a reader
+    could rebuild from, and points to what each release lists (the digest; the
+    SBOM attestation only where the table says the image carries one)."""
+    base = " ".join(section(read("COMPATIBILITY.md"), "Container base image").split())
+    assert "same recipe" not in base
+    assert "is maintained by them and is not published" in base
+    assert "carries no `org.opencontainers.image.source` label" in base
+    assert "Verify an image by its digest: each release lists the image's digest" in base
+    assert "where the table says the image carries an SBOM attestation" in base
+    assert "with whether it carries an SBOM attestation" in base
+
+
 def test_upgrading_shows_the_handler_registration_errors():
     text = read("UPGRADING.md")
     for message in (
@@ -859,3 +872,42 @@ def test_readme_documents_the_container_allowlist():
     quickstart = " ".join(section(README, "Quickstart").split())
     assert "KBM_LEDSAS_ALLOWED_CONTAINERS" in quickstart
     assert "does not authenticate callers" in quickstart
+
+
+# --------------------------------------------------------------------------- #
+# Test and example URLs
+# --------------------------------------------------------------------------- #
+_USERINFO_URL = re.compile(r"\b([a-z][a-z0-9+.-]*)://[^\s/@:'\"]+:[^\s/@'\"]+@")
+_SCANNED_SUFFIXES = {".py", ".md", ".yml", ".yaml", ".toml", ".ini", ".txt", ".example", ".cfg"}
+
+
+def test_no_test_or_example_writes_a_password_url_other_than_amqp():
+    """Secret scanners report a URL that carries a user and a password as a
+    credential. Tests and examples build such URLs from parts; only an
+    ``amqp://`` URL with the broker's local default user stays literal."""
+    hits = []
+    for base in ("tests", "examples"):
+        for path in sorted((ROOT / base).rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            if path.suffix not in _SCANNED_SUFFIXES and not path.name.startswith(".env"):
+                continue
+            text = path.read_text(encoding="utf-8")
+            for number, line in enumerate(text.splitlines(), 1):
+                for match in _USERINFO_URL.finditer(line):
+                    if match.group(1) not in ("amqp", "amqps"):
+                        hits.append(f"{path.relative_to(ROOT)}:{number}: {match.group(0)}")
+    assert hits == []
+
+
+def test_the_release_notes_name_the_numeric_example_user():
+    """The example ends with ``USER 1000:1000``; the upgrade guide and the
+    changelog say why (``runAsNonRoot`` without ``runAsUser``)."""
+    upgrading = " ".join(section(read("UPGRADING.md"), f"Upgrading to {VERSION}").split())
+    assert "End your `Dockerfile` with the numeric `USER 1000:1000`" in upgrading
+    assert "`runAsNonRoot: true` and no `runAsUser`" in upgrading
+    entry = " ".join(
+        read("CHANGELOG.md").split(f"## [{VERSION}]", 1)[1].split("\n## [", 1)[0].split()
+    )
+    assert "ends with the numeric `USER 1000:1000`" in entry
+    assert "`runAsNonRoot: true` and no `runAsUser` is admitted" in entry

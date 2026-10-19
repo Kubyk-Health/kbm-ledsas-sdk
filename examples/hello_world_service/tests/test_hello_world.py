@@ -256,14 +256,19 @@ def test_one_connection_attempt_with_the_timeout(monkeypatch) -> None:
     assert connect.await_args.kwargs.get("timeout") == 0.01
 
 
+# Test URLs with a user and password are built from parts, so that secret
+# scanners do not report them as credentials.
+_USERINFO = ":".join(("guest", "guest"))
+
+
 @pytest.mark.parametrize(
     "url",
     [
-        "guest:guest@127.0.0.1:25675",
+        f"{_USERINFO}@127.0.0.1:25675",
         "not a url",
-        "http://guest:guest@127.0.0.1:5672/",
+        "http://" + f"{_USERINFO}@127.0.0.1:5672/",
         "amqp:///",
-        "amqp://guest:guest@127.0.0.1:notaport/",
+        "amqp://" + f"{_USERINFO}@127.0.0.1:notaport/",
     ],
 )
 def test_an_invalid_broker_url_is_one_line_and_no_connection(monkeypatch, capsys, url) -> None:

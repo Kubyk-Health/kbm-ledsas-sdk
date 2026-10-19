@@ -5,6 +5,8 @@ Provides methods for uploading/downloading data to/from Azure Blob Storage.
 Streaming operations support multi-GB files with minimal memory footprint.
 """
 
+import functools
+import inspect
 import json
 import math
 from abc import ABC, abstractmethod
@@ -871,5 +873,35 @@ class AllowedContainersBlobOperations(BlobOperations):
 
     def __getattr__(self, name: str) -> Any:
         # Anything else (an implementation's own attribute) is the
-        # underlying operations'.
-        return getattr(self._inner, name)
+        # underlying operations'. An implementation's own public coroutine
+        # method that names a container or a blob (a ``container`` or a
+        # ``blob_ref`` parameter, as the methods above do) is checked the
+        # same way before it runs, so no method of ``ctx.blob`` reaches a
+        # container outside the list.
+        attr = getattr(self._inner, name)
+        if name.startswith("_") or not inspect.iscoroutinefunction(attr):
+            return attr
+        try:
+            signature = inspect.signature(attr)
+        except (TypeError, ValueError):
+            return attr
+        if "container" in signature.parameters:
+            target = "container"
+        elif "blob_ref" in signature.parameters:
+            target = "blob_ref"
+        else:
+            return attr
+
+        @functools.wraps(attr)
+        async def checked(*args: Any, **kwargs: Any) -> Any:
+            try:
+                value = signature.bind_partial(*args, **kwargs).arguments.get(target)
+            except TypeError:
+                value = None  # wrong arguments: the method itself refuses them
+            if target == "container":
+                self._require(value, "upload")
+            elif value is not None:
+                self._ref(value, "download")
+            return await attr(*args, **kwargs)
+
+        return checked

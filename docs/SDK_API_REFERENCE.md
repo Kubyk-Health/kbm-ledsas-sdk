@@ -1348,7 +1348,7 @@ Called without `await` it does nothing: no update is sent, the handler
 goes on, and the only trace is Python's `RuntimeWarning: coroutine
 'ExecutionContext.emit_status' was never awaited`.
 
-#### `async emit_status(stage: str, progress: float, note: str | None = None) -> None`
+#### `async emit_status(stage: str | Enum, progress: float, note: str | Enum | None = None) -> None`
 
 Report processing progress back to the caller.
 
@@ -1367,7 +1367,9 @@ handler continues.
 
 An `Enum` member whose value is a `str` (`class Stage(Enum): DOWNLOADING
 = "downloading"`) is accepted for `stage` and `note` and sent as that
-value.
+value. `Enum` in the signature means such a member: a type checker
+accepts it and reports an `IntEnum` member (or any `Enum` with values
+that are not text) as an error, as the call refuses it.
 
 **Raises:**
 - `TypeError` if `stage` is not a `str`, or `note` is neither `None` nor a `str`

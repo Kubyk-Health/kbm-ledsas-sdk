@@ -933,8 +933,10 @@ class AzureBlobClient:
 
         Example:
             >>> async def file_stream():
-            ...     async with aiofiles.open("large.bin", "rb") as f:
-            ...         while chunk := await f.read(4 * 1024 * 1024):
+            ...     # Each read runs in a worker thread (asyncio.to_thread),
+            ...     # so the file read never blocks the event loop.
+            ...     with open("large.bin", "rb") as f:
+            ...         while chunk := await asyncio.to_thread(f.read, 4 * 1024 * 1024):
             ...             yield chunk
             >>> blob_ref = await client.upload_blob_stream("data", file_stream())
         """

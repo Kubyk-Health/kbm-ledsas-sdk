@@ -478,8 +478,10 @@ class DirectBlobOperations(BlobOperations):
 
         Example:
             >>> async def file_stream():
-            ...     async with aiofiles.open("large.bin", "rb") as f:
-            ...         while chunk := await f.read(4 * 1024 * 1024):
+            ...     # Each read runs in a worker thread (asyncio.to_thread),
+            ...     # so the file read never blocks the event loop.
+            ...     with open("large.bin", "rb") as f:
+            ...         while chunk := await asyncio.to_thread(f.read, 4 * 1024 * 1024):
             ...             yield chunk
             >>> ref = await ctx.blob.upload_stream(
             ...     container="uploads",
@@ -538,12 +540,13 @@ class DirectBlobOperations(BlobOperations):
             Exception: For other download errors
 
         Example:
-            >>> async with aiofiles.open("output.bin", "wb") as f:
+            >>> with open("output.bin", "wb") as f:
             ...     async for chunk in ctx.blob.download_stream(
             ...         blob_ref,
             ...         progress_callback=lambda d, t: print(f"{d}/{t} bytes")
             ...     ):
-            ...         await f.write(chunk)
+            ...         # The write runs in a worker thread, off the event loop.
+            ...         await asyncio.to_thread(f.write, chunk)
         """
         blob_ref = _ensure_blob_ref(blob_ref)
         logger.debug(

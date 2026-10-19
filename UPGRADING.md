@@ -259,6 +259,12 @@ section lists what may need action.
   [`examples/hello_world_service/`](examples/hello_world_service/). This is a
   recommendation: `pip install kbm-ledsas-sdk==0.3.6` on any Python 3.11+ image
   still works.
+- **End your `Dockerfile` with the numeric `USER 1000:1000`** (the base image's
+  `kbmuser`, same uid and gid), as `examples/hello_world_service/Dockerfile` now
+  does (in 0.3.3 it ended with the named `USER appuser`). Kubernetes admits a pod with
+  `runAsNonRoot: true` and no `runAsUser` only when the image's user is numeric:
+  the kubelet cannot verify that a named user is not root. Or set
+  `runAsUser: 1000` in the pod.
 
 ---
 

@@ -1263,7 +1263,12 @@ an action on your side; the details are in its entry.
 - **Example service.** `examples/hello_world_service` builds `FROM` the LEDSAS
   base image (one stage; the code stays read-only for the non-root service
   user; pip is removed at the end of the build), no longer lists the SDK in
-  its `requirements.txt`, and logs one JSON stream.
+  its `requirements.txt`, and logs one JSON stream. Its `Dockerfile` ends
+  with the numeric `USER 1000:1000` (the base image's `kbmuser`; in 0.3.3
+  it ended with the named `USER appuser`), so a Kubernetes pod with `runAsNonRoot: true` and
+  no `runAsUser` is admitted: the kubelet cannot verify that a named user
+  is not root. End a `Dockerfile` of your own the same way, or set
+  `runAsUser: 1000` in the pod.
 - **API reference** (`docs/SDK_API_REFERENCE.md`) brought up to date with this
   release, including how a blob URI with `?versionId=` is parsed
   (`BlobRef.version_id`).

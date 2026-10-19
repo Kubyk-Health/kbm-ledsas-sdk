@@ -13,7 +13,7 @@ The context is scoped to a single command execution and is immutable after creat
 import enum
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from ..blob.operations import (
     AllowedContainersBlobOperations,
@@ -25,6 +25,17 @@ from ..models.envelope import Envelope
 from ..models.messages import Status
 from ..transport.base import Transport
 from ..utils.logging import masked_logger
+
+
+class _TextValuedEnum(Protocol):
+    """The type of an ``Enum`` member whose value is a ``str``
+    (``class Stage(Enum): DONE = "done"``), as ``emit_status`` accepts it
+    for ``stage`` and ``note``. A type checker infers ``value`` from the
+    members, so an ``IntEnum`` member is a type error, as it is refused at
+    run time. For typing only: the run-time check is ``_status_text``."""
+
+    @property
+    def value(self) -> str: ...
 
 
 def _handler_logger(command_name: str) -> logging.Logger:
@@ -187,9 +198,9 @@ class ExecutionContext:
 
     async def emit_status(
         self,
-        stage: str,
+        stage: str | _TextValuedEnum,
         progress: float,
-        note: str | None = None,
+        note: str | _TextValuedEnum | None = None,
     ) -> None:
         """
         Emit a status update during handler execution.
@@ -200,9 +211,9 @@ class ExecutionContext:
             note: Optional human-readable note (e.g., "Downloading 15 MB dataset")
 
         An ``Enum`` member whose value is a ``str`` is accepted for
-        ``stage`` and ``note`` and sent as that value (annotated ``str``: a
-        ``StrEnum`` member is a ``str``; an ``Enum`` whose values are not
-        text, such as an ``IntEnum``, is refused).
+        ``stage`` and ``note`` and sent as that value (a ``StrEnum`` member
+        is a ``str``); an ``Enum`` whose values are not text, such as an
+        ``IntEnum``, is refused, and is a type error for a type checker.
 
         Raises:
             TypeError: If ``stage`` is not a ``str``, ``note`` is neither
