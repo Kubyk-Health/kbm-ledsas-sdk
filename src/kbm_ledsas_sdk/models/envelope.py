@@ -9,9 +9,16 @@ import copy as _copy
 import re
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Literal, TypeVar
+from typing import Any, ClassVar, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_serializer,
+    field_validator,
+)
 
 # The start of an ISO 8601 date and time ("2026-10-15T10:00"; a space is
 # accepted between date and time, as RFC 3339 allows).
@@ -209,10 +216,10 @@ class Envelope(_ValidatedCopyModel):
     job_id: str | None = Field(
         None,
         description=(
-            "Optional orchestrator-controlled job identifier for "
-            "business-level tracking. Unlike correlation_id "
-            "(SDK-controlled), job_id is set by the orchestrator and "
-            "echoed in all responses for workflow tracking. Same "
+            "Optional caller-chosen job identifier for business-level "
+            "tracking. Like correlation_id, it is echoed exactly as the "
+            "caller sent it in every response and status, for workflow "
+            "tracking. Same "
             "URL-safe character set as idempotency_key / trace_id "
             "(`^[A-Za-z0-9_\\-:.]+$`, length 1..128) so handlers can "
             "safely interpolate it into paths."
@@ -224,7 +231,7 @@ class Envelope(_ValidatedCopyModel):
 
     @field_validator("message_id", mode="before")
     @classmethod
-    def _normalize_uuid_case(cls, v):
+    def _normalize_uuid_case(cls, v: Any) -> Any:
         """Lowercase ``message_id``.
 
         The accepted pattern is case-insensitive hex (RFC 4122 allows
@@ -289,15 +296,25 @@ class Envelope(_ValidatedCopyModel):
     @field_validator("sent_at", "deadline")
     @classmethod
     def validate_timezone_aware(cls, v: datetime | None) -> datetime | None:
-        """Ensure datetime fields are timezone-aware (preferably UTC)."""
+        """Ensure datetime fields are timezone-aware (preferably UTC).
+
+        Internal: a pydantic validator the model runs itself when it is built;
+        not part of the public API (it may change).
+        """
         if v is not None and v.tzinfo is None:
             raise ValueError("Datetime must be timezone-aware (use datetime.timezone.utc)")
         return v
 
     @field_validator("deadline")
     @classmethod
-    def validate_deadline_after_sent_at(cls, v: datetime | None, info) -> datetime | None:
-        """Ensure deadline is after sent_at if both are present."""
+    def validate_deadline_after_sent_at(
+        cls, v: datetime | None, info: ValidationInfo
+    ) -> datetime | None:
+        """Ensure deadline is after sent_at if both are present.
+
+        Internal: a pydantic validator the model runs itself when it is built;
+        not part of the public API (it may change).
+        """
         if v is not None and info.data.get("sent_at") is not None:
             sent_at = info.data["sent_at"]
             if v <= sent_at:
@@ -308,7 +325,7 @@ class Envelope(_ValidatedCopyModel):
     # message_id = ...) gets a ValidationError instead of silently
     # changing the ids the SDK acknowledges and replies with. Build a
     # changed copy with model_copy(update=...), which validates it.
-    model_config = ConfigDict(
+    model_config: ClassVar[ConfigDict] = ConfigDict(
         validate_assignment=True,
         frozen=True,
     )

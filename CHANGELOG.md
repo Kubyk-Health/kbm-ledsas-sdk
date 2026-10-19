@@ -15,6 +15,37 @@ that was never valid but used to be accepted is now refused: read "Changed"
 and [UPGRADING.md](UPGRADING.md) before upgrading. 0.3.4 and 0.3.5 were not
 released (numbers skipped), so this entry lists every change since 0.3.3.
 
+**Check before upgrading.** Each line names a change below that can need
+an action on your side; the details are in its entry.
+
+- Dependency pins: a pin of `cryptography` below 50.0.0 or of
+  `azure-core` below 1.38.0 no longer resolves ("Security").
+- Callers: one reply per command, after the last attempt (allow for the
+  retries in a reply timeout); `reply_to` may not name a `cmd.`, `dlq.`
+  or `amq.` exchange; envelope timestamps must be ISO 8601 text and
+  `priority` an integer; blob URIs with a backslash, C1 control
+  characters or line / paragraph separators are refused.
+- Handlers: handlers must be `async def`, with names a command can
+  carry; results must be JSON (no `bytes`) and small enough to reply
+  with; `emit_status` takes text; `overwrite` takes a bool;
+  `upload_stream` chunks must be bytes; invalid upload paths are
+  refused; the message models are read-only; command bodies nested more
+  than 256 levels deep are dead-lettered.
+- Storage: `download_json` / `upload_json` take only a JSON object or
+  array; `KBM_LEDSAS_ALLOWED_CONTAINERS` (new, optional) limits `ctx.blob`
+  to listed containers; the message models refuse an envelope of another
+  kind.
+- Configuration: broker URLs must be `amqp://` or `amqps://` with a
+  host, without `no_verify_ssl`, and with a whole-number `?heartbeat=`
+  from 0 to 600; boolean settings refuse values that are not booleans;
+  each service on one host needs its own health port.
+- Operations: alert on `Max retries (N) exceeded` rather than on
+  `Uncaught exception in handler`; JSON and text log timestamps changed;
+  a handler that can run longer than 30 minutes needs a higher broker
+  `consumer_timeout`; a handler that blocks the event loop longer than
+  about two heartbeat intervals (60 s by default) loses the connection,
+  and those redeliveries now count toward `KBM_LEDSAS_MAX_RETRIES`.
+
 ### Security
 
 - **Raised the `aiohttp` floor to `>=3.14.3`** (was `>=3.8.0`), which
@@ -28,6 +59,13 @@ released (numbers skipped), so this entry lists every change since 0.3.3.
   **Action required only if you pin `cryptography` below 50.0.0** in
   your own requirements or constraints: the install then fails to
   resolve. Raise your pin.
+- **Added an `azure-core` floor of `>=1.38.0`** (`azure-core>=1.38.0,<2.0`;
+  there was none), which fixes CVE-2026-21226 (PYSEC-2026-1208). The SDK
+  uses `azure-core` directly, and it also arrives through
+  `azure-storage-blob`; without the floor, upgrading the SDK in place
+  (`pip install -U kbm-ledsas-sdk`) kept an older, vulnerable
+  `azure-core` that was already installed. **Action required only if you
+  pin `azure-core` below 1.38.0**: raise your pin.
 
 ### Added
 
@@ -955,11 +993,13 @@ released (numbers skipped), so this entry lists every change since 0.3.3.
   record the SDK masks.
 - **`deployment_id`: a matched pair of surrounding quotes is removed.**
   The `deployment_id` field of `/health` and `/ready` is read from the
-  same variables as in 0.3.3 (`KBM_LEDSAS_DEPLOYMENT_ID`, else
-  `KBM_LASTCOMMITID`); a matched pair of quotes around the value is now
-  removed, as from every setting (`KBM_LASTCOMMITID="a1b2c3d4"` under
-  `docker run --env-file` reported the quotes). Set either at deploy time,
-  for example to the commit id; nothing sets them for you.
+  same variables as in 0.3.3: `KBM_LEDSAS_DEPLOYMENT_ID`, or its older
+  alias `KBM_LASTCOMMITID`, read only when `KBM_LEDSAS_DEPLOYMENT_ID` is
+  unset or blank (prefer `KBM_LEDSAS_DEPLOYMENT_ID`). A matched pair of
+  quotes around the value is now removed, as from every setting (the older
+  alias `KBM_LASTCOMMITID="a1b2c3d4"` under `docker run --env-file`
+  reported the quotes). The SDK sets neither; set one at deploy time, for
+  example to the commit id.
 - **A broker URL with `no_verify_ssl` is refused.** A
   `KBM_LEDSAS_RABBITMQ_URL` whose query sets `no_verify_ssl` to any value
   other than `0` (`1`, `true`, `false`, or no value at all: the AMQP client
@@ -982,15 +1022,34 @@ released (numbers skipped), so this entry lists every change since 0.3.3.
   field now raises `pydantic.ValidationError`, and `ctx.envelope` is
   read-only. **Action:** make a changed copy with
   `model_copy(update={...})` instead.
-- **New `KBM_LEDSAS_HEARTBEAT` (default 15 s).** The SDK now asks the
-  broker for an AMQP heartbeat every 15 seconds (`0` to `600`; `0` turns
-  heartbeats off), so a broker or a network path that stops answering
-  without closing the connection is detected after about three times
-  this interval (the AMQP client library allows three missed heartbeats:
-  `3 × (interval + 1)` seconds, 48 s at the default 15, plus up to half an
-  interval until its next check), and the SDK reconnects. Earlier releases set no heartbeat of
-  their own (the AMQP client library's default applied). A
-  `?heartbeat=` in `KBM_LEDSAS_RABBITMQ_URL` still wins.
+- **New `KBM_LEDSAS_HEARTBEAT` (default 60 s, as before).** The AMQP
+  heartbeat interval the SDK asks the broker for is now a setting (`0` to
+  `600`; `0` turns heartbeats off, and with it the detection of a broker
+  that stops answering). The default `60` is the interval earlier releases
+  already used (the AMQP client library's default), now set by the SDK
+  itself. A broker or a network path that stops answering without closing
+  the connection is detected after about three intervals (`3 × (interval +
+  1)` seconds, 183 s at the default, plus up to half an interval), and the
+  SDK reconnects. A handler that blocks the event loop longer than about
+  two heartbeat intervals makes the broker close the connection: run
+  blocking work with `await asyncio.to_thread(...)`; a lower value finds a
+  dead broker sooner but leaves handlers less room to block. A
+  `?heartbeat=` in `KBM_LEDSAS_RABBITMQ_URL` still wins; its value must now
+  be a whole number from `0` to `600`: any other value (`abc`, `-5`,
+  `99999`) is refused at start with a `Configuration error`. Before, the
+  AMQP client library silently turned heartbeats off for such a value.
+- **A command delivered again after a lost broker connection counts toward
+  `KBM_LEDSAS_MAX_RETRIES`.** Each delivery of a command that the broker
+  makes again after the connection was lost (for example because its
+  handler blocked the event loop past the heartbeat) counts as one
+  attempt. Once the attempts are spent the SDK logs the `Max retries (N)
+  exceeded, sending to DLQ` ERROR (saying that the command was delivered
+  again after attempts that did not finish because the connection was
+  lost), answers the caller once with the final error and dead-letters
+  the command. Before, such a command could
+  run again after every reconnect without end, with no reply and nothing
+  in the DLQ. The count is kept in the service process (a restart starts
+  it again).
 - **A message whose AMQP properties are not UTF-8 is dead-lettered.** A
   message whose AMQP short-string property (`message_id`,
   `correlation_id`, `reply_to`, `type`, ...) or header name held bytes
@@ -1048,11 +1107,101 @@ released (numbers skipped), so this entry lists every change since 0.3.3.
   service started ...` and exits with code 0. Missing connection
   settings (`KBM_LEDSAS_RABBITMQ_URL`, `KBM_LEDSAS_BLOB_CONN_STRING`) are
   reported together in one `Configuration error`.
+
+- **New `KBM_LEDSAS_ALLOWED_CONTAINERS`: a container allowlist for
+  `ctx.blob`.** A comma-separated list of container names
+  (`input,results`). When it is set, every upload (by its `container`)
+  and every download (by the container of its URI) outside the list
+  raises the new `errors.ContainerNotAllowed` (a `PermissionError`, with
+  the refused name in `.container`) before anything is sent to storage,
+  logs one WARNING `Blob upload refused: container 'other' is not in
+  KBM_LEDSAS_ALLOWED_CONTAINERS` (or `Blob download refused: ...`) and,
+  uncaught, is replied once as `Permanent` (`container 'other' is not
+  allowed (KBM_LEDSAS_ALLOWED_CONTAINERS)`), not retried. An empty item
+  or an invalid container name stops the start with one `Configuration
+  error`; when set, the start logs one INFO `Blob access limited to the
+  containers in KBM_LEDSAS_ALLOWED_CONTAINERS: ...`. Unset (the default),
+  nothing changes. It limits what a command can make the service do with
+  its storage credential; see "Security model" in the API reference.
+- **`download_json` and `upload_json` keep to a dict or a list.**
+  `download_json` of valid JSON whose root is a number, a string,
+  `true`/`false` or `null` now raises a `ValueError` (`Blob <uri> holds
+  JSON whose root is <kind>: download_json() returns a dict or a list;
+  ...`) and logs one ERROR `Blob content is JSON but its root is <kind>,
+  not an object or an array`; `upload_json` of anything but a dict or a
+  list (tuples included) raises `TypeError` (`upload_json() takes a dict
+  or a list (the root of the JSON document), got <type>; ...`) before
+  anything is sent. Both are not retried (`Permanent` when uncaught).
+  Before, `download_json` returned the scalar and `upload_json` uploaded
+  it. **Action:** read such content with `download_text()` (then
+  `json.loads`) and write it with `upload_text()`.
+- **`Command`, `Response` and `Status` check their envelope's `type`.**
+  Each refuses an envelope of another kind (`pydantic.ValidationError`:
+  `envelope.type is 'command', not 'response' (a Response carries a
+  response envelope)`). **Action:** to build a `Response` from a
+  command's envelope, copy it with `model_copy(update={"type":
+  "response"})`. A response or status that reaches a command queue is
+  still dead-lettered with its one WARNING.
+- **A broker-cancelled command consumer is noticed.** When the broker
+  cancels the service's consumer while the connection stays up (its
+  queue was deleted, or the node that holds it is down), the SDK logs one
+  ERROR `The AMQP broker cancelled the command consumer on <queue> ...`,
+  `/ready` answers 503, and the SDK declares the queue and consumes again
+  until it succeeds (a WARNING `Could not consume from <queue> again
+  (...); retrying in N s` per failed try, an INFO `Consuming commands
+  from <queue> again` at the end). Before, the service consumed nothing,
+  `/ready` stayed 200 and the SDK logged nothing.
+- **The configured secrets are masked everywhere.** The broker password
+  (also percent-encoded) and the storage `AccountKey` and SAS signature
+  the service is configured with are masked in every record and reply
+  text of the process, in any form, not only where a pattern recognises
+  them; a dict, list, tuple or set in a record field is masked item by
+  item. `repr()` of the broker URL and connection string the SDK holds
+  (and so of the configuration and transport objects, in debuggers and
+  `rich` views) shows `'**redacted**'` for `rabbitmq_url` and
+  `blob_conn_string`; `str()` gives the value.
+- **More precise start errors.** Refused credentials:
+  `AMQP authentication refused by the broker at amqp://***:***@host:port/:
+  check the user name and password in KBM_LEDSAS_RABBITMQ_URL and the
+  user's access to the virtual host. Broker reply: ...`. A broker host
+  name that does not resolve: `... the host name '<host>' does not
+  resolve (...); check the host in KBM_LEDSAS_RABBITMQ_URL and the DNS of
+  the network the service runs in`. An empty numeric setting:
+  `KBM_LEDSAS_PREFETCH='' is empty: unset it to use the default (10) or
+  give a whole number`; an empty log setting: `Invalid log level: ''
+  (empty: unset the variable to use the default)`. A
+  `KBM_LEDSAS_RABBITMQ_URL` that still starts or ends with a quote (an
+  unmatched quote) is refused. A missing reply exchange's ERROR now ends
+  `verify the caller declared this exchange and bound a queue to it for
+  routing key 'response'.`. A heartbeat timeout logs `Lost the
+  connection to the AMQP broker (no frames from the broker within the
+  heartbeat timeout, about N s) ...` (`error_class` `HeartbeatTimeout`),
+  and a reply that close cancelled logs `Reply to exchange '<name>' not
+  sent: ... (ConnectionLost)`.
+- **Errors and registration.** Every `errors.SDKError` carries
+  `user_message` as an attribute; a bare `errors.DeadlineExceeded()` has
+  the message `Processing deadline exceeded`. A wrong-typed argument to
+  `@app.handler` or a health-check decorator (a name that is not a
+  string, a timeout that is not a number) raises a `TypeError` that is
+  also a `ValueError` (an existing `except ValueError` still catches it),
+  and a handler with the wrong number of arguments is named with its
+  arity (`... the SDK calls it with (ctx, payload), but it takes 1
+  positional argument.`).
+- **Health-server hardening gaps are reported.** With an aiohttp version
+  whose internals the health server cannot harden, the endpoints still
+  answer and the SDK logs one ERROR per gap, `Health server: <what>
+  cannot be applied with the installed aiohttp <version>; ...`.
 - **`aio-pika` 10.x is now accepted** (`aio-pika>=9.4.0,<11.0`; was
   `<10.0`). A fresh install resolves aio-pika 10 (with aiormq 7 and
   pamqp 4). The SDK's message handling, reply publishing and startup /
   authentication error handling behave the same on 9.x and 10.x. If you
   pin aio-pika 9.x yourself, nothing changes.
+- **`aiormq` and `pamqp` are declared** (`aiormq>=6.8.0,<8.0`,
+  `pamqp>=3.3.0,<5.0`): the SDK imports them directly; they already
+  arrived through `aio-pika`. If the installed `pamqp` has a layout the
+  SDK cannot adapt, the start logs a WARNING (a message property that is
+  not UTF-8 then drops the connection instead of dead-lettering that one
+  message).
 - `pydantic` and `azure-storage-blob` ranges are unchanged.
 
 ### Fixed
@@ -1100,11 +1249,17 @@ released (numbers skipped), so this entry lists every change since 0.3.3.
   `BlobRef.from_uri(uri).container` instead of splitting the URI string by
   hand, writes its own log records in the
   SDK's JSON format, and the configuration table lists both variables that
-  set `deployment_id` (`KBM_LEDSAS_DEPLOYMENT_ID`, and `KBM_LASTCOMMITID`,
-  which is read when the first is unset; the table named only the first) and
+  set `deployment_id` (`KBM_LEDSAS_DEPLOYMENT_ID`, and its older alias
+  `KBM_LASTCOMMITID`, read only when the first is unset or blank; the table
+  named only the first) and
   `KBM_LEDSAS_CONNECT_TIMEOUT`, `KBM_LEDSAS_GENERIC_ERRORS` and
   `KBM_LEDSAS_DEBUG`. The "Local development" commands load the example's
   `.env` and say they run from a clone of this repository.
+- **`KBM_LEDSAS_CONTAINER` is informational.** The 0.3.3 README called it
+  the default blob container, but it never selected a container: the SDK
+  logs it at startup, and every upload method takes an explicit
+  `container`. The README and the API reference now say so; nothing changes
+  in what the SDK does.
 - **Example service.** `examples/hello_world_service` builds `FROM` the LEDSAS
   base image (one stage; the code stays read-only for the non-root service
   user; pip is removed at the end of the build), no longer lists the SDK in
@@ -1135,7 +1290,7 @@ Not released; number skipped, no changes.
 
 Not released; number skipped, no changes.
 
-## [0.3.3] - 2026-07-09
+## [0.3.3] - 2026-07-10
 
 ### Changed
 
@@ -1172,7 +1327,7 @@ Not released; number skipped, no changes.
   used to leave an orphaned counter slot forever — a slow, unbounded memory
   growth. Eviction only resets that message's local retry budget.
 
-## [0.3.2] - 2026-07-01
+## [0.3.2] - 2026-07-02
 
 First public release of the KeborMed LEDSAS SDK. The SDK connects directly to
 RabbitMQ and Azure Blob Storage, and provides the handler-based programming model

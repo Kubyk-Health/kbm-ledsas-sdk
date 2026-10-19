@@ -196,13 +196,18 @@ class _HealthHttpServer(web.Server):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        if not isinstance(getattr(self, "_connections", None), dict):
+            _report_hardening_problem("the open-connection limit (no Server._connections)")
         self._last_limit_warning = float("-inf")
         self.connections_refused = 0
         self.connections_evicted = 0
 
     def connection_made(self, handler: web_protocol.RequestHandler, transport) -> None:
         super().connection_made(handler, transport)
-        open_now = [h for h in self._connections if getattr(h, "_force_close", False) is not True]
+        connections = getattr(self, "_connections", None)
+        if not isinstance(connections, dict):
+            return  # reported when the server was built
+        open_now = [h for h in connections if getattr(h, "_force_close", False) is not True]
         if len(open_now) <= MAX_CONNECTIONS:
             return
         # Over the limit: close the oldest connection that is not answering
@@ -251,9 +256,65 @@ class _HealthHttpServer(web.Server):
         handler = super().__call__()
         try:
             handler.__class__ = _HealthRequestHandler
-        except TypeError:  # pragma: no cover - an aiohttp with another layout
-            pass
+        except TypeError as e:
+            _report_hardening_problem(
+                f"the JSON error responses (the request handler class could "
+                f"not be replaced: {e})"
+            )
         return handler
+
+
+# The hardening above relies on aiohttp internals (there is no public hook
+# for these): the response headers hook (_prepare_headers, to drop the
+# Server header), the server's connection table (_connections) and the
+# request handlers' state (_force_close, _request_in_progress, to bound the
+# open connections), and replacing the request handler's class (for the
+# JSON error responses). Each is checked when the server starts; one that is
+# missing in the installed aiohttp is reported as one ERROR (the endpoints
+# still answer; that protection is off), never skipped silently.
+_hardening_reported: set[str] = set()
+
+
+def _report_hardening_problem(what: str) -> None:
+    """One ERROR per process for a hardening step that cannot be applied
+    with the installed aiohttp."""
+    if what in _hardening_reported:
+        return
+    _hardening_reported.add(what)
+    try:
+        import aiohttp
+
+        version = aiohttp.__version__
+    except Exception:  # pragma: no cover - aiohttp is imported above
+        version = "unknown"
+    logger.error(
+        "Health server: %s cannot be applied with the installed aiohttp %s; "
+        "the endpoints still answer, without that protection. Install an "
+        "aiohttp version this SDK release supports.",
+        what,
+        version,
+        extra={"aiohttp_version": version},
+    )
+
+
+def hardening_problems() -> list[str]:
+    """The hardening steps of the health server that the installed aiohttp
+    does not support (empty when every one applies)."""
+    problems = []
+    if not callable(getattr(web.Response, "_prepare_headers", None)):
+        problems.append("removing the Server response header (no Response._prepare_headers)")
+    slots = set()
+    for cls in type.mro(web_protocol.RequestHandler):
+        slots.update(getattr(cls, "__slots__", ()))
+    for name in ("_force_close", "_request_in_progress"):
+        if name not in slots and not hasattr(web_protocol.RequestHandler, name):
+            problems.append(f"the open-connection limit (no RequestHandler.{name})")
+            break
+    if not issubclass(_HealthRequestHandler, web_protocol.RequestHandler) or (
+        getattr(web_protocol.RequestHandler, "__slots__", None) is None
+    ):
+        problems.append("the JSON error responses (RequestHandler has another layout)")
+    return problems
 
 
 class HealthServer:
@@ -315,6 +376,8 @@ class HealthServer:
         if self.port == 0:
             logger.info("Health server disabled (KBM_LEDSAS_HEALTH_PORT=0)")
             return
+        for problem in hardening_problems():
+            _report_hardening_problem(problem)
         server = _HealthHttpServer(
             self._dispatch,
             access_log=None,
@@ -411,8 +474,9 @@ async def _trivial_liveness() -> CheckResult:
 
 def _deployment_id() -> str | None:
     """Deployed-service identifier: ``KBM_LEDSAS_DEPLOYMENT_ID``, else
-    ``KBM_LASTCOMMITID`` (the same identifier under another name, read when
-    ``KBM_LEDSAS_DEPLOYMENT_ID`` is unset or blank).
+    ``KBM_LASTCOMMITID`` (an older alias of ``KBM_LEDSAS_DEPLOYMENT_ID``,
+    read only when that is unset or blank; prefer
+    ``KBM_LEDSAS_DEPLOYMENT_ID``). The SDK sets neither.
 
     Returned as ``deployment_id`` in every /health and /ready body so an
     operator can confirm which build is actually live behind a probe. Read

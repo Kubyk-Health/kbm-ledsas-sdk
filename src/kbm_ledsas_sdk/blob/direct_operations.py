@@ -8,6 +8,7 @@ import json
 import logging
 import sys
 from collections.abc import AsyncIterable, AsyncIterator, Callable
+from typing import cast
 
 from kbm_ledsas_sdk.blob.azure_client import DEFAULT_CHUNK_SIZE, AzureBlobClient
 from kbm_ledsas_sdk.blob.operations import (
@@ -17,7 +18,9 @@ from kbm_ledsas_sdk.blob.operations import (
     _check_container,
     _check_overwrite,
     _check_upload_data,
+    _check_upload_json_root,
     _check_upload_stream,
+    _checked_json_root,
     _encode_text,
     _ensure_blob_ref,
     _json_dumps_for_blob,
@@ -143,7 +146,7 @@ class DirectBlobOperations(BlobOperations):
         data = await self.azure_client.download_blob(blob_ref)
 
         try:
-            obj = json.loads(data.decode("utf-8"))
+            obj = cast(JSONValue, json.loads(data.decode("utf-8")))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             _refuse_blob_json(blob_ref, e, str(e))
             raise
@@ -175,6 +178,10 @@ class DirectBlobOperations(BlobOperations):
                 valid_json=True,
             )
             raise
+
+        # A dict or a list (the documented contract); a scalar root is
+        # refused like the other content errors.
+        obj = _checked_json_root(blob_ref, obj)
 
         # Don't log JSON key names at INFO — blob contents are
         # frequently sensitive (config with `api_key`, `password`,
@@ -208,7 +215,7 @@ class DirectBlobOperations(BlobOperations):
             overwrite: If True, replace an existing blob at ``path``.
                 Default False; set True for the idempotency-key replay
                 pattern (see it in the SDK API reference,
-                https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/docs/SDK_API_REFERENCE.md).
+                https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/v0.3.6/docs/SDK_API_REFERENCE.md).
 
         Returns:
             BlobRef of the uploaded blob (its URI carries ?versionId= when
@@ -280,6 +287,7 @@ class DirectBlobOperations(BlobOperations):
         """
         _check_overwrite(overwrite)
         _check_container(container)
+        _check_upload_json_root(obj)
         try:
             # Standard JSON: NaN / Infinity are written as null, as in
             # replies (json.dumps would write the non-standard NaN token).

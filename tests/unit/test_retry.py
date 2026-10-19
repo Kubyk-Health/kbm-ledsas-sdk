@@ -21,9 +21,21 @@ from kbm_ledsas_sdk.transport.mock import MockTransport
 
 
 @pytest.fixture
-def app():
-    """ServiceApp instance for testing."""
-    return ServiceApp("test_service")
+def app(monkeypatch):
+    """ServiceApp instance for testing.
+
+    The retry backoff does not really wait here: each requested delay is
+    recorded in ``app.backoff_delays`` instead (no wall-clock time in these
+    tests; the waiting itself is covered where it is the behavior)."""
+    service = ServiceApp("test_service")
+    service.backoff_delays = []
+
+    async def record_backoff(delay):
+        service.backoff_delays.append(delay)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(service, "_backoff_unless_shutdown", record_backoff)
+    return service
 
 
 @pytest.fixture
@@ -136,12 +148,10 @@ class TestRetryLogic:
         semaphore = asyncio.Semaphore(1)
 
         # Handle command - should apply backoff before NACK
-        start_time = asyncio.get_event_loop().time()
         await app._handle_command(sample_command, semaphore)
-        elapsed = asyncio.get_event_loop().time() - start_time
 
-        # Should have waited at least 1 second (base backoff)
-        assert elapsed >= 1.0
+        # Waited at least 1 second (base backoff) before the requeue
+        assert len(app.backoff_delays) == 1 and app.backoff_delays[0] >= 1.0
 
         # Message should be NACKed with requeue
         assert len(mock_transport.nacked_messages) == 1
@@ -260,13 +270,13 @@ class TestTimeoutIntegration:
         # Register handler that takes too long
         @app.handler("ProcessDataset", "1.0")
         async def slow_handler(ctx, payload):
-            await asyncio.sleep(5)  # Takes 5 seconds
+            await asyncio.sleep(5)  # longer than the timeout below
             return {"result": "success"}
 
         # Mock transport
         mock_transport = MockTransport()
         app.transport = mock_transport
-        app.config = create_mock_config(handler_timeout=1, max_retries=3)  # 1 second timeout
+        app.config = create_mock_config(handler_timeout=0.05, max_retries=3)  # 50 ms timeout
 
         # Create semaphore
         semaphore = asyncio.Semaphore(1)
@@ -294,7 +304,7 @@ class TestTimeoutIntegration:
 
         mock_transport = MockTransport()
         app.transport = mock_transport
-        app.config = create_mock_config(handler_timeout=1, max_retries=0)
+        app.config = create_mock_config(handler_timeout=0.05, max_retries=0)
 
         await app._handle_command(sample_command, asyncio.Semaphore(1))
 

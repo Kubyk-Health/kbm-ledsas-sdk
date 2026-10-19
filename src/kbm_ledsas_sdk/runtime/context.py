@@ -15,7 +15,12 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from ..blob.operations import BlobOperations, _find_lone_surrogate, _mark_non_retryable
+from ..blob.operations import (
+    AllowedContainersBlobOperations,
+    BlobOperations,
+    _find_lone_surrogate,
+    _mark_non_retryable,
+)
 from ..models.envelope import Envelope
 from ..models.messages import Status
 from ..transport.base import Transport
@@ -91,19 +96,30 @@ class ExecutionContext:
         transport: Transport,
         envelope: Envelope,
         payload: "dict[str, Any]",
+        *,
+        allowed_containers: "frozenset[str] | None" = None,
     ) -> None:
         """
         Initialize execution context.
+
+        Internal: the SDK builds the context for each command and passes it
+        to the handler; handler code does not construct one (the signature
+        may change). Its type hints are for reading only.
 
         Args:
             transport: Transport instance (for blob ops and status emission)
             envelope: Command envelope with metadata
             payload: Command payload (dict)
+            allowed_containers: The containers ``blob`` may use
+                (``KBM_LEDSAS_ALLOWED_CONTAINERS``); None for no restriction.
         """
         self._transport = transport
         self._envelope = envelope
         self._payload = payload
-        self._blob_ops = transport.get_blob_operations()
+        blob_ops = transport.get_blob_operations()
+        if isinstance(allowed_containers, (set, frozenset)) and allowed_containers:
+            blob_ops = AllowedContainersBlobOperations(blob_ops, frozenset(allowed_containers))
+        self._blob_ops = blob_ops
         self._logger: logging.Logger | None = None
 
     @property
@@ -171,9 +187,9 @@ class ExecutionContext:
 
     async def emit_status(
         self,
-        stage: "str | enum.Enum",
+        stage: str,
         progress: float,
-        note: "str | enum.Enum | None" = None,
+        note: str | None = None,
     ) -> None:
         """
         Emit a status update during handler execution.
@@ -184,7 +200,9 @@ class ExecutionContext:
             note: Optional human-readable note (e.g., "Downloading 15 MB dataset")
 
         An ``Enum`` member whose value is a ``str`` is accepted for
-        ``stage`` and ``note`` and sent as that value.
+        ``stage`` and ``note`` and sent as that value (annotated ``str``: a
+        ``StrEnum`` member is a ``str``; an ``Enum`` whose values are not
+        text, such as an ``IntEnum``, is refused).
 
         Raises:
             TypeError: If ``stage`` is not a ``str``, ``note`` is neither
@@ -207,32 +225,32 @@ class ExecutionContext:
         # every attempt, so it is one Permanent reply, not a retry. An
         # Enum member whose value is text (class Stage(Enum): DOWNLOADING =
         # "downloading") is sent as that value, as it was before this check.
-        stage = _status_text("stage", stage, "a str")
+        stage_text = _status_text("stage", stage, "a str")
         note = _status_text("note", note, "None or a str")
 
         # bool is an int subclass: True / False are refused, as the
         # envelope's priority refuses them.
         if isinstance(progress, bool) or not isinstance(progress, (int, float)):
-            err = TypeError(
+            type_error = TypeError(
                 f"Progress must be a number between 0.0 and 1.0, got " f"{type(progress).__name__}"
             )
-            _mark_non_retryable(err, str(err))
-            raise err
+            _mark_non_retryable(type_error, str(type_error))
+            raise type_error
         if not 0.0 <= progress <= 1.0:
-            err = ValueError(f"Progress must be between 0.0 and 1.0, got {progress}")
-            _mark_non_retryable(err, str(err))
-            raise err
+            range_error = ValueError(f"Progress must be between 0.0 and 1.0, got {progress}")
+            _mark_non_retryable(range_error, str(range_error))
+            raise range_error
 
         # A lone surrogate would be written as an escape that strict JSON
         # readers refuse (as in replies and upload_json).
-        for field, text in (("stage", stage), ("note", note)):
+        for field, text in (("stage", stage_text), ("note", note)):
             problem = _find_lone_surrogate(text, field) if text is not None else None
             if problem is not None:
-                err = ValueError(f"emit_status() refused: {problem}")
-                _mark_non_retryable(err, str(err))
-                raise err
+                surrogate_error = ValueError(f"emit_status() refused: {problem}")
+                _mark_non_retryable(surrogate_error, str(surrogate_error))
+                raise surrogate_error
 
-        payload: dict[str, Any] = {"stage": stage, "progress": progress}
+        payload: dict[str, Any] = {"stage": stage_text, "progress": progress}
         if note is not None:
             payload["note"] = note
 

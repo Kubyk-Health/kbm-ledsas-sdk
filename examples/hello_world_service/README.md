@@ -32,8 +32,9 @@ hello_world_service/
 #    ports 5672, 15672 and 10000; if another local stack uses them, stop it
 #    first or pick other ports (HELLO_WORLD_AMQP_PORT, HELLO_WORLD_MGMT_PORT,
 #    HELLO_WORLD_BLOB_PORT; see deploy/local/docker-compose.yml) and use the
-#    same ports in .env.
-cd deploy/local && docker compose up -d && cd ../..
+#    same ports in .env. --wait returns once both are healthy (the broker
+#    accepts connections), so the service can connect at step 4.
+cd deploy/local && docker compose up -d --wait && cd ../..
 
 # 2. Create a venv and install the SDK. Standalone, install it from PyPI:
 python3.11 -m venv .venv     # any Python 3.11+, e.g. python3.12
@@ -113,16 +114,21 @@ docker run --rm --network hello-world-net --env-file .env \
   restart.
 - **Health check.** The `Dockerfile` declares no `HEALTHCHECK`, so that the platform's
   probes decide. For plain Docker or Compose, add one that asks `/ready` from inside the
-  container (it works with either `KBM_LEDSAS_HEALTH_HOST`, and uses the image's own
-  Python):
+  container (it works with either `KBM_LEDSAS_HEALTH_HOST`, uses the image's own Python,
+  and writes one line, not a traceback, into the health log when the answer is not
+  `200`):
 
   ```dockerfile
   HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
-    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/ready', timeout=4)"]
+    CMD ["python", "-c", "import sys, urllib.request\ntry:\n    urllib.request.urlopen('http://127.0.0.1:8090/ready', timeout=4)\nexcept Exception as e:\n    sys.exit(f'not ready: {e}')"]
   ```
 
+  The port is the health server's, `KBM_LEDSAS_HEALTH_PORT` (`8090` by default): change
+  it in the URL when you set another port (with `0` there is no health server to ask).
   `/ready` answers `503` during a broker outage and while the service stops, so Docker
-  marks the container unhealthy then; Docker itself never restarts an unhealthy container.
+  marks the container unhealthy then (`not ready: HTTP Error 503: Service Unavailable`
+  in `docker inspect --format '{{json .State.Health}}'`); Docker itself never restarts
+  an unhealthy container.
 
 ### Base image
 
@@ -132,9 +138,19 @@ which comes with the SDK and its runtime dependencies installed:
 
 - **The tag is the SDK version.** `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6`
   runs SDK 0.3.6; change the tag to move the service to another SDK release. The tag is
-  written literally so that a dependency bot (for example Dependabot's `docker`
-  ecosystem) can propose the next one. `latest` moves with every release, so do not
-  build on it. For a fully reproducible build, pin the digest as well:
+  written literally so that a dependency bot can propose the next one once you copy
+  this folder into your own repository: for Dependabot, add a `docker` entry for the
+  folder that holds the `Dockerfile` to your repository's `.github/dependabot.yml`
+  (this repository has none for the example, whose tag moves with each SDK release):
+
+  ```yaml
+    - package-ecosystem: docker
+      directory: "/"            # the folder of your Dockerfile
+      schedule:
+        interval: weekly
+  ```
+
+  `latest` moves with every release, so do not build on it. For a fully reproducible build, pin the digest as well:
   `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6@sha256:<digest>`.
 - **Do not install the SDK again.** Never list `kbm-ledsas-sdk` in `requirements.txt`,
   and never copy an SDK wheel into the image. The base image pins its SDK version, so a
@@ -147,7 +163,9 @@ which comes with the SDK and its runtime dependencies installed:
 - **User and paths.** The image runs as the non-root user `kbmuser` (uid 1000) in
   `/app`. The `Dockerfile` switches to `USER root` only around `pip install` (the base
   image turns off per-user site-packages, so packages go into the system site-packages)
-  and the final pip-removal step, then back to `USER kbmuser`. It makes `/app` owned by
+  and the final pip-removal step, then back to `USER 1000:1000` (`kbmuser` by
+  number: Kubernetes `runAsNonRoot` can only verify a numeric user, so the pod
+  starts without a `runAsUser`). It makes `/app` owned by
   root and copies `main.py` without `--chown`, so the running service can neither change
   nor replace its code; the service writes no files in `/app` (use `/tmp` for scratch
   files). Its `LABEL` instruction clears the base image's labels (title, version,
@@ -156,12 +174,11 @@ which comes with the SDK and its runtime dependencies installed:
   image, never at runtime, so the last root step of the `Dockerfile` uninstalls it. Keep
   every `pip` command above that step (below it pip is gone, so a `pip` command fails the
   build), and install into the base image's Python, not into a virtual environment: the
-  step's check fails the build if pip is still installed anywhere in the image. (The base
-  image may still carry `setuptools`, `wheel` and Python's own bundled installer archive
-  under `ensurepip`; they are inert as long as nothing builds packages, runs `ensurepip`
-  or creates a virtual environment, which a service image must not do. Remove them in
-  your own image if you want them gone.) A service must not install packages while it runs: install everything it
-  needs at build time, through `requirements.txt`.
+  step's check fails the build if pip is still installed anywhere in the image. The base
+  image ships without `setuptools`, `wheel` and Python's bundled installer archive under
+  `ensurepip`: pip is the only installer left for the build, and this step removes it. A
+  service must not install packages while it runs: install everything it needs at build
+  time, through `requirements.txt`.
 - **One stage.** Keep a single `FROM` line, on this base image.
 
 #### Third-party packages on Alpine (musl libc)
@@ -184,6 +201,8 @@ can look like it worked: some older wheels on that index carry the generic
 
 ## Updating the SDK version
 
-1. Change the base image tag on the `FROM` line of the `Dockerfile` and the
-   `kbm-ledsas-sdk==` pin in "Run it locally".
+1. Change the SDK version everywhere this folder names it: the base image tag on
+   the `FROM` line of the `Dockerfile` (and in "Base image" above), the
+   `kbm-ledsas-sdk==` pin in "Run it locally", and the same pin in the docstring
+   of `main.py`.
 2. Re-run the tests and one local round-trip (steps above).

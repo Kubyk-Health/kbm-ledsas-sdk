@@ -1,9 +1,12 @@
 [build-system]
 # Build backend pinned exactly (not a floor): an unpinned setuptools changes the
 # wheel (its dist-info/WHEEL "Generator:" line) whenever setuptools releases.
-# Pinned, and built with SOURCE_DATE_EPOCH set to the commit time (as the CI and
-# release workflows do), the wheel published to PyPI has the same file contents
-# as one built from the same commit before the release. Bump deliberately.
+# The wheel is reproducible: built from the tagged commit with these pins,
+# SOURCE_DATE_EPOCH set to the commit time and umask 022 (as the CI and release
+# workflows do), it is byte-identical to the wheel published to PyPI. The sdist
+# is not (its tar and gzip headers carry the build time and the builder's
+# account). Keep these pins equal to .github/release-requirements.in. Bump
+# deliberately.
 requires = ["setuptools==84.0.0", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
@@ -33,7 +36,16 @@ classifiers = [
 dependencies = [
     "pydantic>=2.5.0,<3.0",
     "aio-pika>=9.4.0,<11.0",
+    # Imported directly (exceptions, and the protocol decoders the SDK
+    # makes tolerant of non-UTF-8 message properties), so declared with the
+    # ranges the SDK is tested with rather than left to aio-pika.
+    "aiormq>=6.8.0,<8.0",
+    "pamqp>=3.3.0,<5.0",
     "azure-storage-blob>=12.19.0,<13.0",
+    # Imported directly (azure.core). Security floor: 1.38.0 fixes
+    # CVE-2026-21226 (PYSEC-2026-1208); without it an in-place upgrade keeps
+    # an older, vulnerable azure-core.
+    "azure-core>=1.38.0,<2.0",
     # Health server + azure-storage-blob async transport. Security floor:
     # 3.14.3 fixes CVE-2026-69244.
     "aiohttp>=3.14.3,<4.0",
@@ -48,20 +60,22 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    # Upper bounds on the formatters/linters so a future release can't reformat
-    # the tree or add rules and break `black --check` / `ruff check` on an
-    # unrelated PR. Bump deliberately.
+    # Upper bounds on the formatters, linters and type checker so a future
+    # release can't reformat the tree or add rules and break `black --check` /
+    # `ruff check` / the blocking mypy checks on an unrelated PR. Bump
+    # deliberately.
     "ruff>=0.5,<0.18",
     "black>=26.3.1,<27",
-    "mypy>=1.10",
+    "mypy>=1.10,<3",
     "build>=1.2.1",
+    "twine>=6.1,<8",
 ]
 
 [project.urls]
 Homepage = "https://github.com/Kubyk-Health/kbm-ledsas-sdk"
 Repository = "https://github.com/Kubyk-Health/kbm-ledsas-sdk"
 Issues = "https://github.com/Kubyk-Health/kbm-ledsas-sdk/issues"
-Changelog = "https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/v0.3.6/CHANGELOG.md"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -81,7 +95,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 markers = [
-    "integration: live tests that need a local RabbitMQ on 127.0.0.1:5672 (skipped when none answers)",
+    "integration: live tests that need a RabbitMQ (127.0.0.1:5672, or LEDSAS_TEST_RABBITMQ_URL; skipped when none answers)",
 ]
 
 [tool.mypy]

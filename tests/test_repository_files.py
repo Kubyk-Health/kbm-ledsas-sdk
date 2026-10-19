@@ -59,6 +59,52 @@ def test_readme_lists_both_deployment_id_variables():
     assert "KBM_LEDSAS_DEPLOYMENT_ID" in rows
     assert "KBM_LASTCOMMITID" in rows
     assert "KBM_LASTCOMMITID" in rows["KBM_LEDSAS_DEPLOYMENT_ID"]  # the precedence is stated
+    assert "Older alias of `KBM_LEDSAS_DEPLOYMENT_ID`" in rows["KBM_LASTCOMMITID"]
+    assert "The SDK sets neither" in rows["KBM_LEDSAS_DEPLOYMENT_ID"]
+
+
+# Wording that says or implies that something other than the user sets a
+# deployment-id variable (nothing does: the SDK only reads them).
+PLATFORM_SETS = re.compile(
+    r"platforms?\b|\bset (?:it|them) for you\b|\b(?:is|are|gets?) set by\b|\binject(?:s|ed)?\b|"
+    r"\b(?:Kubernetes|the orchestrator|your orchestrator|CI|the CI)\s+sets?\b",
+    re.I,
+)
+
+
+@pytest.mark.parametrize("rel", ["README.md", "UPGRADING.md", "CHANGELOG.md", "COMPATIBILITY.md"])
+def test_deployment_id_variables_are_never_said_to_be_set_by_a_platform(rel):
+    # Every sentence (or table row) that names either variable: the older name
+    # is called an alias, and nothing says a platform (or anything but the
+    # user) sets them.
+    for unit in text_units(read(rel)):
+        if "KBM_LASTCOMMITID" in unit or "KBM_LEDSAS_DEPLOYMENT_ID" in unit:
+            assert not PLATFORM_SETS.search(unit), (rel, unit[:300])
+        if "KBM_LASTCOMMITID" in unit:
+            assert "alias" in unit, (rel, unit[:300])
+
+
+def text_units(text: str) -> list[str]:
+    """Sentences of the prose, and each Markdown table row as one unit."""
+    out: list[str] = []
+    for block in re.split(r"\n\s*\n", text):
+        lines = block.splitlines()
+        out += [" ".join(ln.split()) for ln in lines if ln.lstrip().startswith("|")]
+        prose = " ".join(" ".join(ln for ln in lines if not ln.lstrip().startswith("|")).split())
+        out += [u for u in re.split(r"(?<=[.;])\s", prose) if u]
+    return out
+
+
+def test_platform_wording_check_catches_the_old_readme_row():
+    # The row as the README had it (split so that this file does not say it).
+    old = (
+        "Read for `deployment_id` when `KBM_LEDSAS_DEPLOYMENT_ID` is unset or blank "
+        "(some deployment plat" + "forms set it)"
+    )
+    assert PLATFORM_SETS.search(old)
+    row = f"| `KBM_LASTCOMMITID` | {old} | *(optional)* |"
+    assert [u for u in text_units(row) if PLATFORM_SETS.search(u)] == [row]
+    assert not PLATFORM_SETS.search("The SDK sets neither; set one at deploy time, for example")
 
 
 def test_readme_does_not_overclaim_typing():
@@ -75,6 +121,49 @@ def test_readme_quickstart_names_the_file_and_a_working_connection_string():
     send = section(quickstart, "Send it a command", level=3)
     for needed in ("upload_blob", 'routing_key="response"', "reply_to", "cmd.csv-processor.v1"):
         assert needed in send, needed
+
+
+def test_readme_quickstart_writes_only_where_the_service_decides():
+    quickstart = section(README, "Quickstart")
+    service = re.search(r"^```python\n(.*?)^```", quickstart, re.M | re.S).group(1)
+    upload = re.search(r"upload_json\((.*?)\n    \)", service, re.S).group(1)
+    # The output container is the service's constant, never one the command names.
+    assert "container=RESULTS_CONTAINER" in upload, upload
+    assert "from_uri(csv_uri).container != INPUT_CONTAINER" in service
+    assert "#security-model" in quickstart
+
+
+def test_readme_send_command_reports_failures_in_one_line():
+    send = section(section(README, "Quickstart"), "Send it a command", level=3)
+    code = re.search(r"^```python\n(.*?)^```", send, re.M | re.S).group(1)
+    compile(code, "send_command.py", "exec")
+    for needed in (
+        "except ChannelNotFoundEntity:",
+        "except TimeoutError:",
+        "except KeyboardInterrupt:",
+        "expiration=WAIT",
+        "aio_pika.connect(",
+    ):
+        assert needed in code, needed
+    assert "connect_robust" not in code  # one attempt: an unreachable broker fails at once
+
+
+def test_readme_features_name_every_blob_method():
+    import inspect
+
+    from kbm_ledsas_sdk.blob.operations import BlobOperations
+
+    features = section(README, "Features")
+    named = set()
+    for group in re.findall(r"`((?:download|upload)_[a-z]+(?:/[a-z]+)*)`", features):
+        verb, _, rest = group.partition("_")
+        named |= {f"{verb}_{kind}" for kind in rest.split("/")}
+    methods = {
+        n
+        for n, _ in inspect.getmembers(BlobOperations, inspect.isfunction)
+        if re.match(r"(?:download|upload)_", n)
+    }
+    assert methods and methods <= named, sorted(methods - named)
 
 
 def test_readme_local_development_loads_the_env_file_from_a_clone():
@@ -230,7 +319,20 @@ def test_builds_are_reproducible_and_release_links_are_pinned():
     release, ci = read(".github/workflows/release.yml"), read(".github/workflows/ci.yml")
     assert "SOURCE_DATE_EPOCH" in release and "SOURCE_DATE_EPOCH" in ci
     assert "a second build" in ci and "cmp " in ci
-    assert "/blob/${TAG}/" in release and "'/blob/main/" in release
+    # The tagged commit is built as it is: no rewrite of the tree before the build.
+    assert "sed -i" not in release.split("Rehearsal version", 1)[1].split("Tests", 1)[1]
+    assert "'/blob/main/" in release  # the guard that fails on a link to main
+    for step in steps("release.yml") + steps("ci.yml"):
+        if "python -m build" in step:
+            assert "umask 022" in step, step
+
+
+def test_the_package_page_and_the_source_link_this_release():
+    for rel in ("README.md", "pyproject.toml"):
+        text = read(rel)
+        assert "/blob/main/" not in text and "/tree/main/" not in text, rel
+        links = re.findall(r"kbm-ledsas-sdk/(?:blob|tree)/([^/\s)]+)/", text)
+        assert links and set(links) == {f"v{VERSION}"}, (rel, sorted(set(links)))
 
 
 def test_release_sbom_has_a_root_component_and_hashes():
@@ -267,7 +369,36 @@ def test_ci_blocks_on_the_typed_consumer_and_runs_the_example_tests():
 
 
 def test_dco_requires_the_authors_sign_off():
-    assert 'grep -Fqx "Signed-off-by: $author"' in read(".github/workflows/dco.yml")
+    dco = read(".github/workflows/dco.yml")
+    assert 'grep -Fqx "Signed-off-by: $author"' in dco
+    # Merge commits ("Update branch") carry no authored change: not checked.
+    assert 'git rev-list --no-merges "$BASE".."$HEAD"' in dco
+
+
+def test_release_tag_must_be_a_v_version():
+    release = read(".github/workflows/release.yml")
+    assert '[[ "$TAG" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]' in release
+    assert "${TAG#v}" not in release
+
+
+def _jobs(workflow: str) -> dict[str, str]:
+    text = read(f".github/workflows/{workflow}")
+    body = text.split("\njobs:\n", 1)[1]
+    return dict(re.findall(r"^  ([a-z-]+):\n((?:^(?:    .*|\s*)\n)*)", body + "\n", re.M))
+
+
+def test_publish_checks_the_build_digests_and_runs_no_unpinned_code_first():
+    jobs = _jobs("release.yml")
+    assert "digests: ${{ steps.build.outputs.digests }}" in jobs["build"]
+    for name in ("publish-pypi", "publish-testpypi"):
+        job = jobs[name]
+        assert re.search(r"^    needs: build$", job, re.M), name  # not the SBOM job
+        check = job.index("needs.build.outputs.digests")
+        assert "sha256sum --check --strict" in job
+        assert check < job.index("pypa/gh-action-pypi-publish"), name
+    # The SBOM job (unpinned dependency closure) runs after the upload.
+    assert "publish-pypi" in jobs["sbom"].split("needs:", 1)[1].splitlines()[0]
+    assert re.search(r"^    needs: \[publish-pypi, sbom\]$", jobs["attach-release-assets"], re.M)
 
 
 def test_secret_scans_cover_the_commits():
@@ -306,6 +437,75 @@ def test_dev_toolchain_floor_skips_the_yanked_build_release():
     assert "build>=1.2.1" in dev
 
 
+def test_every_dev_tool_behind_a_blocking_check_is_bounded():
+    from packaging.requirements import Requirement
+
+    dev = {
+        Requirement(r).name: Requirement(r).specifier
+        for r in tomllib.loads(read("pyproject.toml"))["project"]["optional-dependencies"]["dev"]
+    }
+    # ruff, black and mypy back blocking CI checks; twine backs the metadata check.
+    for tool in ("ruff", "black", "mypy", "twine"):
+        assert tool in dev, tool
+        assert any(spec.operator == "<" for spec in dev[tool]), (tool, str(dev[tool]))
+
+
+def test_the_build_backend_pins_are_the_release_toolchain_pins():
+    backend = tomllib.loads(read("pyproject.toml"))["build-system"]["requires"]
+    lock_in = read(".github/release-requirements.in").splitlines()
+    for pin in backend:
+        assert pin in lock_in, pin
+    assert [ln for ln in lock_in if re.match(r"(?:setuptools|wheel)\b", ln)] == backend
+
+
+def test_contributing_names_the_pins_updated_by_hand():
+    text = " ".join(read("CONTRIBUTING.md").split())
+    assert "Pins that Dependabot does not update" in text
+    for name in ("GITLEAKS_IMAGE", "TRUFFLEHOG_IMAGE", "RabbitMQ service image", "[build-system]"):
+        assert name in text, name
+    scan = read(".github/workflows/secret-scan.yml")
+    for var in ("GITLEAKS_IMAGE", "TRUFFLEHOG_IMAGE"):
+        pinned = re.search(rf"^  {var}: (\S+)$", scan, re.M).group(1)
+        assert f"{var}={pinned}" in read("CONTRIBUTING.md"), var  # the local commands match CI
+
+
+def test_contributing_build_command_runs_without_git():
+    text = read("CONTRIBUTING.md")
+    build = section(text, "Reproducible build", level=3)
+    assert "umask 022" in build and "|| echo 315532800" in build
+    assert "twine check dist/*" in build
+    dev = tomllib.loads(read("pyproject.toml"))["project"]["optional-dependencies"]["dev"]
+    assert any(r.startswith("twine") for r in dev)  # the dev extra installs it
+    assert "Only the wheel is reproducible" in " ".join(build.split())
+
+
+def test_dependencies_name_the_security_floors_and_the_libraries_used_directly():
+    deps = tomllib.loads(read("pyproject.toml"))["project"]["dependencies"]
+    for needed in ("azure-core>=1.38.0,<2.0", "aiormq>=6.8.0,<8.0", "pamqp>=3.3.0,<5.0"):
+        assert needed in deps, needed
+    compat = section(read("COMPATIBILITY.md"), "Runtime dependencies")
+    rows = dict(re.findall(r"^\| `([a-z0-9-]+)` \| `([^`]+)`", compat, re.M))
+    for dep in deps:
+        name, spec = re.match(r"([A-Za-z0-9_.-]+)(.*)", dep).groups()
+        assert name in rows, name
+        assert set(rows[name].split(",")) == set(spec.split(",")), (name, rows[name], spec)
+
+
+def test_compatibility_names_every_python_release_as_tested_or_untested():
+    table = section(read("COMPATIBILITY.md"), "Python")
+    for minor in (11, 12, 13):
+        assert re.search(rf"^\| 3\.{minor} ", table, re.M), minor
+    assert re.search(r"^\| 3\.14 and newer \| Installs, not yet tested \|$", table, re.M)
+    classifiers = tomllib.loads(read("pyproject.toml"))["project"]["classifiers"]
+    tested = sorted(c.rsplit(" ", 1)[1] for c in classifiers if re.search(r"Python :: 3\.\d+$", c))
+    ci = read(".github/workflows/ci.yml")
+    assert f"python-version: {json_list(tested)}" in ci, tested
+
+
+def json_list(items: list[str]) -> str:
+    return "[" + ", ".join(f'"{i}"' for i in items) + "]"
+
+
 # --------------------------------------------------------------------------- #
 # Settings, upgrade notes and links (the changes a 0.3.3 user must know about)
 # --------------------------------------------------------------------------- #
@@ -323,10 +523,24 @@ def test_api_reference_has_a_row_for_every_setting():
     assert missing == [], missing
 
 
+def heartbeat_default() -> int:
+    """The KBM_LEDSAS_HEARTBEAT default of the SDK source (the value it reads
+    when the variable is unset)."""
+    config = read("src/kbm_ledsas_sdk/runtime/config.py")
+    m = re.search(r'_int_env\(\s*"KBM_LEDSAS_HEARTBEAT",\s*(?:"([0-9]+)"|str\((\w+)\))', config)
+    assert m, "no KBM_LEDSAS_HEARTBEAT default in runtime/config.py"
+    if m.group(1):
+        return int(m.group(1))
+    const = re.search(rf"^{m.group(2)}(?::\s*int)?\s*=\s*([0-9]+)\b", config, re.M)
+    assert const, m.group(2)
+    return int(const.group(1))
+
+
 def test_readme_configuration_lists_the_heartbeat():
     config = section(README, "Configuration")
-    row = re.search(r"^\| `KBM_LEDSAS_HEARTBEAT` \|.*\| `15` \|$", config, re.M)
-    assert row, "no KBM_LEDSAS_HEARTBEAT row with its default"
+    row = re.search(rf"^\| `KBM_LEDSAS_HEARTBEAT` \|.*\| `{heartbeat_default()}` \|$", config, re.M)
+    assert row, f"no KBM_LEDSAS_HEARTBEAT row with the SDK's default ({heartbeat_default()})"
+    assert "asyncio.to_thread" in row.group(0)
 
 
 def test_upgrading_tells_the_changes_that_can_break_a_deployment():
@@ -336,8 +550,12 @@ def test_upgrading_tells_the_changes_that_can_break_a_deployment():
         "no_verify_ssl",
         "?cafile=",
         "KBM_LEDSAS_HEARTBEAT",
-        "KBM_LEDSAS_HEARTBEAT=60",
-        "Message models are read-only",
+        f"default `{heartbeat_default()}` seconds",
+        "counts toward\n  `KBM_LEDSAS_MAX_RETRIES`",
+        "invalid `?heartbeat=`",
+        "asyncio.to_thread",
+        "Message models and `BlobRef` are read-only",
+        "BlobRef(uri=..., version_id=...)",
         "model_copy(update=",
         "ASCII digits",
     ):
@@ -350,6 +568,10 @@ def test_compatibility_exception_paragraph_lists_the_other_changes():
     para = text.split(f"**Exception in {VERSION}:**", 1)[1].split("\n## ", 1)[0]
     for change in ("`amq.…`", "no_verify_ssl", "KBM_LEDSAS_HEARTBEAT", "read-only", "ASCII digits"):
         assert change in para, change
+    flat = " ".join(para.split())
+    assert "BlobRef` are read-only" in flat and "BlobRef(version_id=...)" in flat
+    assert "counts toward `KBM_LEDSAS_MAX_RETRIES`" in flat
+    assert "like `BlobRef` " + "already was" not in " ".join(read("UPGRADING.md").split())
 
 
 def test_readme_quickstart_runs_from_an_empty_directory():
@@ -372,6 +594,26 @@ def test_issue_form_links_are_absolute(form):
     assert [link for link in links if not link.startswith(("https://", "mailto:"))] == []
 
 
+PUBLIC_TYPED_MODULES = (
+    "src/kbm_ledsas_sdk/models",
+    "src/kbm_ledsas_sdk/runtime/context.py",
+    "src/kbm_ledsas_sdk/blob/operations.py",
+    "src/kbm_ledsas_sdk/blob/direct_operations.py",
+    "src/kbm_ledsas_sdk/utils/logging.py",
+)
+
+
+def test_ci_blocks_on_strict_typing_of_the_public_modules():
+    typed = [s for s in steps("ci.yml") if "Type check the public modules" in s]
+    assert typed and "continue-on-error" not in typed[0], typed
+    step = " ".join(typed[0].split())
+    assert "mypy --strict --follow-imports=silent" in step
+    for module in PUBLIC_TYPED_MODULES:
+        assert module in step, module
+        assert (ROOT / module).exists(), module
+    assert " ".join(PUBLIC_TYPED_MODULES) in read("CONTRIBUTING.md")
+
+
 def test_ci_runs_the_typed_consumer_test_and_requires_mypy():
     typed = [s for s in steps("ci.yml") if "tests/test_typed_consumer.py" in s]
     assert typed and "continue-on-error" not in typed[0]
@@ -386,7 +628,7 @@ def test_configuration_error_points_at_a_reachable_reference():
     problems = missing_connection_settings(SDKConfig(service_name="svc"))
     pointer = problems[-1]
     assert (
-        "https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/docs/SDK_API_REFERENCE.md"
+        f"https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/v{VERSION}/docs/SDK_API_REFERENCE.md"
         in pointer
     )
     assert pointer.endswith("#environment-variables).")
@@ -419,8 +661,8 @@ def test_upgrading_and_compatibility_state_the_old_heartbeat_as_the_library_defa
 
 def test_upgrading_states_the_heartbeat_detection_time():
     # The client library gives up after 3 * (interval + 1) s and checks every
-    # interval // 2 s: 48 to 55 s at the default 15.
-    interval = 15
+    # interval // 2 s: 183 to 213 s at the default 60.
+    interval = heartbeat_default()
     low, high = 3 * (interval + 1), 3 * (interval + 1) + max(1, interval // 2)
     text = " ".join(section(read("UPGRADING.md"), f"Upgrading to {VERSION}").split())
     assert f"{low} to {high}" in text
@@ -456,6 +698,128 @@ def test_waits_for_the_stack_refuses_a_bare_up():
     assert waits_for_the_stack("docker compose -f x.yml up -d --wait\npython main.py\n")
 
 
+def test_contributing_documents_the_live_test_broker_variable():
+    text = read("CONTRIBUTING.md")
+    assert "LEDSAS_TEST_RABBITMQ_URL" in text and "HELLO_WORLD_AMQP_PORT" in text
+    live = read("tests/integration/test_reply_unroutable_live.py")
+    assert "LEDSAS_TEST_RABBITMQ_URL" in live
+    assert "--wait" in live  # the skip message starts the stack the way that works
+    # The broker address is read from the environment; 127.0.0.1:5672 only as the default.
+    assert re.search(
+        r'^DEFAULT_RABBITMQ_URL = "amqp://guest:guest@127\.0\.0\.1:5672/"$', live, re.M
+    )
+    assert re.search(r"^RABBITMQ_URL = live_rabbitmq_url\(\)$", live, re.M)
+    assert not re.search(r'^RABBITMQ_(?:HOST|PORT) = ["0-9]', live, re.M)  # derived from the URL
+
+
+def test_every_compose_up_in_the_documents_waits_for_the_stack():
+    for path in sorted(ROOT.rglob("*.md")) + sorted(ROOT.rglob("docker-compose*.yml")):
+        if set(path.relative_to(ROOT).parts) & {".git", ".venv", "venv", "build", "dist"}:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for no, line in enumerate(text.splitlines(), 1):
+            if re.search(r"docker compose\b.*\bup\b.*\s-d\b", line):
+                assert (
+                    "--wait" in line or "until " in text
+                ), f"{path.relative_to(ROOT)}:{no}: {line}"
+
+
+# --------------------------------------------------------------------------- #
+# The example's README (its wording is checked here, not by the example's own
+# tests, so that a copy of the example can rewrite its README freely)
+# --------------------------------------------------------------------------- #
+EXAMPLE_README = read("examples/hello_world_service/README.md")
+
+
+def test_example_readme_container_section_runs_against_the_local_stack():
+    container = section(EXAMPLE_README, "Container image")
+    assert "docker run" in container
+    for setting in (
+        "KBM_LEDSAS_ALLOW_INSECURE_AMQP",
+        "KBM_LEDSAS_HEALTH_HOST=0.0.0.0",
+        "--network",
+    ):
+        assert setting in container, setting
+    assert "stop_grace_period" in container or "docker stop -t" in container
+
+
+def test_example_readme_names_the_port_variables_and_the_handler_timeout():
+    run = section(EXAMPLE_README, "Run it locally")
+    for var in ("HELLO_WORLD_AMQP_PORT", "HELLO_WORLD_MGMT_PORT", "HELLO_WORLD_BLOB_PORT"):
+        assert var in run, var
+    assert "KBM_LEDSAS_HANDLER_TIMEOUT" in run
+
+
+def test_example_readme_states_what_the_base_image_ships():
+    text = " ".join(EXAMPLE_README.split())
+    assert "stays in the image" not in text and "may still carry" not in text
+    assert "The base image ships without `setuptools`, `wheel`" in text
+
+
+def test_example_wording_names_no_indirect_path():
+    for rel in ("examples/hello_world_service/README.md", "examples/hello_world_service/main.py"):
+        assert "straight to" not in read(rel), rel
+
+
+def test_example_dependency_bot_advice_is_for_your_own_repository():
+    text = " ".join(EXAMPLE_README.split())
+    assert "into your own repository" in text and "package-ecosystem: docker" in EXAMPLE_README
+    # Every place the example names the SDK version is listed in "Updating the SDK version".
+    update = " ".join(section(EXAMPLE_README, "Updating the SDK version").split())
+    pins = {
+        "Dockerfile": f"kbm-ledsas-base-direct:{VERSION}"
+        in read("examples/hello_world_service/Dockerfile"),
+        "main.py": f"kbm-ledsas-sdk=={VERSION}" in read("examples/hello_world_service/main.py"),
+        "Run it locally": f"kbm-ledsas-sdk=={VERSION}" in section(EXAMPLE_README, "Run it locally"),
+    }
+    for where, present in pins.items():
+        if present:
+            assert where in update, where
+
+
+HEALTHCHECK_RX = re.compile(r"^HEALTHCHECK [^\n]*\\\n\s*CMD (\[.*\])$", re.M)
+
+
+def test_example_healthcheck_reports_a_503_in_one_line(tmp_path):
+    import json
+    import subprocess
+    import sys
+    import textwrap
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    blocks = re.findall(r"```dockerfile\n(.*?)^\s*```", EXAMPLE_README, re.S | re.M)
+    block = next(textwrap.dedent(b) for b in blocks if "HEALTHCHECK" in b)
+    cmd = json.loads(HEALTHCHECK_RX.search(block).group(1))
+    assert cmd[:2] == ["python", "-c"]
+
+    class Unavailable(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - the http.server API
+            self.send_response(503)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Unavailable)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        code = cmd[2].replace(":8090/", f":{server.server_port}/")
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    finally:
+        server.shutdown()
+    assert r.returncode == 1
+    assert "Traceback" not in r.stderr
+    assert r.stderr.strip().splitlines() == ["not ready: HTTP Error 503: Service Unavailable"]
+    assert "KBM_LEDSAS_HEALTH_PORT" in block or "KBM_LEDSAS_HEALTH_PORT" in EXAMPLE_README
+
+
+def test_example_env_says_the_container_setting_is_informational():
+    env = read("examples/hello_world_service/.env.example")
+    assert "Informational only" in env
+    assert "required at startup" not in env and "Default blob container" not in env
+
+
 def test_upgrading_and_compatibility_keep_no_verify_ssl_zero_apart():
     # The client library verifies the certificate when no_verify_ssl is "0" (or
     # absent), and the SDK accepts that value: only other values are refused.
@@ -463,3 +827,35 @@ def test_upgrading_and_compatibility_keep_no_verify_ssl_zero_apart():
         text = " ".join(read(rel).split())
         assert "any value except `0`" in text, rel
         assert "whatever its " + "value" not in text, rel
+
+
+def test_the_0_3_6_behaviour_changes_are_in_the_upgrade_and_compatibility_guides():
+    upgrading = " ".join(section(read("UPGRADING.md"), f"Upgrading to {VERSION}").split())
+    for needed in (
+        "New, optional `KBM_LEDSAS_ALLOWED_CONTAINERS`",
+        "kbm_ledsas_sdk.errors.ContainerNotAllowed",
+        "`download_json` and `upload_json` take only a JSON object or array",
+        "`Command`, `Response` and `Status` check their envelope's `type`",
+        "A consumer the broker cancels is noticed",
+        "Configured secrets are masked wherever they appear",
+        "`'**redacted**'`",
+    ):
+        assert needed in upgrading, needed
+    compat = " ".join(read("COMPATIBILITY.md").split(f"**Exception in {VERSION}:**", 1)[1].split())
+    for needed in (
+        "KBM_LEDSAS_ALLOWED_CONTAINERS",
+        "take only a JSON object or array",
+        "a consumer the broker cancels is noticed",
+        "'**redacted**'",
+        "another `type`",
+    ):
+        assert needed in compat, needed
+
+
+def test_readme_documents_the_container_allowlist():
+    config = section(README, "Configuration")
+    row = re.search(r"^\| `KBM_LEDSAS_ALLOWED_CONTAINERS` \|.*\|$", config, re.M)
+    assert row and "ContainerNotAllowed" in row.group(0) and "no restriction" in row.group(0)
+    quickstart = " ".join(section(README, "Quickstart").split())
+    assert "KBM_LEDSAS_ALLOWED_CONTAINERS" in quickstart
+    assert "does not authenticate callers" in quickstart

@@ -11,11 +11,33 @@ preceding the actual ERROR.
 from __future__ import annotations
 
 import os
+import re
 from urllib.parse import parse_qsl, urlparse
 
 from kbm_ledsas_sdk.utils.logging import mask_url_secrets, masked_logger
 
 logger = masked_logger(__name__)
+
+
+class RedactedStr(str):
+    """A credential-bearing setting (the broker URL, the storage connection
+    string): the value itself everywhere a string is used (``str()``,
+    comparisons, the client libraries), but ``repr()`` - and so every
+    display path built on it: ``vars()`` / ``__dict__`` reprs, ``pprint``,
+    rich's ``inspect`` and pretty-printing, debugger variable views - shows
+    ``'**redacted**'``."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "'**redacted**'"
+
+
+def redacted(value: str | None) -> str | None:
+    """``value`` as a :class:`RedactedStr` (None stays None)."""
+    if value is None or isinstance(value, RedactedStr):
+        return value
+    return RedactedStr(value)
 
 
 # Hosts that don't need TLS — credentials never leave the local box.
@@ -74,8 +96,22 @@ def _read_env(name: str, default: str | None = None) -> str | None:
     return _strip_surrounding_quotes(raw.strip()).strip()
 
 
-_TRUTHY_BOOL_VALUES = frozenset({"1", "true", "yes", "on", "t", "y"})
-_FALSY_BOOL_VALUES = frozenset({"0", "false", "no", "off", "f", "n"})
+# The accepted boolean spellings, as (true, false) pairs: the parser and
+# its error message are both built from this one table.
+_BOOL_SPELLINGS = (
+    ("true", "false"),
+    ("1", "0"),
+    ("yes", "no"),
+    ("on", "off"),
+    ("t", "f"),
+    ("y", "n"),
+)
+_TRUTHY_BOOL_VALUES = frozenset(true for true, _ in _BOOL_SPELLINGS)
+_FALSY_BOOL_VALUES = frozenset(false for _, false in _BOOL_SPELLINGS)
+# "1/0, yes/no, on/off, t/f and y/n"
+_OTHER_BOOL_SPELLINGS = ", ".join(
+    f"{true}/{false}" for true, false in _BOOL_SPELLINGS[1:-1]
+) + " and {}/{}".format(*_BOOL_SPELLINGS[-1])
 
 
 def parse_bool_env(name: str, default: bool = False) -> bool:
@@ -98,8 +134,8 @@ def parse_bool_env(name: str, default: bool = False) -> bool:
     if value in _FALSY_BOOL_VALUES:
         return False
     raise ValueError(
-        f"{name}={raw[:40]!r} is not a boolean (use true or false; 1/0, "
-        f"yes/no and on/off are accepted too)"
+        f"{name}={raw[:40]!r} is not a boolean (use true or false; "
+        f"{_OTHER_BOOL_SPELLINGS} are accepted too, in any letter case)"
     )
 
 
@@ -185,7 +221,8 @@ def check_broker_url_shape(url: str) -> None:
     """
     hint = ""
     stripped = url.strip()
-    if stripped[:1] in ("'", '"') or stripped[-1:] in ("'", '"'):
+    quoted = stripped[:1] in ("'", '"') or stripped[-1:] in ("'", '"')
+    if quoted:
         hint = (
             " It starts or ends with a quote character: quote the whole "
             "value with one matching pair of quotes, or not at all."
@@ -229,6 +266,55 @@ def check_broker_url_shape(url: str) -> None:
             "KBM_LEDSAS_RABBITMQ_URL has port 0; use the broker's port "
             "(5672 for amqp://, 5671 for amqps://)."
         )
+    if quoted:
+        # A quote left at one end (an unmatched quote; a matched pair is
+        # removed when the variable is read) would otherwise reach the
+        # broker as part of the virtual host or the password.
+        raise ValueError("KBM_LEDSAS_RABBITMQ_URL is not a usable broker URL." + hint)
+    check_url_heartbeat(parsed.query)
+
+
+# Largest heartbeat interval, in seconds, the SDK accepts (the same bound
+# as KBM_LEDSAS_HEARTBEAT).
+HEARTBEAT_MAX_S = 600
+_WHOLE_NUMBER = re.compile(r"[0-9]{1,6}")
+
+
+def url_heartbeat(query: str) -> str | None:
+    """The ``heartbeat`` value of a broker URL's query, as the client
+    library reads it (the first value of the key spelled exactly
+    ``heartbeat``), or None when the key is absent."""
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        if key == "heartbeat":
+            return value
+    return None
+
+
+def check_url_heartbeat(query: str) -> None:
+    """Refuse a ``?heartbeat=`` in the broker URL that is not a whole
+    number of seconds between 0 and 600. The client library reads any
+    other value (``abc``, ``-5``, ``99999``, ``1.5``) as 0, which turns
+    heartbeats off without a word. The value is quoted: it is not a
+    secret."""
+    value = url_heartbeat(query)
+    if value is None:
+        return
+    if _WHOLE_NUMBER.fullmatch(value) and int(value) <= HEARTBEAT_MAX_S:
+        return
+    # Shown as written in the URL (before "+" / "%xx" decoding).
+    written = next(
+        (
+            item.partition("=")[2]
+            for item in re.split("[&;]", query)
+            if item.partition("=")[0] == "heartbeat"
+        ),
+        value,
+    )
+    raise ValueError(
+        f"KBM_LEDSAS_RABBITMQ_URL: ?heartbeat={written[:20]!r} is not a whole "
+        f"number of seconds between 0 and {HEARTBEAT_MAX_S} (0 turns "
+        f"heartbeats off, so a broker that stops answering is not detected)"
+    )
 
 
 # The broker URL query option of the client library that turns off TLS

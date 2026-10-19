@@ -277,7 +277,7 @@ class AMQPPublisher:
         channel = await self._round_trip(self._open_transient_channel())
         try:
             # Passive declare: only check existence, do NOT redeclare with our
-            # own args. This lets the caller (orchestrator) own the exchange's
+            # own args. This lets the caller own the exchange's
             # type/durability/etc. and prevents PRECONDITION_FAILED channel
             # closures from arg mismatches. The transient channel is the
             # blast-radius if the exchange is missing.

@@ -10,8 +10,11 @@ import logging
 import math
 import re
 import sys
+from collections.abc import MutableMapping
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote as _url_quote
+from urllib.parse import unquote as _url_unquote
 
 # The datefmt older releases passed for the JSON ``timestamp`` (local time,
 # whole seconds, no offset). Treated like "no datefmt": the timestamp is
@@ -229,11 +232,26 @@ def _json_safe_field(value: Any) -> Any:
 # ISO 8601 with milliseconds, as in the JSON format.
 _LEGACY_TEXT_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
+# Unicode format characters (category Cf, as of Unicode 15.1): bidirectional
+# overrides and isolates (U+202A-U+202E, U+2066-U+2069), zero-width
+# characters (U+200B-U+200F), the byte order mark, ... They are invisible,
+# and a bidirectional override makes a terminal show the rest of the line in
+# another order, so a value could disguise what a record says. The same set
+# BlobRef refuses in a blob name.
+_FORMAT_CHARS = (
+    "\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890-\u0891\u08e2\u180e"
+    "\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb"
+    "\U000110bd\U000110cd\U00013430-\U0001343f\U0001bca0-\U0001bca3"
+    "\U0001d173-\U0001d17a\U000e0001\U000e0020-\U000e007f"
+)
 # C0 control characters, DEL and the C1 range (\x9b is a one-byte terminal
-# escape introducer), plus the Unicode line and paragraph separators.
-_CONTROL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+# escape introducer), the Unicode line and paragraph separators and the
+# format characters above.
+_CONTROL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029" + _FORMAT_CHARS + "]")
 # The same, except the newline (kept between the lines of a traceback).
-_CONTROL_CHARS_BUT_NEWLINE = re.compile("[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029]")
+_CONTROL_CHARS_BUT_NEWLINE = re.compile(
+    "[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029" + _FORMAT_CHARS + "]"
+)
 # Plain values that need no quotes in a key=value pair.
 _PLAIN_VALUE = re.compile(r"[A-Za-z0-9_.:/@+-]+")  # used with fullmatch
 
@@ -244,7 +262,9 @@ def _escape_control(match: "re.Match[str]") -> str:
     if ch in named:
         return named[ch]
     code = ord(ch)
-    return f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}"
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
 
 
 def _escape_text(text: str) -> str:
@@ -295,9 +315,10 @@ class TextFormatter(logging.Formatter):
         "RESET": "\033[0m",
     }
 
-    # Extras rendered in their own bracket (correlation_id, trace_id) or
-    # that are the same on every line (service_name).
-    _NOT_AS_PAIRS = frozenset({"correlation_id", "trace_id", "service_name"})
+    # Extras rendered in their own bracket (correlation_id, trace_id).
+    # service_name is a key=value pair like every other field, as in the
+    # JSON format.
+    _NOT_AS_PAIRS = frozenset({"correlation_id", "trace_id"})
 
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as one escaped line (plus any traceback)."""
@@ -361,9 +382,14 @@ _ANY_URL = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)([^\s'\"<>]+)")
 # taken for the start of a value running to the next ";", which would drop
 # that punctuation.
 _ALREADY_MASKED_VALUE = r"(?!\*\*\*(?:#\*\*\*)?[.,:!?)\]}]*(?:[&;\s'\"<>]|$))"
-_SECRET_KEYS = r"AccountKey|SharedAccessSignature|SharedAccessKey|Password|Pwd|account_key"
+_SECRET_KEYS = (
+    r"AccountKey|SharedAccessSignature|SharedAccessKey|Password|Pwd|account_key"
+    r"|client_secret|api_key"
+)
+# KEY=value, with optional spaces around "=" or a ":" in its place
+# ("AccountKey = x", "AccountKey:x").
 _CONNECTION_STRING_SECRET = re.compile(
-    r"(?i)\b(" + _SECRET_KEYS + r")=" + _ALREADY_MASKED_VALUE + r"[^;\s'\"]+"
+    r"(?i)\b(" + _SECRET_KEYS + r")(\s*[=:]\s*)" + _ALREADY_MASKED_VALUE + r"[^;\s'\"]+"
 )
 # The same keys with a quoted value, in any of the forms a configuration
 # dump or a repr shows them: AccountKey="...", 'account_key': '...',
@@ -386,8 +412,20 @@ _BEARER_TOKEN = re.compile(
 # Query parameters that carry a credential in a URL of any scheme: a SAS
 # signature, an OAuth code or token.
 _SAS_SIGNATURE = re.compile(
-    r"(?i)([?&](?:sig|code|access_token|token)=)" + _ALREADY_MASKED_VALUE + r"[^&\s'\"]+"
+    r"(?i)((?:[?&]|&amp;|%26|%3F)(?:sig|code|access_token|token)(?:=|%3D))"
+    + _ALREADY_MASKED_VALUE
+    + r"(?:(?!%26|&amp;)[^&\s'\"])+"
 )
+# A broker URL written with one slash after the scheme ("amqps:/u:p@h"):
+# its user info.
+_BROKER_URL_ONE_SLASH = re.compile(r"(?i)\b(amqps?:/)(?!/)([^\s/'\"<>@]+)@")
+# Secret values the SDK itself was configured with (the broker password,
+# the storage account key, a SAS signature), masked wherever they appear,
+# whatever form the text quotes them in (see register_secret).
+_REGISTERED_SECRETS: "set[str]" = set()
+# Shorter values are not registered: masking every occurrence of a
+# two-letter password would garble unrelated text.
+_REGISTERED_SECRET_MIN_LENGTH = 6
 # A broker URL quoted in a text (up to a space, a quote or an angle bracket).
 _BROKER_URL = re.compile(r"(?i)\bamqps?://[^\s'\"<>]+")
 # Punctuation that ends a sentence rather than the URL it follows.
@@ -547,13 +585,64 @@ def redact_secrets(text: str) -> str:
         text = _BROKER_URL.sub(_mask_broker_url, text)
     if "://" in text:
         text = _ANY_URL.sub(_mask_any_url_userinfo, text)
+    if ":/" in text:
+        text = _BROKER_URL_ONE_SLASH.sub(r"\1***:***@", text)
     text = _QUOTED_SECRET.sub(
         lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}***{m.group(3)}", text
     )
-    text = _CONNECTION_STRING_SECRET.sub(lambda m: f"{m.group(1)}=***", text)
+    text = _CONNECTION_STRING_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}***", text)
     text = _BEARER_HEADER_TOKEN.sub(r"\1***", text)
     text = _BEARER_TOKEN.sub(r"\1***", text)
-    return _SAS_SIGNATURE.sub(r"\1***", text)
+    text = _SAS_SIGNATURE.sub(r"\1***", text)
+    for secret in tuple(_REGISTERED_SECRETS):
+        if secret in text:
+            text = text.replace(secret, "***")
+    return text
+
+
+def register_secret(value: Any) -> None:
+    """Mask ``value`` (and its percent-encoded and percent-decoded forms)
+    wherever a record or a reply text quotes it, in addition to the
+    pattern-based masking (see :func:`redact_secrets`). The SDK registers
+    the secrets it is configured with (the broker password, the storage
+    account key or SAS signature) when its configuration is read; values
+    shorter than six characters are not registered."""
+    if not isinstance(value, str):
+        return
+    forms = {value}
+    try:
+        forms.add(_url_quote(value, safe=""))
+        forms.add(_url_unquote(value))
+    except Exception:  # pragma: no cover - quote/unquote do not fail on text
+        pass
+    for form in forms:
+        if len(form) >= _REGISTERED_SECRET_MIN_LENGTH and form != "***":
+            _REGISTERED_SECRETS.add(form)
+
+
+def register_connection_secrets(rabbitmq_url: Any, blob_conn_string: Any) -> None:
+    """Register (see :func:`register_secret`) the password of the broker
+    URL and the AccountKey / SharedAccessSignature / sig values of the
+    storage connection string."""
+    if isinstance(rabbitmq_url, str) and "://" in rabbitmq_url:
+        rest = rabbitmq_url.split("://", 1)[1]
+        at = _userinfo_end(rest)
+        if at > 0:
+            _user, colon, password = rest[:at].partition(":")
+            if colon:
+                register_secret(password)
+    if isinstance(blob_conn_string, str):
+        for part in blob_conn_string.split(";"):
+            key, eq, val = part.strip().partition("=")
+            if not eq:
+                continue
+            if key.strip().lower() in ("accountkey", "sharedaccesssignature", "sharedaccesskey"):
+                register_secret(val.strip())
+                if key.strip().lower() == "sharedaccesssignature":
+                    for item in val.split("&"):
+                        name, eq2, sig = item.partition("=")
+                        if eq2 and name.strip().lower() == "sig":
+                            register_secret(sig)
 
 
 # What a record carries in place of a text that could not be masked: the
@@ -561,14 +650,77 @@ def redact_secrets(text: str) -> str:
 _WITHHELD_TEXT = "<withheld: secret masking failed>"
 _WITHHELD_MESSAGE = "<record text withheld: secret masking failed>"
 _WITHHELD_TRACEBACK = "<traceback withheld: secret masking failed>"
+# What a field value nested deeper, or holding more items, than the masking
+# walks carries in place of the part it could not walk.
+_WITHHELD_NESTED = "<withheld: too deeply nested or too large to mask>"
+# Bounds of the walk through a field value's dicts, lists, tuples and sets.
+_MASK_MAX_DEPTH = 32
+_MASK_MAX_ITEMS = 10_000
+# Values written as they are (no text to mask).
+_UNMASKED_SCALARS = (int, float, bool, type(None), bytes)
+
+
+class _MaskBudget:
+    """How many more items a field's masking walk may visit."""
+
+    __slots__ = ("left",)
+
+    def __init__(self) -> None:
+        self.left = _MASK_MAX_ITEMS
+
+
+def _mask_value(value: Any, depth: int, budget: _MaskBudget) -> Any:
+    """``value`` with every text inside it masked (see redact_secrets): a
+    string itself, the keys and values of a dict and the items of a list,
+    tuple or set (nested ones too, as a copy: the caller's object is never
+    changed), and the text another object is written as (its repr, which
+    the formatters write in its place). A part deeper than
+    ``_MASK_MAX_DEPTH`` levels, or past ``_MASK_MAX_ITEMS`` items in all,
+    becomes a placeholder (also a structure that contains itself)."""
+    budget.left -= 1
+    if budget.left < 0 or depth > _MASK_MAX_DEPTH:
+        return _WITHHELD_NESTED
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, _UNMASKED_SCALARS):
+        return value
+    if isinstance(value, dict):
+        masked_dict = {}
+        changed = False
+        for key, item in list(value.items()):
+            new_key = _mask_value(key, depth + 1, budget) if isinstance(key, str) else key
+            new_item = _mask_value(item, depth + 1, budget)
+            changed = changed or new_key is not key or new_item is not item
+            masked_dict[new_key] = new_item
+        return masked_dict if changed else value
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+        new_items = [_mask_value(item, depth + 1, budget) for item in items]
+        if all(new is old for new, old in zip(new_items, items)):  # noqa: B905
+            return value
+        # A copy of the built-in type (a subclass, such as a namedtuple, is
+        # written as a list or set either way).
+        if isinstance(value, frozenset):
+            return frozenset(new_items)
+        if isinstance(value, set):
+            return set(new_items)
+        if isinstance(value, tuple):
+            return tuple(new_items)
+        return new_items
+    # Another object: the formatters write its repr; mask that.
+    text = _safe_repr(value)
+    masked = redact_secrets(text)
+    return value if masked == text else masked
 
 
 class SecretMaskFilter(logging.Filter):
     """Masks the secrets (see :func:`redact_secrets`) in the text a record
-    may quote from code the SDK does not control: its message, every text
+    may quote from code the SDK does not control: its message, every
     field (``extra={...}``: ``error``, ``error_message``,
-    ``internal_message``, ``reason``, ``uri``, ...), its traceback and its
-    stack. Fields that are not text (numbers, lists, dicts) are kept as they
+    ``internal_message``, ``reason``, ``uri``, ...), including the texts
+    inside a dict, list, tuple or set value (nested ones too; the masked
+    value is a copy) and the text another object is written as, its
+    traceback and its stack. Numbers, booleans and None are kept as they
     are.
 
     Attached to the logger of every SDK module (:func:`masked_logger`; a
@@ -593,20 +745,23 @@ class SecretMaskFilter(logging.Filter):
         return True
 
     @staticmethod
-    def _text_fields(record: logging.LogRecord) -> list:
+    def _text_fields(record: logging.LogRecord) -> "list[tuple[str, Any]]":
+        """The record's own fields (``extra={...}``) that may hold text:
+        everything except numbers, booleans and None."""
         return [
             (name, value)
             for name, value in list(record.__dict__.items())
-            if name not in JSONFormatter._STANDARD_RECORD_ATTRS and isinstance(value, str)
+            if name not in JSONFormatter._STANDARD_RECORD_ATTRS
+            and not isinstance(value, _UNMASKED_SCALARS)
         ]
 
     def _mask(self, record: logging.LogRecord) -> None:
         for name, value in self._text_fields(record):
             try:
-                masked = redact_secrets(value)
+                masked = _mask_value(value, 0, _MaskBudget())
             except Exception:
                 masked = _WITHHELD_TEXT
-            if masked != value:
+            if masked is not value:
                 record.__dict__[name] = masked
         try:
             message = record.getMessage()
@@ -655,7 +810,7 @@ def masked_logger(name: str) -> logging.Logger:
     return logger
 
 
-def _command_fields(envelope: Any) -> dict:
+def _command_fields(envelope: Any) -> "dict[str, Any]":
     """The fields that identify a command in every per-command record:
     ``correlation_id``, ``message_id`` (the key of the dead-letter queue
     message and of a log search across services), ``command_name``,
@@ -704,6 +859,7 @@ def setup_logging(
     handler.setLevel(getattr(logging, log_level.upper()))
 
     # Set formatter based on format
+    formatter: logging.Formatter
     if log_format == "json":
         formatter = JSONFormatter()
     else:
@@ -912,7 +1068,7 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f"kbm_ledsas_sdk.{name}")
 
 
-class ContextAdapter(logging.LoggerAdapter):
+class ContextAdapter(logging.LoggerAdapter[logging.Logger]):
     """
     Logger adapter that adds context fields to all log records.
 
@@ -925,10 +1081,12 @@ class ContextAdapter(logging.LoggerAdapter):
         # Logs will include correlation_id field
     """
 
-    def process(self, msg: str, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def process(
+        self, msg: Any, kwargs: MutableMapping[str, Any]
+    ) -> "tuple[Any, MutableMapping[str, Any]]":
         """Add context to log record."""
         # Add context fields to 'extra'
         extra = kwargs.get("extra", {})
-        extra.update(self.extra)
+        extra.update(self.extra or {})
         kwargs["extra"] = extra
         return msg, kwargs

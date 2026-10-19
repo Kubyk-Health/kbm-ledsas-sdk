@@ -20,6 +20,7 @@ from aio_pika.exceptions import (
 from aiormq.exceptions import AMQPConnectionError, AMQPError, ChannelInvalidStateError
 from pydantic import ValidationError
 
+from kbm_ledsas_sdk.models.envelope import Envelope
 from kbm_ledsas_sdk.models.messages import Command
 from kbm_ledsas_sdk.transport.base import DeliveryLost
 from kbm_ledsas_sdk.utils.amqp_text import shown as shown_text
@@ -398,6 +399,32 @@ def _nesting_depth_exceeds(value: Any, limit: int) -> bool:
     return False
 
 
+def _refuse_non_command_envelope(data: Any) -> None:
+    """Dead-letter (one WARNING) a message whose envelope ``type`` is not
+    ``command``.
+
+    The Envelope schema's Literal accepts three type values
+    (command/response/status) because the same model is reused for
+    outbound responses and status updates, but only "command" is
+    legitimate on a *command* queue. A forged response/status envelope
+    reaching this queue is either a misconfigured upstream or a hostile
+    reflection attempt: it is dead-lettered without invoking the handler.
+    An envelope that is not valid otherwise is left to the schema check."""
+    raw = data.get("envelope") if isinstance(data, dict) else None
+    if not isinstance(raw, dict) or raw.get("type") in (None, "command"):
+        return
+    try:
+        envelope = Envelope.model_validate(raw)
+    except ValidationError:
+        return  # reported by the validation of the whole message
+    logger.warning(
+        "Envelope type %r is not 'command' on command exchange; dead-lettering",
+        envelope.type,
+        extra={**_command_fields(envelope), "envelope_type": envelope.type},
+    )
+    raise _RejectOnArrivalError
+
+
 def _delivery_fields(message: Any) -> dict[str, Any]:
     """Log fields that identify a delivery whose body cannot be used.
 
@@ -627,6 +654,18 @@ class AMQPConsumer:
             logger.error("Failed to start AMQP consumer", exc_info=True, extra={"error": str(e)})
             raise
 
+    async def consume_again(self) -> None:
+        """Consume from the queue again under the same consumer tag, after
+        the broker cancelled the consumer (its queue was deleted, or the
+        queue's node went down). The commands already received stay held
+        and are settled as usual. Raises what the subscription raises."""
+        tag = self.consumer_tag
+        self.consumer_tag = await self.queue.consume(
+            callback=self._on_message,
+            no_ack=False,
+            consumer_tag=tag,
+        )
+
     async def stop_consuming(
         self, timeout: float | None = None, *, skip_cancel: bool = False
     ) -> list[Command]:
@@ -743,7 +782,8 @@ class AMQPConsumer:
         self.consumer_tag = None
 
         # Reported on the stop record (no metrics backend): redeliveries of a
-        # command still in progress here, settled by that command's outcome.
+        # command still in progress here, settled by that command's outcome,
+        # and closes of the consumer channel at the broker's consumer_timeout.
         if not confirmed:
             abandoned = len(self.pending_messages)
             self.pending_messages.clear()
@@ -754,6 +794,7 @@ class AMQPConsumer:
                 extra={
                     "pending_messages": abandoned,
                     "redeliveries_adopted": self.redeliveries_adopted,
+                    "consumer_timeout_closes": self.consumer_timeout_closes,
                 },
             )
             return False
@@ -772,7 +813,10 @@ class AMQPConsumer:
 
         logger.info(
             "AMQP consumer stopped",
-            extra={"redeliveries_adopted": self.redeliveries_adopted},
+            extra={
+                "redeliveries_adopted": self.redeliveries_adopted,
+                "consumer_timeout_closes": self.consumer_timeout_closes,
+            },
         )
         return True
 
@@ -955,29 +999,13 @@ class AMQPConsumer:
                 ) and _nesting_depth_exceeds(data, MAX_COMMAND_NESTING_DEPTH):
                     raise _BodyTooDeepError
 
+                # Only "command" is legitimate on a command queue (see
+                # below); checked before the whole message is validated,
+                # because Command itself refuses another envelope type.
+                _refuse_non_command_envelope(data)
                 command = Command.model_validate(data)
             finally:
                 self._note_body_read(time.perf_counter() - read_started, len(message.body))
-
-            # Enforce envelope.type=="command" on the command
-            # exchange. The Envelope schema's Literal accepts three type
-            # values (command/response/status) because the same
-            # model is reused for outbound responses and status updates,
-            # but only "command" is legitimate on a *command* queue. A
-            # forged response/status envelope reaching this queue
-            # is either a misconfigured upstream or a hostile reflection
-            # attempt — dead-letter it without invoking the handler.
-            envelope_type = command.envelope.type
-            if envelope_type != "command":
-                logger.warning(
-                    "Envelope type %r is not 'command' on command " "exchange; dead-lettering",
-                    envelope_type,
-                    extra={
-                        **_command_fields(command.envelope),
-                        "envelope_type": envelope_type,
-                    },
-                )
-                raise _RejectOnArrivalError
 
             message_id = command.envelope.message_id
 
@@ -1429,15 +1457,24 @@ class AMQPConsumer:
         longer be acknowledged or rejected."""
         return _channel_closed(self.pending_messages.get(message_id))
 
-    async def release(self, message_id: str) -> None:
-        """Give a pending message back to the broker without counting it
-        as a failed attempt (its retry count is unchanged).
+    async def release(self, message_id: str, *, count_attempt: bool = False) -> None:
+        """Give a pending message back to the broker.
 
-        Used when the command's reply could not be sent because the broker
-        connection was lost. If the message's channel is already closed
-        the broker has requeued it by itself and it is simply dropped
-        here; otherwise it is requeued. Never raises.
+        Without ``count_attempt`` it is not counted as a failed attempt
+        (its retry count is unchanged): a command given back without
+        running (at shutdown). With ``count_attempt`` (the command ran, but
+        its reply could not be sent because the broker connection was
+        lost) the attempt counts toward ``KBM_LEDSAS_MAX_RETRIES`` like a
+        retry, so a command whose every run loses the connection (a
+        handler that blocks the event loop past the heartbeat timeout)
+        ends in the dead-letter queue instead of running forever.
+
+        If the message's channel is already closed the broker has requeued
+        it by itself and it is simply dropped here; otherwise it is
+        requeued. Never raises.
         """
+        if count_attempt:
+            self.count_lost_attempt(message_id)
         message = self.pending_messages.pop(message_id, None)
         self._forget_finishing(message_id)
         self._take_ack_timed_out(message_id)
@@ -1526,30 +1563,46 @@ class AMQPConsumer:
                     "AMQP broker not reachable during shutdown; " f"{operation.lower()} not sent"
                 ) from e
             if self._delivery_lost(message_id, message, operation, e):
-                if not requeue and prior_count:
-                    # The command had reached its terminal outcome. Keep
-                    # its retry count so the broker's redelivery is not
-                    # handed a fresh retry budget: a retryable failure
-                    # whose retries were spent goes straight back to its
-                    # terminal outcome on its next failure.
-                    self._set_retry_count(message_id, prior_count)
+                if not requeue:
+                    # The command had reached its terminal outcome but the
+                    # dead-letter was lost with the connection: the attempt
+                    # counts (as a requeue that could not be sent already
+                    # did), so the broker's redelivery is not handed a
+                    # fresh retry budget, and a command whose every
+                    # attempt is lost this way still ends.
+                    self._set_retry_count(message_id, prior_count + 1)
                 raise DeliveryLost(f"{operation} not sent: broker connection lost") from e
             logger.error("Failed to NACK message", exc_info=True, extra={**ids, "error": str(e)})
             raise
         finally:
             self._forget_ids(message_id)
 
+    # Most message_ids whose retry count is kept (see _set_retry_count).
+    RETRY_COUNTS_KEPT = 10_000
+
     def _set_retry_count(self, message_id: str, count: int) -> None:
         """Record ``count`` as the message's retry count.
 
-        The map is bounded: a requeued message whose redelivery lands
-        on ANOTHER replica orphans its slot here forever, so the oldest
-        slot is evicted at the cap instead of growing unboundedly.
-        Eviction only resets that message's local retry budget.
+        The map is bounded (least recently counted first out): a requeued
+        message whose redelivery lands on ANOTHER replica orphans its slot
+        here forever, so the slot counted longest ago is evicted at the
+        cap instead of growing unboundedly. Eviction only resets that
+        message's local retry budget.
         """
-        if message_id not in self.retry_counts and len(self.retry_counts) >= 10_000:
+        self.retry_counts.pop(message_id, None)
+        while len(self.retry_counts) >= self.RETRY_COUNTS_KEPT:
             self.retry_counts.pop(next(iter(self.retry_counts)))
         self.retry_counts[message_id] = count
+
+    def count_lost_attempt(self, message_id: str) -> int:
+        """Count one attempt of ``message_id`` that ended with the broker
+        connection lost (its reply, or its settlement, could not be
+        sent) toward ``KBM_LEDSAS_MAX_RETRIES``, as a retry is counted;
+        return the new count. The count is kept in this process only (a
+        restart, or a redelivery to another instance, starts again)."""
+        count = self.retry_counts.get(message_id, 0) + 1
+        self._set_retry_count(message_id, count)
+        return count
 
     def get_retry_count(self, message_id: str) -> int:
         """How many times this message has been NACK-requeued.

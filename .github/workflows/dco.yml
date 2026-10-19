@@ -2,7 +2,9 @@ name: DCO
 
 # Verifies every commit in a pull request carries a "Signed-off-by:" trailer
 # for its author (Developer Certificate of Origin): the trailer must name the
-# commit's author exactly, as `git commit -s` writes it. See CONTRIBUTING.md.
+# commit's author exactly, as `git commit -s` writes it. Merge commits (for
+# example the one "Update branch" creates) are not checked: they carry no
+# authored change of their own. See CONTRIBUTING.md.
 
 on:
   pull_request:
@@ -26,7 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          for sha in $(git rev-list "$BASE".."$HEAD"); do
+          for sha in $(git rev-list --no-merges "$BASE".."$HEAD"); do
             author="$(git show -s --format='%an <%ae>' "$sha")"
             if ! git show -s --format='%(trailers:key=Signed-off-by)' "$sha" | grep -Fqx "Signed-off-by: $author"; then
               echo "::error::commit $sha is missing a Signed-off-by trailer for its author ($author)"

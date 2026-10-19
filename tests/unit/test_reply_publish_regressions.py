@@ -350,7 +350,7 @@ class TestSendResponseUnroutable:
         assert result is False
         assert transport.reply_publish_failures == 1
         assert transport.reply_unroutable_failures == 0
-        assert "pre-declared this exchange" in caplog.text
+        assert "the caller declared this exchange" in caplog.text
 
 
 # ---------------------------------------------------------------------------

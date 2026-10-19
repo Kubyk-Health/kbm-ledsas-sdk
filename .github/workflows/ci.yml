@@ -43,6 +43,15 @@ jobs:
         # Strict typing of the SDK's own source is being adopted incrementally;
         # report but don't block yet. The typed-consumer step below blocks.
         continue-on-error: true
+      - name: Type check the public modules (mypy --strict, blocking)
+        # The modules behind the public API (message models, ExecutionContext,
+        # the blob operations, the log formatter) are strict-clean; the rest of
+        # src/ is still reported by the advisory step above.
+        env:
+          MYPYPATH: src
+        run: >-
+          mypy --strict --follow-imports=silent
+          src/kbm_ledsas_sdk/models src/kbm_ledsas_sdk/runtime/context.py src/kbm_ledsas_sdk/blob/operations.py src/kbm_ledsas_sdk/blob/direct_operations.py src/kbm_ledsas_sdk/utils/logging.py
       - name: Type check a consumer of the public API (mypy --strict, blocking)
         env:
           MYPYPATH: src
@@ -102,6 +111,9 @@ jobs:
       - name: Build sdist + wheel (twice; the wheels must be identical)
         run: |
           set -euo pipefail
+          # The release workflow builds the same way: file modes from umask 022,
+          # timestamps from the commit time.
+          umask 022
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
           python -m build --no-isolation --outdir dist

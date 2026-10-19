@@ -87,11 +87,20 @@ section lists what may need action.
   Rename the command (callers must send the new name), fix the version, or
   define the handler with `async def handler(ctx, payload)` (run blocking work
   with `await asyncio.to_thread(...)`).
-- **Message models are read-only.** `Envelope`, `Command`, `Response` and `Status`
-  are immutable, like `BlobRef` already was: assigning a field (for example
-  `ctx.envelope.reply_to = ...`, or setting a field of a `Command` you built)
+- **Message models and `BlobRef` are read-only.** `Envelope`, `Command`,
+  `Response`, `Status` and `BlobRef` are immutable (all five could be changed
+  in 0.3.3): assigning a field (for example `ctx.envelope.reply_to = ...`,
+  `ref.uri = ...` on a `BlobRef`, or setting a field of a `Command` you built)
   raises `pydantic.ValidationError` ("Instance is frozen"). Build a changed copy
-  with `model_copy(update={"reply_to": ...})`, or construct a new object.
+  with `model_copy(update={"reply_to": ...})`, or construct a new object
+  (`BlobRef.from_uri(...)` for a blob reference).
+- **`Command`, `Response` and `Status` check their envelope's `type`.** Building
+  one around an envelope of another type (for example
+  `Response(envelope=Envelope(type="command", ...))`) raises
+  `pydantic.ValidationError` (`envelope.type is 'command', not 'response'`).
+  Copy the envelope with `model_copy(update={"type": "response"})`. A response
+  or status sent to a service's command exchange is still dead-lettered with one
+  WARNING, as before.
 - **Return a JSON-serializable `dict` (or nothing).** A handler that returns
   `None` replies `{}`. Any other value without a JSON form, or a result larger than
   `KBM_LEDSAS_MAX_PAYLOAD_BYTES`, is replied as `Permanent` and dead-lettered
@@ -105,6 +114,11 @@ section lists what may need action.
 
 ### Blob storage
 
+- **`BlobRef` takes only `uri`.** `BlobRef(uri=..., version_id=...)` (accepted,
+  and ignored, by 0.3.3) now raises `pydantic.ValidationError` ("BlobRef takes
+  only 'uri'"): put the version in the URI instead,
+  `azblob://<container>/<path>?versionId=<version>`, and read it back from
+  `.version_id`.
 - **`BlobRef` follows the storage naming rules.** A container name Azure would
   refuse, user info or a port in the URI, a query parameter other than
   `versionId`, a `#` fragment, a backslash, and control characters in a blob name
@@ -116,6 +130,23 @@ section lists what may need action.
   `upload_bytes` should call `upload_text`.
 - **`download_stream` honors `chunk_size`** (it used to read 4 MiB chunks
   whatever you asked for).
+- **`download_json` and `upload_json` take only a JSON object or array.** A blob
+  whose JSON root is a number, a string, `true` / `false` or `null` now makes
+  `download_json` raise `ValueError` (not retried; read such content with
+  `download_text` or `download_bytes`), where 0.3.3 returned the scalar.
+  `upload_json` raises `TypeError` before anything is written for anything but a
+  `dict` or a `list` (a tuple included); upload other values with `upload_text`.
+- **New, optional `KBM_LEDSAS_ALLOWED_CONTAINERS`.** Unset (the default) changes
+  nothing. Set to comma-separated container names (`input,results`), it limits
+  every `ctx.blob` operation to them: an upload by its `container` argument, a
+  download by the container of its URI. Any other container raises
+  `kbm_ledsas_sdk.errors.ContainerNotAllowed` (a `PermissionError`) before
+  anything is sent to storage; uncaught, the caller gets one `Permanent` reply
+  (`container 'other' is not allowed (KBM_LEDSAS_ALLOWED_CONTAINERS)`), never the
+  list itself. An empty item (`a,,b`) or a name the storage service would refuse
+  stops the start with one `Configuration error` line. Anyone who can publish a
+  command chooses the blob URIs in it; the setting keeps the service's storage
+  credential to the containers you list.
 
 ### Configuration and startup
 
@@ -131,18 +162,29 @@ section lists what may need action.
   `KBM_LEDSAS_ALLOW_INSECURE_AMQP=1` acknowledges it (then one WARNING is logged).
   Remove it; to trust a private certificate authority, name its certificate with
   `?cafile=<path>` instead.
-- **New `KBM_LEDSAS_HEARTBEAT`** (default `15` seconds, `0` to `600`, `0` turns
-  heartbeats off): the SDK asks the broker for this AMQP heartbeat interval
-  (0.3.3 set none of its own, so the AMQP client library's default of 60 seconds
-  applied). A `?heartbeat=` in `KBM_LEDSAS_RABBITMQ_URL` still wins. A dead broker
-  or network path is now noticed within about 50 seconds (48 to 55 with the
-  default; three intervals plus three seconds), and the SDK reconnects.
-  **Blocking code that holds the event loop longer than about two intervals**
-  (about 30 seconds with the default) now makes the broker close the connection,
-  and the SDK reconnects. Run blocking work with
-  `await asyncio.to_thread(...)` (see "Blocking code is not timed out" in the
-  [API reference](docs/SDK_API_REFERENCE.md)), or set `KBM_LEDSAS_HEARTBEAT=60` for
-  the old timing.
+- **New `KBM_LEDSAS_HEARTBEAT`** (default `60` seconds, `0` to `600`, `0` turns
+  heartbeats off): the AMQP heartbeat interval the SDK asks the broker for. The
+  default is the interval 0.3.3 used (0.3.3 set none of its own, so the AMQP
+  client library's default of 60 seconds applied), so nothing changes unless you
+  set it. A `?heartbeat=` in `KBM_LEDSAS_RABBITMQ_URL` still wins, but **an
+  invalid `?heartbeat=` value** (not a whole number from `0` to `600`, for
+  example `abc` or `-5`) **is refused at start**, where the client library used
+  to turn heartbeats off without a word. A dead broker or network path is
+  noticed within 183 to 213 seconds with the default (three intervals plus
+  three seconds, checked every half interval), and the SDK reconnects.
+- **Blocking code still loses the connection, and such a command now ends in
+  the dead-letter queue.** A handler that holds the event loop (for example
+  `time.sleep()` or CPU-bound work in an `async def`) longer than about two
+  heartbeat intervals (about two minutes with the default) makes the broker
+  close the connection; the command is redelivered after the reconnect. **A
+  redelivery after a lost connection now counts toward
+  `KBM_LEDSAS_MAX_RETRIES`**: once the retries are spent, the command is
+  dead-lettered with one ERROR record and one reply, instead of running again
+  after every reconnect. The count is kept per process (a restart starts it
+  again). Run blocking work with `await asyncio.to_thread(...)` (see "Blocking
+  code is not timed out" in the [API reference](docs/SDK_API_REFERENCE.md));
+  a lower `KBM_LEDSAS_HEARTBEAT` notices a dead broker sooner but shortens how
+  long a handler may block.
 - **A boolean setting must be a boolean.** `KBM_LEDSAS_GENERIC_ERRORS`,
   `KBM_LEDSAS_HEALTH_VERBOSE`, `KBM_LEDSAS_ALLOW_INSECURE_AMQP` and
   `KBM_LEDSAS_DEBUG` accept `true` / `false` (or `1` / `0`, `yes` / `no`,
@@ -164,11 +206,34 @@ section lists what may need action.
 ### Operations
 
 - **`deployment_id` is read as before**: from `KBM_LEDSAS_DEPLOYMENT_ID`, or
-  from `KBM_LASTCOMMITID` when the first is unset or blank. Both names stay
-  supported; nothing to change.
+  from its older alias `KBM_LASTCOMMITID`, read only when
+  `KBM_LEDSAS_DEPLOYMENT_ID` is unset or blank. The older alias stays
+  supported; prefer `KBM_LEDSAS_DEPLOYMENT_ID`. The SDK sets neither; set one
+  at deploy time, for example to the commit id.
 - **`/ready` reports a broker outage** (`503` until the SDK has reconnected by
   itself) and answers `503` while the service stops. A readiness probe that
   expected `200` throughout an outage now sees the outage.
+- **A consumer the broker cancels is noticed.** When the broker cancels the
+  service's consumer (its queue was deleted, or the node that holds a classic
+  queue is down), 0.3.3 consumed nothing more while `/ready` answered `200`.
+  The SDK now logs one ERROR (`The AMQP broker cancelled the command consumer on
+  <queue> ...`), answers `503` on `/ready`, declares the queue again and keeps
+  trying to consume, with a growing delay (at most 30 seconds); one INFO
+  `Consuming commands from <queue> again` when it is back. Nothing to do; alert
+  on that ERROR if you watch the logs.
+- **Configured secrets are masked wherever they appear.** The broker password,
+  the storage `AccountKey` and the `SharedAccessSignature` (6 characters or
+  longer), in their percent-encoded forms too, are replaced by `***` in every
+  log record and reply text the SDK writes, not only where they appear in a
+  URL or a connection string; more key forms are masked as well
+  (`client_secret=`, `api_key=`, `AccountKey = ...`, `%26sig%3D...`). A log
+  parser or a test that expected one of these values in the output now sees
+  `***`.
+- **`repr()` of the connection settings is redacted.** `SDKConfig.rabbitmq_url`
+  and `SDKConfig.blob_conn_string` are a `str` subclass whose `repr()` is
+  `'**redacted**'`, so `repr(config)`, `vars()`, `pprint` and `rich.inspect`
+  show no credential. The value itself, `str()` and comparisons are
+  unchanged.
 - **Log alerts.** A retried failure logs one WARNING per attempt, with a traceback
   only on the last attempt; an alert on `Uncaught exception in handler` at ERROR
   level no longer fires. Alert on the `Max retries (N) exceeded` ERROR (one per

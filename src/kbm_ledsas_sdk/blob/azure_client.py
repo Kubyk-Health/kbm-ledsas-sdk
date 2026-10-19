@@ -8,7 +8,7 @@ streaming for multi-GB file transfers with minimal memory footprint.
 import base64
 import binascii
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 from urllib.parse import urlsplit
 
 from azure.core import MatchConditions
@@ -25,6 +25,7 @@ from azure.storage.blob import ContentSettings
 from azure.storage.blob.aio import BlobServiceClient, ExponentialRetry
 
 from kbm_ledsas_sdk.blob.operations import (
+    BytesLike,
     _check_stream_chunk,
     _check_upload_path,
     _mark_non_retryable,
@@ -902,7 +903,7 @@ class AzureBlobClient:
     async def upload_blob_stream(
         self,
         container: str,
-        stream: AsyncIterator[bytes],
+        stream: AsyncIterable[BytesLike],
         path: str | None = None,
         metadata: dict[str, str] | None = None,
         progress_callback: Callable[[int], None] | None = None,

@@ -20,8 +20,8 @@ LABEL org.opencontainers.image.title="" \
 
 WORKDIR /app
 
-# The base image runs as the non-root user kbmuser (uid 1000). Switch to root
-# only to install this service's own dependencies, then switch back.
+# The base image runs as the non-root user kbmuser (uid 1000, gid 1000). Switch
+# to root only to install this service's own dependencies, then switch back.
 USER root
 # /app (created by the base image for kbmuser) becomes root's, so the running
 # service can neither change nor replace its code here. The service writes no
@@ -42,5 +42,7 @@ RUN PIP_ROOT_USER_ACTION=ignore python -m pip uninstall --yes pip \
  && ! python -c "import pip" 2>/dev/null \
  && ! find / -xdev \( -path '*/site-packages/pip' -o -name 'pip-*.dist-info' \) -print | grep .
 
-USER kbmuser
+# Back to kbmuser, by number: Kubernetes runAsNonRoot can verify a numeric user
+# only (with a name it refuses the pod unless runAsUser is set).
+USER 1000:1000
 CMD ["python", "main.py"]

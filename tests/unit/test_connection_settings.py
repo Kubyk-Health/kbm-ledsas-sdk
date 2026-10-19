@@ -67,13 +67,13 @@ class TestHeartbeat:
 
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://127.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", AZURITE_CONN)
-        assert SDKConfig.from_env("svc").heartbeat == 15
+        assert SDKConfig.from_env("svc").heartbeat == 60
         monkeypatch.setenv("KBM_LEDSAS_HEARTBEAT", "5")
         assert SDKConfig.from_env("svc").heartbeat == 5
         monkeypatch.setenv("KBM_LEDSAS_HEARTBEAT", "601")
         with pytest.raises(pydantic.ValidationError):
             SDKConfig.from_env("svc")
-        assert get_env_var("KBM_LEDSAS_HEARTBEAT").default == "15"
+        assert get_env_var("KBM_LEDSAS_HEARTBEAT").default == "60"
 
     async def test_the_connect_url_carries_it(self, monkeypatch):
         from kbm_ledsas_sdk.transport import direct as direct_module

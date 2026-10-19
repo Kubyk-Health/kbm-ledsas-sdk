@@ -2,7 +2,7 @@
 # RabbitMQ (message queue) + Azurite (Azure Blob Storage emulator).
 #
 # Usage (from this directory):
-#   docker compose up -d        # Start services
+#   docker compose up -d --wait # Start services, return once both are healthy
 #   docker compose ps           # Check status
 #   docker compose down -v      # Stop + discard data
 #
@@ -14,7 +14,7 @@
 # The host ports default to the standard ones (5672/15672/10000). If another
 # local RabbitMQ/Azurite already uses them, choose others, for example
 #   HELLO_WORLD_AMQP_PORT=5673 HELLO_WORLD_MGMT_PORT=15673 \
-#   HELLO_WORLD_BLOB_PORT=10010 docker compose up -d
+#   HELLO_WORLD_BLOB_PORT=10010 docker compose up -d --wait
 # and use the same ports in KBM_LEDSAS_RABBITMQ_URL and the BlobEndpoint of
 # KBM_LEDSAS_BLOB_CONN_STRING (.env). The container, volume and network names are
 # fixed (one such stack per Docker host): stop the other stack first, or rename

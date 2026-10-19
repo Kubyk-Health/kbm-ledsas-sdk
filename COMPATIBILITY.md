@@ -12,10 +12,12 @@ guarantees between releases. For step-by-step upgrade instructions see
 | 3.11   | ✅ |
 | 3.12   | ✅ |
 | 3.13   | ✅ |
+| 3.14 and newer | Installs, not yet tested |
 
 The wheel declares `Requires-Python >=3.11` with no upper bound, so it installs on
 newer interpreters as they are released. CI runs the test suite on 3.11, 3.12, and
-3.13.
+3.13; Python 3.14 is not in the test matrix yet, so test your service on it
+before you move to it.
 
 ## Runtime dependencies
 
@@ -26,6 +28,9 @@ newer interpreters as they are released. CI runs the test suite on 3.11, 3.12, a
 | `azure-storage-blob` | `>=12.19.0,<13.0` |
 | `aiohttp` | `>=3.14.3,<4.0` (security floor) |
 | `cryptography` | `>=50.0.0` (security floor; pulled in transitively) |
+| `azure-core` | `>=1.38.0,<2.0` (security floor; also pulled in by `azure-storage-blob`) |
+| `aiormq` | `>=6.8.0,<8.0` (the AMQP client under `aio-pika`, used directly) |
+| `pamqp` | `>=3.3.0,<5.0` (the AMQP frame codec under `aiormq`, used directly) |
 
 ## Release compatibility matrix
 
@@ -100,7 +105,10 @@ is now refused with a clear error — for example a handler name a command canno
 carry, a handler that is not `async def`, a malformed blob URI, a broker URL that
 is not `amqp://` / `amqps://`, a storage connection string without a credential,
 a broker URL whose `no_verify_ssl` turns certificate verification off (any value
-except `0`; unless `KBM_LEDSAS_ALLOW_INSECURE_AMQP=1` acknowledges it), or a boolean setting with a value that is not a boolean. Some
+except `0`; unless `KBM_LEDSAS_ALLOW_INSECURE_AMQP=1` acknowledges it), a broker
+URL with an invalid `?heartbeat=` value, `BlobRef(version_id=...)`, a
+`Command` / `Response` / `Status` built around an envelope of another `type`,
+or a boolean setting with a value that is not a boolean. Some
 changes are visible on the wire, in the configuration or in the public API:
 
 - **one reply per command**: an attempt that will be retried sends no reply; the
@@ -112,13 +120,26 @@ changes are visible on the wire, in the configuration or in the public API:
   before its handler runs);
 - **version fields are ASCII digits, 1 to 4 on each side of the dot**
   (`schema_version`, `message_version`, the `@app.handler` version);
-- **the SDK asks the broker for a 15-second heartbeat** (new
-  `KBM_LEDSAS_HEARTBEAT`; 0.3.3 set none of its own, so the AMQP client library's
-  default of 60 seconds applied):
-  blocking code that holds the event loop for more than about 30 seconds now loses
-  the broker connection;
-- **`Envelope`, `Command`, `Response` and `Status` are read-only**: assigning a
-  field raises `ValidationError` (build a changed copy with `model_copy(update=...)`);
+- **a command redelivered after a lost broker connection counts toward
+  `KBM_LEDSAS_MAX_RETRIES`** and is dead-lettered once the retries are spent
+  (a handler that blocks the event loop longer than about two heartbeat
+  intervals loses the connection; the interval is unchanged from 0.3.3, 60
+  seconds, and now configurable with the new `KBM_LEDSAS_HEARTBEAT`; 0.3.3 set
+  none of its own, so the AMQP client library's default of 60 seconds applied);
+- **`Envelope`, `Command`, `Response`, `Status` and `BlobRef` are read-only**:
+  assigning a field raises `ValidationError` (build a changed copy with
+  `model_copy(update=...)`), and `BlobRef` takes only `uri` (a version goes
+  in the URI as `?versionId=`);
+- **`download_json` / `upload_json` take only a JSON object or array**: a
+  scalar JSON root raises `ValueError` on download (0.3.3 returned it), and
+  anything but a `dict` or a `list` raises `TypeError` on upload;
+- **a consumer the broker cancels is noticed**: `/ready` answers `503` and
+  the SDK declares the queue and consumes again (0.3.3 stayed ready and
+  consumed nothing);
+- **configured secrets are masked in every log record and reply text**, and
+  the connection settings' `repr()` is `'**redacted**'`;
+- **new optional `KBM_LEDSAS_ALLOWED_CONTAINERS`** (unset: no restriction, as
+  in 0.3.3) limits `ctx.blob` to the listed containers;
 - **a health port that cannot be bound stops the service at start**.
 
 The full list, with what to do for each, is in

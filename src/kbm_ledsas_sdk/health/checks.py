@@ -25,6 +25,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..models.errors import ArgumentTypeError
 from ..utils.logging import masked_logger, redact_secrets
 
 logger = masked_logger(__name__)
@@ -47,6 +48,12 @@ FAILURE_LOG_REPEAT_S = 600.0
 def _checked_timeout(name: str, timeout: float | None) -> float:
     if timeout is None:
         return DEFAULT_CHECK_TIMEOUT_S
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ArgumentTypeError(
+            f"Health check {name!r}: timeout must be a number of seconds "
+            f"greater than 0 and at most {MAX_CHECK_TIMEOUT_S:g}, got "
+            f"{type(timeout).__name__} {timeout!r}"
+        )
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, (int, float))
@@ -99,7 +106,11 @@ class HealthCheckRegistry:
         Raises TypeError when ``check`` is not callable or cannot be called
         without arguments (it would fail on every probe).
         """
-        if not name or not isinstance(name, str):
+        if not isinstance(name, str):
+            raise ArgumentTypeError(
+                f"Health check name must be a non-empty string, got {type(name).__name__}"
+            )
+        if not name:
             raise ValueError("Health check name must be a non-empty string")
         if name in self._checks:
             raise ValueError(f"Health check already registered: {name!r}")

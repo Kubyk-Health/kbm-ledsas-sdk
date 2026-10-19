@@ -6,7 +6,7 @@ Handles parsing and validation of azblob:// URIs with optional version IDs.
 
 import re
 import unicodedata
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import parse_qsl, urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -45,7 +45,7 @@ _REFUSED_CATEGORIES = {
 }
 
 
-def refused_character(text: str) -> tuple | None:
+def refused_character(text: str) -> tuple[int, str] | None:
     """The first character of ``text`` a blob URI or blob path may not
     hold, as ``(code point, kind)`` (kind: ``"control character"``, ...),
     or None."""
@@ -281,7 +281,7 @@ class BlobRef(BaseModel):
     # revalidate_instances: a BlobRef given where a BlobRef is validated
     # (model_validate, a BlobRef field of another model) is checked again,
     # not passed through as it is.
-    model_config = ConfigDict(
+    model_config: ClassVar[ConfigDict] = ConfigDict(
         extra="forbid",
         hide_input_in_errors=True,
         frozen=True,
@@ -373,7 +373,7 @@ class BlobRef(BaseModel):
         return self.model_copy(update=update, deep=deep)
 
     @classmethod
-    def model_construct(cls, _fields_set: set | None = None, **values: Any) -> "BlobRef":
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> "BlobRef":
         """Build a BlobRef from ``uri=...``, checked as :meth:`from_uri`
         checks it (pydantic's construct would skip the checks)."""
         return cls.model_validate(values)
@@ -382,6 +382,9 @@ class BlobRef(BaseModel):
     @classmethod
     def validate_uri_format(cls, v: str) -> str:
         """Validate that URI follows azblob:// format and contains no control characters.
+
+        Internal: a pydantic validator the model runs itself when it is built;
+        not part of the public API (it may change).
 
         Control-character rejection closes a silent-strip inconsistency:
         Python 3.11+ ``urlparse`` strips newlines, tabs, and CR from the

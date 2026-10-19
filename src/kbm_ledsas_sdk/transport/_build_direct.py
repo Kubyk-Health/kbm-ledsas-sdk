@@ -251,7 +251,7 @@ _MISSING_BLOB_CONN_STRING = (
 )
 _SEE_ENV_VARS = (
     'See "Environment Variables" in the SDK API reference '
-    "(https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/docs/SDK_API_REFERENCE.md#environment-variables)."
+    "(https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/v0.3.6/docs/SDK_API_REFERENCE.md#environment-variables)."
 )
 
 

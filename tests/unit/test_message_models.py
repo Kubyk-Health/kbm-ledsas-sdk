@@ -51,8 +51,16 @@ class TestReadOnlyMessages:
             (envelope, "message_id", "99999999-2222-4333-8444-555555555555"),
             (envelope, "reply_to", "resp.other.v1"),
             (Command(envelope=envelope, payload={}), "payload", {}),
-            (Response(envelope=envelope, payload={}), "envelope", envelope),
-            (Status(envelope=envelope, payload={}), "payload", {}),
+            (
+                Response(envelope=envelope.model_copy(update={"type": "response"}), payload={}),
+                "envelope",
+                envelope,
+            ),
+            (
+                Status(envelope=envelope.model_copy(update={"type": "status"}), payload={}),
+                "payload",
+                {},
+            ),
         ):
             with pytest.raises(pydantic.ValidationError):
                 setattr(target, field, value)

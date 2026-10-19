@@ -1,16 +1,26 @@
 name: Release
 
 # Two ways to run:
-#   1. Publish a GitHub Release  -> checks the tag, tests, builds, generates the
-#      SBOM, publishes to PyPI, checks that PyPI holds exactly the built files,
-#      then attaches the sdist, the wheel and the SBOM to the Release.
+#   1. Publish a GitHub Release  -> checks the tag, tests, builds (recording the
+#      SHA-256 of every file built), publishes to PyPI after checking the files
+#      against those digests, checks that PyPI holds exactly the built files,
+#      then generates the SBOM and attaches the sdist, the wheel and the SBOM to
+#      the Release.
 #   2. Run manually (workflow_dispatch) on main -> the same build with a
 #      ".devN" version, published to TestPyPI only (a rehearsal of the whole
 #      flow; every run gets a new version, so it can be repeated).
 #
-# The SBOM is generated BEFORE anything is uploaded: a failure there stops the
-# run before PyPI or TestPyPI receives a file. Every tool is installed from the
-# hash-pinned .github/*-requirements.txt files (pip --require-hashes).
+# What is built is the tagged commit as it is: nothing in the tree is rewritten
+# before the build (the links of the package page already name the release
+# tag), so a build of the same commit with the same SOURCE_DATE_EPOCH and
+# umask gives the same wheel.
+#
+# Nothing that is not hash-pinned runs before the upload: every tool comes from
+# the hash-pinned .github/*-requirements.txt files (pip --require-hashes). The
+# SBOM job, which installs the wheel's dependency closure as a user gets it (not
+# hash-pinned on purpose), runs after the upload; a failure there leaves the
+# published files in place and fails the run before the Release assets are
+# attached.
 #
 # Both use PyPI Trusted Publishing (OIDC) — NO API token is stored in the repo.
 # One-time setup (see CONTRIBUTING.md, "Releases"):
@@ -32,6 +42,10 @@ jobs:
   build:
     name: Check, test and build
     runs-on: ubuntu-latest
+    outputs:
+      # "sha256sum dist/*" output (base64): the publish jobs check their
+      # downloaded files against it before uploading anything.
+      digests: ${{ steps.build.outputs.digests }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,6 +62,12 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
+          # Only a v<major>.<minor>.<patch> tag (the protected tag pattern) publishes.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the release tag $TAG is not v<major>.<minor>.<patch>"
+            exit 1
+          fi
+          VERSION="${TAG:1}"
           git fetch --no-tags origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "::error::the release tag $TAG ($GITHUB_SHA) is not on main"
@@ -55,7 +75,7 @@ jobs:
           fi
           PKG_VERSION="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
           SRC_VERSION="$(PYTHONPATH=src python -c 'import kbm_ledsas_sdk; print(kbm_ledsas_sdk.__version__)')"
-          if [ "$PKG_VERSION" != "${TAG#v}" ] || [ "$SRC_VERSION" != "${TAG#v}" ]; then
+          if [ "$PKG_VERSION" != "$VERSION" ] || [ "$SRC_VERSION" != "$VERSION" ]; then
             echo "::error::pyproject version ($PKG_VERSION) or kbm_ledsas_sdk.__version__ ($SRC_VERSION) does not match the release tag ($TAG)"
             exit 1
           fi
@@ -79,31 +99,33 @@ jobs:
           echo "rehearsal version: ${DEV}"
       - name: Tests
         run: python -m pytest -q -m "not integration"
-      - name: Point the package page's links at the release tag
-        if: github.event_name == 'release'
-        env:
-          TAG: ${{ github.event.release.tag_name }}
+      - name: Check that the package page and the source link a release tag
         run: |
           set -euo pipefail
-          sed -i "s#/blob/main/#/blob/${TAG}/#g; s#/tree/main/#/tree/${TAG}/#g" README.md pyproject.toml
+          # The links are written at sync time, in the commit that is tagged
+          # (README.md is the PyPI page; the source's error messages and
+          # docstrings point at the API reference): none may name main.
+          if grep -rn '/blob/main/\|/tree/main/' README.md pyproject.toml src; then
+            echo "::error::README.md, pyproject.toml or src/ links to main instead of a release tag"
+            exit 1
+          fi
       - name: Build sdist + wheel
+        id: build
         run: |
           set -euo pipefail
+          umask 022
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
           python -m build --no-isolation
           sha256sum dist/*
+          echo "digests=$(cd dist && sha256sum -- * | base64 -w0)" >> "$GITHUB_OUTPUT"
       - name: Check metadata
-        env:
-          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           twine check dist/*
-          if [ "$EVENT" = "release" ]; then
-            if unzip -p dist/*.whl '*.dist-info/METADATA' | grep -n '/blob/main/\|/tree/main/'; then
-              echo "::error::the wheel's METADATA links to main instead of the release tag"
-              exit 1
-            fi
+          if unzip -p dist/*.whl '*.dist-info/METADATA' | grep -n '/blob/main/\|/tree/main/'; then
+            echo "::error::the wheel's METADATA links to main instead of the release tag"
+            exit 1
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -113,7 +135,12 @@ jobs:
 
   sbom:
     name: Generate SBOM
-    needs: build
+    # After the upload (see the header): it installs the published wheel's
+    # dependency closure, which is not hash-pinned.
+    needs: [build, publish-pypi, publish-testpypi]
+    if: >-
+      ${{ !cancelled() && needs.build.result == 'success' &&
+      (needs.publish-pypi.result == 'success' || needs.publish-testpypi.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -161,7 +188,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     if: github.event_name == 'release'
-    needs: [build, sbom]
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -173,6 +200,18 @@ jobs:
         with:
           name: dist
           path: dist
+      - name: Check the files against the build job's digests
+        env:
+          DIGESTS: ${{ needs.build.outputs.digests }}
+        run: |
+          set -euo pipefail
+          echo "$DIGESTS" | base64 -d > "$RUNNER_TEMP/SHA256SUMS"
+          cat "$RUNNER_TEMP/SHA256SUMS"
+          (cd dist && sha256sum --check --strict "$RUNNER_TEMP/SHA256SUMS")
+          if [ "$(find dist -type f | wc -l)" -ne "$(wc -l < "$RUNNER_TEMP/SHA256SUMS")" ]; then
+            echo "::error::dist/ holds other files than the build job built"
+            exit 1
+          fi
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
@@ -215,7 +254,7 @@ jobs:
   publish-testpypi:
     name: Publish to TestPyPI (rehearsal)
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
-    needs: [build, sbom]
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -227,6 +266,18 @@ jobs:
         with:
           name: dist
           path: dist
+      - name: Check the files against the build job's digests
+        env:
+          DIGESTS: ${{ needs.build.outputs.digests }}
+        run: |
+          set -euo pipefail
+          echo "$DIGESTS" | base64 -d > "$RUNNER_TEMP/SHA256SUMS"
+          cat "$RUNNER_TEMP/SHA256SUMS"
+          (cd dist && sha256sum --check --strict "$RUNNER_TEMP/SHA256SUMS")
+          if [ "$(find dist -type f | wc -l)" -ne "$(wc -l < "$RUNNER_TEMP/SHA256SUMS")" ]; then
+            echo "::error::dist/ holds other files than the build job built"
+            exit 1
+          fi
       - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
@@ -237,7 +288,7 @@ jobs:
     if: github.event_name == 'release'
     # After publish-pypi, whose last step proves PyPI holds exactly these files:
     # --clobber then only ever replaces an asset with the file PyPI has.
-    needs: publish-pypi
+    needs: [publish-pypi, sbom]
     runs-on: ubuntu-latest
     permissions:
       contents: write        # required to upload assets to the Release

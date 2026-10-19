@@ -18,6 +18,11 @@ from ..models.blob import (
     container_name_problem,
     refused_character,
 )
+from ..models.errors import ContainerNotAllowed
+from ..utils.logging import masked_logger
+
+_logger = masked_logger(__name__)
+
 
 # Default chunk size: 4MB (optimal for Azure blob storage performance)
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
@@ -411,6 +416,14 @@ class BlobOperations(ABC):
             Exception: Storage errors from the underlying client, e.g. a
                 missing blob.
 
+            ValueError: Also when the content is valid JSON whose root is
+                not an object or an array (a number, a string, true / false,
+                null): replied as Permanent if uncaught (the same content
+                fails the same way). Use ``download_text`` for such content.
+            ContainerNotAllowed: The blob's container is not in
+                ``KBM_LEDSAS_ALLOWED_CONTAINERS`` (every operation; nothing
+                is sent to storage; replied as Permanent if uncaught).
+
         Example:
             >>> data = await ctx.blob.download_json("azblob://dev/config.json")
             >>> print(data["version"])
@@ -493,8 +506,12 @@ class BlobOperations(ABC):
         (as in replies), so the blob is standard JSON (RFC 8259).
 
         Raises:
-            TypeError: If ``obj`` is not JSON-serializable (ValueError for
-                a circular reference), or ``container`` is not a string.
+            TypeError: If ``obj`` is not a dict or a list (the root of the
+                JSON document; use ``upload_text`` / ``upload_bytes`` for
+                other content), is not JSON-serializable (ValueError for a
+                circular reference), or ``container`` is not a string.
+            ContainerNotAllowed: ``container`` is not in
+                ``KBM_LEDSAS_ALLOWED_CONTAINERS`` (every operation).
             ValueError: If ``container`` is not a valid container name
                 (3 to 63 characters: lowercase letters, digits and single
                 hyphens) or ``path`` is not a valid blob path.
@@ -615,8 +632,10 @@ class BlobOperations(ABC):
 
         Example:
             >>> async def file_stream():
-            ...     async with aiofiles.open("large.bin", "rb") as f:
-            ...         while chunk := await f.read(4 * 1024 * 1024):
+            ...     # Each read runs in a worker thread (asyncio.to_thread),
+            ...     # so the file read never blocks the event loop.
+            ...     with open("large.bin", "rb") as f:
+            ...         while chunk := await asyncio.to_thread(f.read, 4 * 1024 * 1024):
             ...             yield chunk
             >>> ref = await ctx.blob.upload_stream(
             ...     container="uploads",
@@ -656,10 +675,201 @@ class BlobOperations(ABC):
                 example a missing blob)
 
         Example:
-            >>> async with aiofiles.open("output.bin", "wb") as f:
+            >>> with open("output.bin", "wb") as f:
             ...     async for chunk in ctx.blob.download_stream(
             ...         blob_ref,
             ...         progress_callback=lambda d, t: print(f"{d}/{t} bytes")
             ...     ):
-            ...         await f.write(chunk)
+            ...         # The write runs in a worker thread, off the event loop.
+            ...         await asyncio.to_thread(f.write, chunk)
         """
+
+
+# ---------------------------------------------------------------------------
+# The JSON root contract of download_json / upload_json (a dict or a list)
+# ---------------------------------------------------------------------------
+
+
+def _check_upload_json_root(obj: Any) -> None:
+    """Refuse an ``upload_json`` object that is not a dict or a list (the
+    JSON document's root), before it is serialized: non-retryable
+    TypeError. Text and other content go through ``upload_text`` /
+    ``upload_bytes``."""
+    if isinstance(obj, (dict, list)):
+        return
+    _refuse_argument(
+        TypeError(
+            f"upload_json() takes a dict or a list (the root of the JSON "
+            f"document), got {type(obj).__name__}; use upload_text() or "
+            f"upload_bytes() for other content"
+        ),
+        f"upload_json() got {type(obj).__name__}, not a dict or a list",
+    )
+
+
+def _checked_json_root(blob_ref: BlobRef, obj: Any) -> JSONValue:
+    """``obj`` (parsed blob content) when its root is an object or an
+    array; otherwise one ERROR and a non-retryable ValueError: the same
+    content fails the same way on every attempt."""
+    if isinstance(obj, (dict, list)):
+        return obj
+    kind = "null" if obj is None else type(obj).__name__
+    detail = f"its root is {kind}, not an object or an array"
+    _logger.error(
+        "Blob content is JSON but %s", detail, extra={"uri": blob_ref.uri, "error": detail}
+    )
+    err = ValueError(
+        f"Blob {blob_ref.uri} holds JSON whose root is {kind}: download_json() "
+        f"returns a dict or a list; use download_text() or download_bytes() "
+        f"for other content"
+    )
+    _mark_non_retryable(err, f"blob content is JSON but {detail}")
+    raise err
+
+
+# ---------------------------------------------------------------------------
+# KBM_LEDSAS_ALLOWED_CONTAINERS: the containers handler code may use
+# ---------------------------------------------------------------------------
+
+#: The setting that limits the containers ``ctx.blob`` may use.
+ALLOWED_CONTAINERS_ENV = "KBM_LEDSAS_ALLOWED_CONTAINERS"
+
+
+def parse_allowed_containers(raw: str | None) -> "frozenset[str] | None":
+    """The container names of a ``KBM_LEDSAS_ALLOWED_CONTAINERS`` value:
+    comma-separated, spaces around each name ignored; None (no restriction)
+    when the value is unset, empty or blank. Raises ValueError naming the
+    setting for an empty item (``a,,b``, a trailing comma) or a name the
+    storage service would refuse."""
+    if raw is None or not raw.strip():
+        return None
+    items = [item.strip() for item in raw.split(",")]
+    names = []
+    for name in items if all(items) else [""]:
+        if not name:
+            raise ValueError(
+                f"{ALLOWED_CONTAINERS_ENV}={raw[:200]!r} has an empty item: list "
+                f"container names separated by commas (for example "
+                f"'input,results'), or unset it for no restriction"
+            )
+        problem = container_name_problem(name)
+        if problem is not None:
+            raise ValueError(
+                f"{ALLOWED_CONTAINERS_ENV}: {name[:80]!r} is not a valid container "
+                f"name ({problem})"
+            )
+        names.append(name)
+    return frozenset(names)
+
+
+class AllowedContainersBlobOperations(BlobOperations):
+    """``ctx.blob`` when ``KBM_LEDSAS_ALLOWED_CONTAINERS`` is set: every
+    operation first checks that its container (the ``container`` argument
+    of an upload, the container of the blob URI of a download) is listed,
+    and raises :class:`ContainerNotAllowed` before any storage call
+    otherwise; listed containers go to the underlying operations
+    unchanged."""
+
+    def __init__(self, inner: BlobOperations, allowed: "frozenset[str]") -> None:
+        self._inner = inner
+        self._allowed = frozenset(allowed)
+
+    @property
+    def allowed_containers(self) -> "frozenset[str]":
+        """The containers this interface may use."""
+        return self._allowed
+
+    def _require(self, container: Any, operation: str) -> None:
+        if not isinstance(container, str) or container in self._allowed:
+            return  # a container of the wrong type is refused by the operation itself
+        _logger.warning(
+            "Blob %s refused: container %r is not in %s",
+            operation,
+            container[:80],
+            ALLOWED_CONTAINERS_ENV,
+            extra={"container": container[:80], "operation": operation},
+        )
+        err = ContainerNotAllowed(
+            f"Blob {operation} refused: container {container[:80]!r} is not in "
+            f"{ALLOWED_CONTAINERS_ENV} (allowed: {', '.join(sorted(self._allowed))}); "
+            f"nothing was sent to storage",
+            container,
+        )
+        _mark_non_retryable(
+            err, f"container {container[:80]!r} is not allowed ({ALLOWED_CONTAINERS_ENV})"
+        )
+        raise err
+
+    def _ref(self, blob_ref: str | BlobRef, operation: str) -> BlobRef:
+        ref = _ensure_blob_ref(blob_ref)
+        self._require(ref.container, operation)
+        return ref
+
+    async def download_bytes(self, blob_ref: str | BlobRef) -> bytes:
+        return await self._inner.download_bytes(self._ref(blob_ref, "download"))
+
+    async def download_json(self, blob_ref: str | BlobRef) -> JSONValue:
+        return await self._inner.download_json(self._ref(blob_ref, "download"))
+
+    async def download_text(self, blob_ref: str | BlobRef) -> str:
+        return await self._inner.download_text(self._ref(blob_ref, "download"))
+
+    async def download_stream(
+        self,
+        blob_ref: str | BlobRef,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        progress_callback: DownloadProgressCallback | None = None,
+    ) -> AsyncIterator[bytes]:
+        ref = self._ref(blob_ref, "download")
+        async for chunk in self._inner.download_stream(
+            ref, chunk_size=chunk_size, progress_callback=progress_callback
+        ):
+            yield chunk
+
+    async def upload_bytes(
+        self,
+        container: str,
+        data: BytesLike,
+        path: str | None = None,
+        overwrite: bool = False,
+    ) -> BlobRef:
+        self._require(container, "upload")
+        return await self._inner.upload_bytes(container, data, path, overwrite=overwrite)
+
+    async def upload_json(
+        self,
+        container: str,
+        obj: JSONValue,
+        path: str | None = None,
+        overwrite: bool = False,
+    ) -> BlobRef:
+        self._require(container, "upload")
+        return await self._inner.upload_json(container, obj, path, overwrite=overwrite)
+
+    async def upload_text(
+        self,
+        container: str,
+        text: str,
+        path: str | None = None,
+        overwrite: bool = False,
+    ) -> BlobRef:
+        self._require(container, "upload")
+        return await self._inner.upload_text(container, text, path, overwrite=overwrite)
+
+    async def upload_stream(
+        self,
+        container: str,
+        stream: AsyncIterable[BytesLike],
+        path: str | None = None,
+        progress_callback: UploadProgressCallback | None = None,
+        overwrite: bool = False,
+    ) -> BlobRef:
+        self._require(container, "upload")
+        return await self._inner.upload_stream(
+            container, stream, path, progress_callback=progress_callback, overwrite=overwrite
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        # Anything else (an implementation's own attribute) is the
+        # underlying operations'.
+        return getattr(self._inner, name)

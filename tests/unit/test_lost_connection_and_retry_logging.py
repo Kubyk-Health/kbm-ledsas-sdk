@@ -246,9 +246,10 @@ class TestConnectionLostWhileHandlerRuns:
 
     async def test_lost_dead_letter_keeps_the_attempt_count(self, caplog) -> None:
         """A terminal dead-letter that cannot be sent on the lost connection
-        keeps the count the command reached: the redelivery does not get a
-        new retry budget (it would otherwise run max_retries + 1 more
-        times, each logged, plus another final traceback)."""
+        counts its attempt on top of the count the command reached: the
+        redelivery does not get a new retry budget (it would otherwise run
+        max_retries + 1 more times, each logged, plus another final
+        traceback)."""
         from kbm_ledsas_sdk.transport.base import DeliveryLost
 
         consumer = _consumer()
@@ -259,7 +260,7 @@ class TestConnectionLostWhileHandlerRuns:
         with caplog.at_level(logging.DEBUG, logger="kbm_ledsas_sdk"):
             with pytest.raises(DeliveryLost):
                 await consumer.nack(MESSAGE_ID, requeue=False)
-        assert consumer.get_retry_count(MESSAGE_ID) == 3
+        assert consumer.get_retry_count(MESSAGE_ID) == 4
         assert consumer.pending_messages == {}
         assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
         assert [r for r in caplog.records if r.exc_info] == []
@@ -277,8 +278,9 @@ class TestConnectionLostWhileHandlerRuns:
         self, no_backoff
     ) -> None:
         """End to end: retries spent, the dead-letter is lost with the
-        connection; the broker's redelivery fails once more and goes
-        straight to the dead-letter queue, with no new retries."""
+        connection (that attempt counts too); the broker's redelivery is
+        not run again: replied and dead-lettered at once, with no new
+        retries."""
         app, transport = _direct_app(max_retries=2)
         transport.consumer.retry_counts[MESSAGE_ID] = 2  # retries spent
         runs = []
@@ -295,7 +297,7 @@ class TestConnectionLostWhileHandlerRuns:
             transport.consumer.command_queue.get_nowait(), asyncio.Semaphore(1)
         )
         assert first.settled == []
-        assert transport.consumer.get_retry_count(MESSAGE_ID) == 2
+        assert transport.consumer.get_retry_count(MESSAGE_ID) == 3
 
         again = _Delivery(first.body, redelivered=True)
         await transport.consumer._on_message(again)
@@ -303,7 +305,7 @@ class TestConnectionLostWhileHandlerRuns:
             transport.consumer.command_queue.get_nowait(), asyncio.Semaphore(1)
         )
         assert again.settled == [("reject", False)]  # terminal, not requeued
-        assert runs == [1, 1]
+        assert runs == [1]
 
 
 # ---------------------------------------------------------------------------

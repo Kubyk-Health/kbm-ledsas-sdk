@@ -1,8 +1,9 @@
 """Unit tests for the hello-world service.
 
 Covers the ``say_hello`` handler (mocked ctx), the sender's pure
-envelope/exchange helpers and its reply-topology cleanup (aio_pika faked),
-and the example's own files (compose stack, .dockerignore, README).
+envelope/exchange helpers, its reply-topology cleanup and its error
+reporting (aio_pika faked), and the example's own files (compose stack,
+.dockerignore). The README is yours to rewrite: nothing here reads it.
 
 No broker, no Azurite, no SDK runtime required.
 """
@@ -185,7 +186,7 @@ def _fake_aio_pika(monkeypatch, *, get_exchange_error=None, publish_error=None):
     connection.channel = AsyncMock(return_value=channel)
     connection.close = AsyncMock()
     fake = SimpleNamespace(
-        connect_robust=AsyncMock(return_value=connection),
+        connect=AsyncMock(return_value=connection),
         ExchangeType=SimpleNamespace(TOPIC="topic"),
         DeliveryMode=SimpleNamespace(PERSISTENT=2),
         Message=lambda **kw: kw,
@@ -232,6 +233,110 @@ def test_timeout_deletes_the_reply_queue_and_exchange(monkeypatch) -> None:
     fake.rx.delete.assert_awaited()
 
 
+async def _never():
+    await asyncio.Event().wait()
+
+
+def test_timeout_bounds_the_whole_run(monkeypatch) -> None:
+    # A blackholed broker: the connection attempt never answers.
+    fake = _fake_aio_pika(monkeypatch)
+    fake_connect = sys.modules["aio_pika"]
+    fake_connect.connect = AsyncMock(side_effect=_never)
+    args = sender.build_parser().parse_args(["--timeout", "0.2"])
+    monkeypatch.delenv("KBM_LEDSAS_RABBITMQ_URL", raising=False)
+    assert _run(asyncio.wait_for(sender._run(args), timeout=5)) == 1
+    assert fake.connection.close.await_count == 0  # never connected
+
+
+def test_one_connection_attempt_with_the_timeout(monkeypatch) -> None:
+    _fake_aio_pika(monkeypatch)
+    with pytest.raises(TimeoutError):
+        _run(_publish_and_wait())
+    connect = sys.modules["aio_pika"].connect
+    assert connect.await_args.kwargs.get("timeout") == 0.01
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "guest:guest@127.0.0.1:25675",
+        "not a url",
+        "http://guest:guest@127.0.0.1:5672/",
+        "amqp:///",
+        "amqp://guest:guest@127.0.0.1:notaport/",
+    ],
+)
+def test_an_invalid_broker_url_is_one_line_and_no_connection(monkeypatch, capsys, url) -> None:
+    _fake_aio_pika(monkeypatch)
+    monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", url)
+    assert sender.main(["--timeout", "5"]) == 1
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1 and err[0].startswith("error: KBM_LEDSAS_RABBITMQ_URL"), err
+    assert "guest:guest" not in err[0]
+    sys.modules["aio_pika"].connect.assert_not_called()
+
+
+def test_a_failure_is_one_line_without_the_password(monkeypatch, capsys) -> None:
+    url = "amqp://guest:s3cret-pw@127.0.0.1:5672/"
+    fake = _fake_aio_pika(monkeypatch)
+    sys.modules["aio_pika"].connect = AsyncMock(
+        side_effect=ConnectionError(f"Connect call failed for {url}")
+    )
+    monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", url)
+    assert sender.main(["--timeout", "5"]) == 1
+    out = capsys.readouterr()
+    err = out.err.strip().splitlines()
+    assert len(err) == 1 and err[0].startswith("error: "), err
+    assert "s3cret-pw" not in out.err + out.out
+    assert "Broker:       amqp://guest:***@127.0.0.1:5672/" in out.out
+    fake.channel.declare_queue.assert_not_called()
+
+
+def test_a_service_that_never_started_is_named(monkeypatch, capsys) -> None:
+    class ChannelNotFoundEntity(Exception):
+        pass
+
+    _fake_aio_pika(monkeypatch, get_exchange_error=ChannelNotFoundEntity("NOT_FOUND"))
+    monkeypatch.delenv("KBM_LEDSAS_RABBITMQ_URL", raising=False)
+    assert sender.main(["--timeout", "5"]) == 1
+    out = capsys.readouterr()
+    assert out.err.strip() == (
+        "error: the exchange cmd.hello-world.v1 does not exist: "
+        "start the service first (python main.py)"
+    )
+    # The broker used is printed when the variable is unset.
+    assert "(KBM_LEDSAS_RABBITMQ_URL is unset: the default)" in out.out
+
+
+def test_ctrl_c_is_one_line_and_exit_130(monkeypatch, capsys) -> None:
+    async def interrupted(args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sender, "_run", interrupted)
+    assert sender.main([]) == 130
+    assert capsys.readouterr().err.strip() == "interrupted"
+
+
+def test_the_amqp_libraries_do_not_log_the_url(monkeypatch) -> None:
+    import logging
+
+    async def ok(args):
+        return 0
+
+    monkeypatch.setattr(sender, "_run", ok)
+    for name in ("aiormq", "aio_pika"):
+        monkeypatch.setattr(logging.getLogger(name), "level", logging.NOTSET)
+    sender.main([])
+    for name in ("aiormq", "aio_pika"):
+        assert logging.getLogger(name).level == logging.CRITICAL, name
+
+
+def test_mask_url() -> None:
+    assert sender.mask_url("amqp://u:p@h:5672/v?x=1") == "amqp://u:***@h:5672/v?***"
+    assert sender.mask_url("amqps://h/") == "amqps://h/"
+    assert sender.mask_url("amqp://u@h/") == "amqp://u@h/"
+
+
 # ---------------------------------------------------------------------------
 # the example's own files
 # ---------------------------------------------------------------------------
@@ -272,30 +377,6 @@ def test_dockerignore_keeps_local_files_out_of_the_build_context() -> None:
     lines = (EXAMPLE_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     for entry in (".env", ".env.*", ".venv/", "!.env.example", "tests/", "scripts/", ".git/"):
         assert entry in lines, entry
-
-
-def _readme_section(title: str) -> str:
-    text = (EXAMPLE_ROOT / "README.md").read_text(encoding="utf-8")
-    match = re.search(rf"^## {re.escape(title)}\n(.*?)(?=^## |\Z)", text, re.M | re.S)
-    assert match, title
-    return match.group(1)
-
-
-def test_readme_container_section_runs_against_the_local_stack() -> None:
-    section = _readme_section("Container image")
-    assert "docker run" in section
-    for setting in (
-        "KBM_LEDSAS_ALLOW_INSECURE_AMQP",
-        "KBM_LEDSAS_HEALTH_HOST=0.0.0.0",
-        "--network",
-    ):
-        assert setting in section, setting
-    assert "stop_grace_period" in section or "docker stop -t" in section
-
-
-def test_readme_shutdown_time_is_qualified() -> None:
-    text = (EXAMPLE_ROOT / "README.md").read_text(encoding="utf-8")
-    assert not re.search(r"<\s?1\s?s\b", text)
 
 
 def test_build_command_message_shape() -> None:
@@ -365,24 +446,5 @@ def test_sender_message_drives_real_handler() -> None:
 
 def test_compose_port_variables_are_the_documented_ones() -> None:
     compose = COMPOSE.read_text(encoding="utf-8")
-    readme = _readme_section("Run it locally")
     for var in ("HELLO_WORLD_AMQP_PORT", "HELLO_WORLD_MGMT_PORT", "HELLO_WORLD_BLOB_PORT"):
         assert "${" + var + ":-" in compose, var
-        assert var in readme, var
-
-
-def test_readme_shutdown_names_the_handler_timeout() -> None:
-    assert "KBM_LEDSAS_HANDLER_TIMEOUT" in _readme_section("Run it locally")
-
-
-def test_readme_does_not_claim_what_the_base_image_ships() -> None:
-    # Whether the base image still carries setuptools, wheel or the ensurepip
-    # bundle depends on how it was built: the README says what to do either way.
-    text = (EXAMPLE_ROOT / "README.md").read_text(encoding="utf-8")
-    assert "stays in the image" not in text
-    assert "may still carry `setuptools`, `wheel`" in text
-
-
-def test_example_wording_names_no_indirect_path() -> None:
-    for path in (EXAMPLE_ROOT / "README.md", EXAMPLE_ROOT / "main.py"):
-        assert "straight to" not in path.read_text(encoding="utf-8"), path

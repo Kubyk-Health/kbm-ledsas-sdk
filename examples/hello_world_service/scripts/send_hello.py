@@ -30,9 +30,16 @@ that request on purpose.
 Environment (read from process env; see ../.env.example):
     KBM_LEDSAS_SERVICE_NAME   (default hello-world)
     KBM_LEDSAS_TENANT         (default unset — no tenant)
-    KBM_LEDSAS_RABBITMQ_URL   (default amqp://guest:guest@127.0.0.1:5672/)
+    KBM_LEDSAS_RABBITMQ_URL   (default amqp://guest:guest@127.0.0.1:5672/; the
+                              broker used is printed at the start, password
+                              masked)
 
-Exit codes: 0 = greeting received; 1 = timeout / error.
+Every failure (an invalid broker URL, a broker that does not answer, a
+service that has not started, no reply in time) prints one ``error:`` line;
+``--timeout`` bounds the whole run, the connection attempt included.
+
+Exit codes: 0 = greeting received; 1 = timeout / error; 2 = invalid
+arguments; 130 = interrupted (Ctrl+C).
 """
 
 from __future__ import annotations
@@ -40,12 +47,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
 import uuid
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------------------
 # Pure, import-and-test-without-a-broker helpers.
@@ -144,6 +153,37 @@ def build_command_message(
     }
 
 
+def broker_url_problem(url: str) -> str | None:
+    """Why ``url`` cannot name a broker (``None`` when it can): the scheme must
+    be ``amqp://`` or ``amqps://`` and a host must follow it."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        _ = parts.port  # raises ValueError for a port that is not a number
+    except ValueError as e:
+        return f"KBM_LEDSAS_RABBITMQ_URL is not a valid URL ({e})"
+    if parts.scheme not in ("amqp", "amqps"):
+        return "KBM_LEDSAS_RABBITMQ_URL must start with amqp:// or amqps://"
+    if not host:
+        return "KBM_LEDSAS_RABBITMQ_URL names no host (amqp://user:password@host:5672/)"
+    return None
+
+
+def mask_url(url: str) -> str:
+    """``url`` with its password (and anything after ``?``) replaced by ``***``."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "***"
+    netloc = parts.netloc
+    if "@" in netloc:
+        userinfo, _, hostport = netloc.rpartition("@")
+        user = userinfo.split(":", 1)[0]
+        netloc = f"{user}:***@{hostport}" if ":" in userinfo else f"{user}@{hostport}"
+    query = "?***" if parts.query else ""
+    return f"{parts.scheme}://{netloc}{parts.path}{query}"
+
+
 class Env:
     """Resolved environment configuration (with documented defaults)."""
 
@@ -151,7 +191,8 @@ class Env:
         e = environ if environ is not None else os.environ
         self.service_name = e.get("KBM_LEDSAS_SERVICE_NAME", DEFAULT_SERVICE_NAME)
         self.tenant = e.get("KBM_LEDSAS_TENANT") or None
-        self.rabbitmq_url = e.get("KBM_LEDSAS_RABBITMQ_URL", DEFAULT_RABBITMQ_URL)
+        self.rabbitmq_url_is_default = not e.get("KBM_LEDSAS_RABBITMQ_URL")
+        self.rabbitmq_url = e.get("KBM_LEDSAS_RABBITMQ_URL") or DEFAULT_RABBITMQ_URL
 
     @property
     def command_exchange(self) -> str:
@@ -178,10 +219,12 @@ async def _publish_and_wait(
     The reply queue and exchange are deleted however this ends (reply
     received, timeout, a failed publish), so a run leaves nothing behind on
     the broker; when the command exchange does not exist, none is created.
+    One connection attempt (no reconnecting): a broker that does not answer
+    fails the run.
     """
     import aio_pika
 
-    connection = await aio_pika.connect_robust(env.rabbitmq_url)
+    connection = await aio_pika.connect(env.rabbitmq_url, timeout=timeout)
     try:
         channel = await connection.channel()
 
@@ -255,6 +298,17 @@ async def _publish_and_wait(
         await connection.close()
 
 
+def _error_line(error: BaseException, env: Env) -> str:
+    """One line for a failed run (the broker URL is never echoed)."""
+    if type(error).__name__ == "ChannelNotFoundEntity":
+        return (
+            f"error: the exchange {env.command_exchange} does not exist: "
+            "start the service first (python main.py)"
+        )
+    text = " ".join(str(error).split()).replace(env.rabbitmq_url, mask_url(env.rabbitmq_url))
+    return f"error: publish/receive failed: {type(error).__name__}: {text or 'no details'}"
+
+
 async def _run(args: argparse.Namespace) -> int:
     env = Env()
     correlation_id = str(uuid.uuid4())
@@ -262,6 +316,14 @@ async def _run(args: argparse.Namespace) -> int:
     reply_exchange = f"reply-ex-hello-{uuid.uuid4().hex[:8]}"
     reply_queue = f"{reply_exchange}-q"
 
+    problem = broker_url_problem(env.rabbitmq_url)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 1
+    default = (
+        " (KBM_LEDSAS_RABBITMQ_URL is unset: the default)" if env.rabbitmq_url_is_default else ""
+    )
+    print(f"Broker:       {mask_url(env.rabbitmq_url)}{default}")
     print(f"Service:      {env.service_name} (tenant={env.tenant})")
     print(f"Cmd exchange: {env.command_exchange}")
     print(f"Idempotency:  {idempotency_key} (pass --idempotency-key to resend this request)")
@@ -275,23 +337,28 @@ async def _run(args: argparse.Namespace) -> int:
 
     print(f"Publishing SayHello, waiting <= {args.timeout:.0f}s for response ...")
     try:
-        response = await _publish_and_wait(
-            env,
-            message=message,
-            reply_exchange=reply_exchange,
-            reply_queue=reply_queue,
-            correlation_id=correlation_id,
+        # --timeout bounds everything: the connection attempt, the lookup of
+        # the command exchange and the wait for the reply.
+        response = await asyncio.wait_for(
+            _publish_and_wait(
+                env,
+                message=message,
+                reply_exchange=reply_exchange,
+                reply_queue=reply_queue,
+                correlation_id=correlation_id,
+                timeout=args.timeout,
+            ),
             timeout=args.timeout,
         )
     except TimeoutError:
         print(
             f"error: no response within {args.timeout:.0f}s "
-            "(is the service running and consuming?)",
+            "(is the broker reachable, and the service running and consuming?)",
             file=sys.stderr,
         )
         return 1
     except Exception as e:
-        print(f"error: publish/receive failed: {e}", file=sys.stderr)
+        print(_error_line(e, env), file=sys.stderr)
         return 1
 
     payload = response.get("payload", {})
@@ -335,7 +402,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return asyncio.run(_run(args))
+    # The AMQP libraries log their own connection errors (with the broker URL);
+    # this script reports every failure in one line of its own instead.
+    for name in ("aiormq", "aio_pika"):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+    try:
+        return asyncio.run(_run(args))
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

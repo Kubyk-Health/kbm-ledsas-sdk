@@ -72,7 +72,7 @@ The service also exposes liveness/readiness HTTP endpoints at
 ``http://127.0.0.1:${KBM_LEDSAS_HEALTH_PORT:-8090}/health`` and ``/ready``
 (loopback only by default; set ``KBM_LEDSAS_HEALTH_HOST=0.0.0.0`` to
 bind on all interfaces). See the SDK API reference
-(https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/main/docs/SDK_API_REFERENCE.md) for the full API.
+(https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/v0.3.6/docs/SDK_API_REFERENCE.md) for the full API.
 """
 
 from . import models

@@ -94,8 +94,8 @@ ENV_VAR_REGISTRY: list[EnvVarSpec] = [
     EnvVarSpec(
         name="KBM_LEDSAS_CONTAINER",
         description=(
-            "Default blob container name. Informational: logged at "
-            "startup; ctx.blob.upload_* always takes an explicit container."
+            "Informational: logged at startup as default_container; every "
+            "ctx.blob upload and download names its own container."
         ),
         default="dev",
         required=False,
@@ -223,21 +223,36 @@ ENV_VAR_REGISTRY: list[EnvVarSpec] = [
         description=(
             "AMQP heartbeat interval in seconds the SDK asks the broker "
             "for, so a broker or network path that stops answering is "
-            "detected within about 3 x (this interval + 1) s, about 50 s "
-            "at the default 15. Used unless the "
-            "broker URL sets its own ?heartbeat=. Range 0-600; 0 turns "
-            "heartbeats off. Default 15."
+            "detected within about 3 x (this interval + 1) s. Used unless "
+            "the broker URL sets its own ?heartbeat= (checked the same "
+            "way). Range 0-600; 0 turns heartbeats off. Default 60. A "
+            "handler that blocks the event loop for longer than about "
+            "two heartbeat intervals loses the broker connection: run "
+            "blocking work with asyncio.to_thread."
         ),
-        default="15",
+        default="60",
+        required=False,
+    ),
+    EnvVarSpec(
+        name="KBM_LEDSAS_ALLOWED_CONTAINERS",
+        description=(
+            "Comma-separated container names that handler code may use "
+            "through ctx.blob (every upload and download, by name or by "
+            "blob URI). Any other container is refused before a storage call "
+            "(ContainerNotAllowed, not retried). Unset or blank: no "
+            "restriction. Each name must be a valid container name."
+        ),
+        default=None,
         required=False,
     ),
     EnvVarSpec(
         name="KBM_LEDSAS_DEPLOYMENT_ID",
         description=(
             "Identifier of the deployed build, reported as deployment_id "
-            "in the health responses. Optional. KBM_LASTCOMMITID, the "
-            "same identifier under another name, is read when "
-            "KBM_LEDSAS_DEPLOYMENT_ID is unset or blank. Surrounding "
+            "in the health responses. Optional. KBM_LASTCOMMITID, an "
+            "older alias of KBM_LEDSAS_DEPLOYMENT_ID, is read only when "
+            "KBM_LEDSAS_DEPLOYMENT_ID is unset or blank; prefer "
+            "KBM_LEDSAS_DEPLOYMENT_ID. The SDK sets neither. Surrounding "
             "quotes and whitespace are removed; unset or blank on both "
             "omits deployment_id."
         ),

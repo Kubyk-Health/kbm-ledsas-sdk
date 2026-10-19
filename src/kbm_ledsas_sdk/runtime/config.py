@@ -9,7 +9,7 @@ settings from ``KBM_LEDSAS_*`` environment variables. See
 import ipaddress
 import os
 import re
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import (
     BaseModel,
@@ -21,14 +21,16 @@ from pydantic import (
     model_validator,
 )
 
+from kbm_ledsas_sdk.blob.operations import parse_allowed_containers
 from kbm_ledsas_sdk.runtime.security import (
     _is_truthy,
     _read_env,
     check_topology_name_budget,
     check_transport_security,
     parse_bool_env,
+    redacted,
 )
-from kbm_ledsas_sdk.utils.logging import masked_logger
+from kbm_ledsas_sdk.utils.logging import masked_logger, register_connection_secrets
 
 _logger = masked_logger(__name__)
 
@@ -60,6 +62,14 @@ def _int_env(name: str, default: str) -> int:
     try:
         return int(raw)
     except ValueError:
+        if raw == "":
+            # Set but empty (``KBM_LEDSAS_PREFETCH=`` in a .env file): refused
+            # like any other value that is not a number, saying how to get
+            # the default.
+            raise ValueError(
+                f"{name}={os.getenv(name, default)!r} is empty: unset it to use "
+                f"the default ({default}) or give a whole number"
+            ) from None
         raise ValueError(f"{name}={os.getenv(name, default)!r} is not a valid integer") from None
 
 
@@ -99,6 +109,7 @@ _FIELD_ENV_VARS = {
     "health_verbose": "KBM_LEDSAS_HEALTH_VERBOSE",
     "connect_timeout": "KBM_LEDSAS_CONNECT_TIMEOUT",
     "heartbeat": "KBM_LEDSAS_HEARTBEAT",
+    "allowed_containers": "KBM_LEDSAS_ALLOWED_CONTAINERS",
 }
 # Fields whose value is never repeated in a message.
 _SECRET_FIELDS = frozenset({"rabbitmq_url", "blob_conn_string"})
@@ -152,6 +163,21 @@ def _config_error_without_secrets(exc: ValidationError) -> ValidationError:
 
 
 _PLAIN_NUMBER = re.compile(r"^-?\d{1,30}$")
+
+
+def _shown_choice(value: str) -> str:
+    """A refused value of an enumerated setting as its message shows it:
+    as written, or ``''`` with how to get the default when it is empty."""
+    if not value.strip():
+        return "'' (empty: unset the variable to use the default)"
+    return value[:80]
+
+
+# AMQP heartbeat interval, in seconds, the SDK asks the broker for by
+# default (KBM_LEDSAS_HEARTBEAT): the interval earlier releases ended up
+# with (the client library's default request, which a broker with its own
+# default of 60 s accepts), now set explicitly.
+DEFAULT_HEARTBEAT_S = 60
 
 
 def _shown_setting(value: Any) -> str:
@@ -263,7 +289,7 @@ class SDKConfig(BaseModel):
     # A ValidationError does not repeat the settings it was given: not in
     # str() (hide_input_in_errors), and not in errors() / json() for the
     # connection values (see _input_not_kept).
-    model_config = ConfigDict(hide_input_in_errors=True)
+    model_config: ClassVar[ConfigDict] = ConfigDict(hide_input_in_errors=True)
 
     # Core
     #
@@ -293,7 +319,13 @@ class SDKConfig(BaseModel):
 
     # Blob storage
     blob_conn_string: str | None = Field(None, description="Azure Blob connection string")
-    blob_container: str = Field("dev", description="Default blob container name")
+    blob_container: str = Field(
+        "dev",
+        description=(
+            "Informational: logged at startup as default_container; every "
+            "upload and download names its own container"
+        ),
+    )
 
     # Performance
     prefetch: int = Field(10, ge=1, le=1000, description="Message prefetch count")
@@ -364,21 +396,62 @@ class SDKConfig(BaseModel):
     )
 
     heartbeat: int = Field(
-        15,
+        DEFAULT_HEARTBEAT_S,
         ge=0,
         le=600,
         description=(
             "AMQP heartbeat interval in seconds requested from the broker "
             "unless the broker URL sets ?heartbeat= (0..600, 0 = off, "
-            "default 15)"
+            "default 60)"
         ),
     )
+
+    allowed_containers: frozenset[str] | None = Field(
+        None,
+        description=(
+            "Containers handler code may use through ctx.blob "
+            "(KBM_LEDSAS_ALLOWED_CONTAINERS, comma-separated); None (unset or "
+            "blank) for no restriction"
+        ),
+    )
+
+    @field_validator("allowed_containers", mode="before")
+    @classmethod
+    def _parse_allowed_containers(cls, v: Any) -> Any:
+        """A comma-separated string or a collection of container names;
+        each must be a valid container name (see
+        ``parse_allowed_containers``)."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return parse_allowed_containers(v)
+        if isinstance(v, (list, tuple, set, frozenset)):
+            if not all(isinstance(name, str) for name in v):
+                raise ValueError("allowed_containers holds a value that is not a string")
+            return parse_allowed_containers(",".join(v)) if v else None
+        raise ValueError(
+            f"allowed_containers must be a comma-separated string or a collection "
+            f"of names, got {type(v).__name__}"
+        )
+
+    @field_validator("rabbitmq_url", "blob_conn_string")
+    @classmethod
+    def _hold_redacted(cls, v: str | None) -> str | None:
+        """Keep the two connection settings as :class:`RedactedStr`, so a
+        display of the config's attributes (``vars(config)`` in a repr,
+        ``pprint``, ``rich.inspect``) does not show the credentials; the
+        value itself is unchanged."""
+        return redacted(v)
 
     @field_validator("health_host")
     @classmethod
     def validate_health_host(cls, v: str) -> str:
         """An IP address or a host name (refused at load, like the other
-        settings, instead of failing to bind later)."""
+        settings, instead of failing to bind later).
+
+        Internal: a pydantic validator the model runs itself when it is built;
+        not part of the public API (it may change).
+        """
         if _is_valid_bind_host(v):
             return v
         inner = v[1:-1] if len(v) > 2 and v.startswith("[") and v.endswith("]") else None
@@ -397,21 +470,33 @@ class SDKConfig(BaseModel):
     @field_validator("log_level")
     @classmethod
     def validate_log_level(cls, v: str) -> str:
-        """Validate log level is valid."""
+        """Validate log level is valid.
+
+        Internal: a pydantic validator the model runs itself when it is built;
+        not part of the public API (it may change).
+        """
         valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
         v_upper = v.upper()
         if v_upper not in valid_levels:
-            raise ValueError(f"Invalid log level: {v}. Must be one of {valid_levels}")
+            raise ValueError(
+                f"Invalid log level: {_shown_choice(v)}. " f"Must be one of {valid_levels}"
+            )
         return v_upper
 
     @field_validator("log_format")
     @classmethod
     def validate_log_format(cls, v: str) -> str:
-        """Validate log format is valid."""
+        """Validate log format is valid.
+
+        Internal: a pydantic validator the model runs itself when it is built;
+        not part of the public API (it may change).
+        """
         valid_formats = ["json", "text"]
         v_lower = v.lower()
         if v_lower not in valid_formats:
-            raise ValueError(f"Invalid log format: {v}. Must be one of {valid_formats}")
+            raise ValueError(
+                f"Invalid log format: {_shown_choice(v)}. " f"Must be one of {valid_formats}"
+            )
         return v_lower
 
     @model_validator(mode="after")
@@ -442,6 +527,9 @@ class SDKConfig(BaseModel):
         # configured" path.
         if self.rabbitmq_url:
             check_transport_security(self.rabbitmq_url)
+        # The configured secrets are masked wherever a record quotes them,
+        # in any form (see register_secret).
+        register_connection_secrets(self.rabbitmq_url, self.blob_conn_string)
         return self
 
     @model_validator(mode="wrap")
@@ -475,7 +563,9 @@ class SDKConfig(BaseModel):
             KBM_LEDSAS_TENANT: Tenant name (overrides arg)
             KBM_LEDSAS_RABBITMQ_URL: RabbitMQ connection URL (required)
             KBM_LEDSAS_BLOB_CONN_STRING: Azure Blob connection string (required)
-            KBM_LEDSAS_CONTAINER: Default blob container (default: ``dev``)
+            KBM_LEDSAS_CONTAINER: Informational (default: ``dev``): logged
+                at startup as ``default_container``; every upload and
+                download names its own container
             KBM_LEDSAS_PREFETCH: Message prefetch count (default: 10; 1 to 1000)
             KBM_LEDSAS_CONCURRENCY: Max concurrent handlers (default: 4; 1 to 100)
             KBM_LEDSAS_LOG_LEVEL: Log level (default: INFO)
@@ -501,11 +591,18 @@ class SDKConfig(BaseModel):
                 shows just the actionable one-liner).
             KBM_LEDSAS_CONNECT_TIMEOUT: Seconds one connection attempt to
                 the message broker may take (default 15, 1..300).
+            KBM_LEDSAS_ALLOWED_CONTAINERS: Comma-separated container names
+                handler code may use through ``ctx.blob`` (every upload and
+                download, by name or by URI); any other container is
+                refused before a storage call (``ContainerNotAllowed``, not
+                retried). Unset or blank: no restriction.
             KBM_LEDSAS_HEARTBEAT: AMQP heartbeat interval in seconds
-                (default 15, 0..600, 0 = off) used unless the broker URL
-                sets ``?heartbeat=``; a broker that stops answering is
-                detected within about 3 x (this interval + 1) s, about
-                50 s at the default 15.
+                (default 60, 0..600, 0 = off) used unless the broker URL
+                sets ``?heartbeat=`` (checked the same way); a broker that
+                stops answering is detected within about 3 x (this
+                interval + 1) s. A handler that blocks the event loop for
+                longer than about two heartbeat intervals loses the broker
+                connection: run blocking work with ``asyncio.to_thread``.
 
         Every value is read the same way, however it was set: surrounding
         whitespace and one matched pair of surrounding quotes are removed
@@ -571,7 +668,8 @@ class SDKConfig(BaseModel):
             health_host=_env("KBM_LEDSAS_HEALTH_HOST", "127.0.0.1"),
             health_verbose=_bool_env("KBM_LEDSAS_HEALTH_VERBOSE", "false"),
             connect_timeout=_int_env("KBM_LEDSAS_CONNECT_TIMEOUT", "15"),
-            heartbeat=_int_env("KBM_LEDSAS_HEARTBEAT", "15"),
+            heartbeat=_int_env("KBM_LEDSAS_HEARTBEAT", str(DEFAULT_HEARTBEAT_S)),
+            allowed_containers=parse_allowed_containers(_env("KBM_LEDSAS_ALLOWED_CONTAINERS")),
         )
 
     @field_serializer("rabbitmq_url", "blob_conn_string", when_used="always")

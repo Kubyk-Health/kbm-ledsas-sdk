@@ -40,7 +40,7 @@ from ..blob.operations import (
     _mark_non_retryable,
 )
 from ..models.envelope import Envelope
-from ..models.errors import DeadlineExceeded, Permanent, Retryable
+from ..models.errors import ArgumentTypeError, DeadlineExceeded, Permanent, Retryable
 from ..models.messages import Command, Response
 
 # _command_fields: the identity of a command on every per-command record
@@ -74,6 +74,12 @@ class HandlerOutcome(NamedTuple):
     response: Response
     failed: bool = False
     retryable: bool = False
+    #: For a failed attempt: the class of the error that ended it (the
+    #: exception's class name, or ``Timeout`` for the SDK's own timeout)
+    #: and its internal message (masked like every record), for the
+    #: command's final record. None for a success.
+    error_class: str | None = None
+    error_message: str | None = None
 
 
 # Command names and message versions a handler can be registered under.
@@ -575,6 +581,46 @@ def _not_async_reason(handler: Any) -> str | None:
     return None
 
 
+def _attempt_fields(final_attempt: bool | None, attempt: int | None) -> dict[str, Any]:
+    """``will_retry`` and ``attempt`` for the record of one failed attempt
+    of a retryable failure (each only when the transport keeps a retry
+    count)."""
+    fields: dict[str, Any] = {}
+    if final_attempt is not None:
+        fields["will_retry"] = not final_attempt
+    if attempt is not None:
+        fields["attempt"] = attempt
+    return fields
+
+
+def _arity_text(func: Any) -> str:
+    """``, but it takes 1 positional argument`` (from the handler's point of
+    view), or "" when its signature cannot be read."""
+    try:
+        parameters = list(inspect.signature(func).parameters.values())
+    except (TypeError, ValueError):
+        return ""
+    positional = [
+        p
+        for p in parameters
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    required = [p for p in positional if p.default is inspect.Parameter.empty]
+    keyword_only = [
+        p.name
+        for p in parameters
+        if p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is inspect.Parameter.empty
+    ]
+    if keyword_only:
+        return ", but it also needs the keyword-only argument(s) " + ", ".join(
+            repr(name) for name in keyword_only
+        )
+    if len(required) > 2:
+        return f", but it needs {len(required)} positional arguments"
+    count = len(positional)
+    return f", but it takes {count} positional argument{'s' if count != 1 else ''}"
+
+
 def _call_signature_problem(func: Any, arguments: int) -> str | None:
     """Why ``func`` cannot be called with ``arguments`` positional
     arguments (the text of the TypeError ``inspect.Signature.bind``
@@ -658,10 +704,19 @@ class HandlerRegistry:
         Example:
             registry.register("ProcessDataset", "1.0", my_handler)
         """
-        if (
-            not isinstance(command_name, str)
-            or len(command_name) > _COMMAND_NAME_MAX_LENGTH
-            or not _COMMAND_NAME_PATTERN.fullmatch(command_name)
+        if not isinstance(command_name, str):
+            raise ArgumentTypeError(
+                f"Invalid command name {command_name!r}: a command name is a "
+                f"string (a letter followed by letters, digits or underscores, "
+                f"e.g. 'ProcessDataset'), got {type(command_name).__name__}"
+            )
+        if not isinstance(version, str):
+            raise ArgumentTypeError(
+                f"Invalid message version {version!r} for {command_name}: a "
+                f"version is a string such as '1.0', got {type(version).__name__}"
+            )
+        if len(command_name) > _COMMAND_NAME_MAX_LENGTH or not _COMMAND_NAME_PATTERN.fullmatch(
+            command_name
         ):
             raise ValueError(
                 f"Invalid command name {command_name!r}: use a letter "
@@ -671,7 +726,7 @@ class HandlerRegistry:
                 f"with any other name are rejected, so the handler could "
                 f"never be called."
             )
-        if not isinstance(version, str) or not _MESSAGE_VERSION_PATTERN.fullmatch(version):
+        if not _MESSAGE_VERSION_PATTERN.fullmatch(version):
             raise ValueError(
                 f"Invalid message version {version!r} for {command_name}: "
                 f"use '<major>.<minor>' digits, e.g. '1.0'."
@@ -688,7 +743,8 @@ class HandlerRegistry:
         if signature_problem is not None:
             raise TypeError(
                 f"Handler for {command_name} v{version} must accept two "
-                f"positional arguments (ctx, payload): {signature_problem}."
+                f"positional arguments: the SDK calls it with (ctx, payload)"
+                f"{_arity_text(handler)}."
             )
         key = (command_name, version)
         if key in self._handlers:
@@ -808,7 +864,7 @@ class HandlerRegistry:
                 # explicit pre-flight check). Raise so the response is
                 # classified DeadlineExceeded (terminal) — using a tiny
                 # positive timeout would misclassify this as Timeout
-                # (retryable), which would have the orchestrator retry
+                # (retryable), which would have the caller retry
                 # against the same expired deadline.
                 raise DeadlineExceeded(f"Deadline {envelope.deadline.isoformat()} already passed")
             if config_timeout > 0:
@@ -1005,9 +1061,11 @@ class HandlerRegistry:
                     extra={
                         **_command_fields(envelope),
                         "timeout_seconds": effective_timeout,
+                        **_attempt_fields(final_attempt, attempt),
                     },
                 )
                 specific = f"Handler timed out after {_format_seconds(effective_timeout)}"
+                error_class = "Timeout"
             else:
                 # The handler raised TimeoutError itself (e.g. a client
                 # library's own timeout): reported as code Timeout, as
@@ -1016,12 +1074,14 @@ class HandlerRegistry:
                     **_command_fields(envelope),
                     "error_class": type(e).__name__,
                     "error_message": _safe_str(e),
+                    **_attempt_fields(final_attempt, attempt),
                 }
                 location = _error_location(e)
                 if location is not None:
                     extra["error_location"] = location
                 logger.warning("Handler raised TimeoutError", extra=extra)
                 specific = "Handler raised TimeoutError"
+                error_class = type(e).__name__
             return self._error_outcome(
                 envelope,
                 {
@@ -1029,6 +1089,8 @@ class HandlerRegistry:
                     "message": self._get_error_message("Timeout", specific),
                     "retryable": True,
                 },
+                error_class=error_class,
+                error_message=specific,
             )
 
         except Retryable as e:
@@ -1037,17 +1099,12 @@ class HandlerRegistry:
             # formatter escapes any control characters, and the text
             # formatter escapes them in its key=value pairs.
             text = _safe_str(e)
-            retry_fields: dict[str, Any] = {}
-            if final_attempt is not None:
-                retry_fields["will_retry"] = not final_attempt
-            if attempt is not None:
-                retry_fields["attempt"] = attempt
             logger.warning(
                 "Retryable error in handler",
                 extra={
                     **_command_fields(envelope),
                     "error_message": text,
-                    **retry_fields,
+                    **_attempt_fields(final_attempt, attempt),
                 },
             )
             return self._error_outcome(
@@ -1057,6 +1114,8 @@ class HandlerRegistry:
                     "message": self._get_error_message("Retryable", text, _safe_user_message(e)),
                     "retryable": True,
                 },
+                error_class=type(e).__name__,
+                error_message=text,
             )
 
         except Permanent as e:
@@ -1100,7 +1159,7 @@ class HandlerRegistry:
                 "asyncio.CancelledError without the SDK cancelling it (for "
                 "example it awaited a task or future that was cancelled)"
             )
-            return self._unexpected_error_outcome(e, envelope, internal_msg, final_attempt)
+            return self._unexpected_error_outcome(e, envelope, internal_msg, final_attempt, attempt)
 
         except (SystemExit, KeyboardInterrupt) as e:
             # A handler must not end the process: contained as a Permanent
@@ -1163,7 +1222,7 @@ class HandlerRegistry:
             # handlers that want richer caller-visible text should raise
             # errors.Permanent / Retryable with user_message= explicitly.
             internal_msg = f"Unexpected error ({type(e).__name__}): {_safe_str(e)}"
-            return self._unexpected_error_outcome(e, envelope, internal_msg, final_attempt)
+            return self._unexpected_error_outcome(e, envelope, internal_msg, final_attempt, attempt)
 
         except BaseException as e:
             # Any other BaseException a handler raises (a custom
@@ -1171,19 +1230,58 @@ class HandlerRegistry:
             # failure like any Exception - retried, then dead-lettered with
             # one reply - so it can never leave the command unsettled.
             internal_msg = f"Unexpected error ({type(e).__name__}): {_safe_str(e)}"
-            return self._unexpected_error_outcome(e, envelope, internal_msg, final_attempt)
+            return self._unexpected_error_outcome(e, envelope, internal_msg, final_attempt, attempt)
 
-    def _error_outcome(self, envelope: Envelope, error: dict) -> HandlerOutcome:
+    def _error_outcome(
+        self,
+        envelope: Envelope,
+        error: dict,
+        *,
+        error_class: str | None = None,
+        error_message: str | None = None,
+    ) -> HandlerOutcome:
         """A failed attempt: the error reply (``{"error": {"code",
         "message", "retryable"}}``, the wire format) for the ``error`` the
         branch that caught the failure built, and the outcome the caller
         acts on, taken from that same SDK-built object (never from a
-        handler's result)."""
+        handler's result). ``error_class`` / ``error_message`` (the error
+        that ended the attempt) default to the reply's code and message."""
         response = Response(
             envelope=self._build_response_envelope(envelope),
             payload={"error": error},
         )
-        return HandlerOutcome(response, failed=True, retryable=bool(error["retryable"]))
+        return HandlerOutcome(
+            response,
+            failed=True,
+            retryable=bool(error["retryable"]),
+            error_class=error_class if error_class is not None else str(error.get("code")),
+            error_message=(
+                redact_secrets(error_message)
+                if error_message is not None
+                else str(error.get("message", ""))
+            ),
+        )
+
+    def connection_lost_outcome(self, envelope: Envelope) -> HandlerOutcome:
+        """The final outcome of a command whose attempts were all lost with
+        the broker connection (its run finished, or was still running,
+        when the connection dropped, so neither its reply nor its
+        acknowledgement reached the broker): the ``UnexpectedError`` reply
+        of a retryable failure whose retries are spent. The handler is not
+        run again."""
+        return self._error_outcome(
+            envelope,
+            {
+                "code": "UnexpectedError",
+                "message": GENERIC_ERROR_MESSAGES["UnexpectedError"],
+                "retryable": True,
+            },
+            error_class="ConnectionLost",
+            error_message=(
+                "every attempt ended with the connection to the AMQP broker "
+                "lost while the command ran"
+            ),
+        )
 
     def _deadline_exceeded_outcome(
         self, envelope: Envelope, error: BaseException
@@ -1215,10 +1313,11 @@ class HandlerRegistry:
         envelope: Envelope,
         internal_msg: str,
         final_attempt: bool | None,
+        attempt: int | None = None,
     ) -> HandlerOutcome:
         """Log an uncaught handler failure and build its retryable
         ``UnexpectedError`` reply (the caller sees the generic message)."""
-        self._log_unexpected_error(error, envelope, internal_msg, final_attempt)
+        self._log_unexpected_error(error, envelope, internal_msg, final_attempt, attempt)
         return self._error_outcome(
             envelope,
             {
@@ -1226,6 +1325,8 @@ class HandlerRegistry:
                 "message": GENERIC_ERROR_MESSAGES["UnexpectedError"],
                 "retryable": True,
             },
+            error_class=type(error).__name__,
+            error_message=internal_msg,
         )
 
     @staticmethod
@@ -1234,6 +1335,7 @@ class HandlerRegistry:
         envelope: Envelope,
         internal_msg: str,
         final_attempt: bool | None,
+        attempt: int | None = None,
     ) -> None:
         """Log an uncaught, retryable handler exception for one attempt.
 
@@ -1259,7 +1361,7 @@ class HandlerRegistry:
         if final_attempt is None:
             logger.error("Uncaught exception in handler", exc_info=error, extra=extra)
             return
-        extra["will_retry"] = not final_attempt
+        extra.update(_attempt_fields(final_attempt, attempt))
         transient = _transient_reason(error)
         if transient is not None:
             logger.warning("Transient error in handler: %s", transient, extra=extra)

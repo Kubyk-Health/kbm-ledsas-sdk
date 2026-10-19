@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import logging
 import re
+import socket
 from collections.abc import AsyncIterator
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
@@ -33,11 +34,21 @@ from kbm_ledsas_sdk.runtime.security import (
     check_transport_security as _check_transport_security,
 )
 from kbm_ledsas_sdk.runtime.security import (
+    redacted,
+)
+from kbm_ledsas_sdk.runtime.security import (
     scrub_url_credentials as _scrub_url_credentials,
+)
+from kbm_ledsas_sdk.runtime.security import (
+    url_heartbeat as _url_heartbeat,
 )
 from kbm_ledsas_sdk.transport.base import DeliveryLost, Transport, TransportUnavailable
 from kbm_ledsas_sdk.utils import amqp_text as _amqp_text
-from kbm_ledsas_sdk.utils.logging import _command_fields, masked_logger
+from kbm_ledsas_sdk.utils.logging import (
+    _command_fields,
+    masked_logger,
+    register_connection_secrets,
+)
 
 logger = masked_logger(__name__)
 
@@ -80,6 +91,45 @@ def url_with_heartbeat(url: str, heartbeat: int | None) -> str:
         else f"heartbeat={int(heartbeat)}"
     )
     return urlunsplit(parts._replace(query=query))
+
+
+# getaddrinfo errors that mean "this host name does not resolve" (no such
+# name, a temporary or permanent name-server failure; musl reports a
+# missing name as EAI_AGAIN, "Try again").
+_UNRESOLVED_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(socket, "EAI_NONAME", None),
+        getattr(socket, "EAI_AGAIN", None),
+        getattr(socket, "EAI_FAIL", None),
+        getattr(socket, "EAI_NODATA", None),
+    )
+    if code is not None
+)
+
+
+def _unresolved_host_error(error: BaseException, host: str | None = None) -> str | None:
+    """The 'host name does not resolve' reason when ``error`` (or an error
+    it was raised from) is such a name-lookup failure, else None."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        candidates = [
+            current,
+            *(a for a in getattr(current, "args", ()) if isinstance(a, BaseException)),
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, socket.gaierror) and candidate.errno in _UNRESOLVED_ERRNOS:
+                name = f"{host!r} " if host else ""
+                return (
+                    f"the host name {name}does not resolve "
+                    f"({candidate.strerror or candidate}); check the host in "
+                    "KBM_LEDSAS_RABBITMQ_URL and the DNS of the network the "
+                    "service runs in"
+                )
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def _publish_error_text(error: BaseException) -> str:
@@ -233,6 +283,19 @@ class DirectTransport(Transport):
     #: is buffered). Handler run time itself is never bounded here.
     SHUTDOWN_STEP_TIMEOUT_S: float = 5.0
 
+    #: How often, in seconds, the transport checks that the broker still
+    #: delivers to its command consumer (see ``_watch_consumer``), and the
+    #: longest wait between two attempts to consume again after the broker
+    #: cancelled it.
+    CONSUMER_CHECK_INTERVAL_S: float = 2.0
+
+    #: An attempt whose reply or settlement was lost with the broker
+    #: connection counts toward KBM_LEDSAS_MAX_RETRIES (see
+    #: ``AMQPConsumer.count_lost_attempt``): read by ServiceApp, which
+    #: dead-letters such a command once its retries are spent.
+    counts_lost_attempts: bool = True
+    CONSUMER_RETRY_MAX_S: float = 30.0
+
     def __init__(
         self,
         rabbitmq_url: str,
@@ -243,7 +306,7 @@ class DirectTransport(Transport):
         default_container: str = "dev",
         max_payload_bytes: int = 16 * 1024 * 1024,
         connect_timeout: float = 15.0,
-        heartbeat: int | None = 15,
+        heartbeat: int | None = 60,
     ):
         """
         Initialize Direct transport.
@@ -265,18 +328,24 @@ class DirectTransport(Transport):
                 to over 2 minutes), which an orchestrator's liveness probe
                 may not wait for.
             heartbeat: AMQP heartbeat interval in seconds requested from
-                the broker (KBM_LEDSAS_HEARTBEAT; 0 turns heartbeats off),
-                used unless ``rabbitmq_url`` sets ``?heartbeat=`` itself.
-                A broker that stops answering (frozen, or a network path
-                that silently drops packets) is then detected within
-                about 3 x (this interval + 1) s, the client library's
-                bound: about 50 s at the default 15, instead of about 3
-                minutes with the library's own 60 s default. ``None``
-                leaves the URL unchanged.
+                the broker (KBM_LEDSAS_HEARTBEAT, default 60; 0 turns
+                heartbeats off), used unless ``rabbitmq_url`` sets
+                ``?heartbeat=`` itself. A broker that stops answering
+                (frozen, or a network path that silently drops packets) is
+                then detected within about 3 x (this interval + 1) s, the
+                client library's bound. A handler that blocks the event
+                loop for longer than about two heartbeat intervals loses the
+                connection (the broker stops hearing from this service):
+                run blocking work with ``asyncio.to_thread``. ``None``
+                leaves the URL unchanged (the client library's own default
+                applies).
         """
-        self.rabbitmq_url = rabbitmq_url
+        # Held so that no display path (repr of the transport's attributes,
+        # pprint, rich.inspect) shows the credentials; see RedactedStr.
+        register_connection_secrets(rabbitmq_url, blob_conn_string)
+        self.rabbitmq_url = redacted(rabbitmq_url)
         self.heartbeat = heartbeat
-        self.blob_conn_string = blob_conn_string
+        self.blob_conn_string = redacted(blob_conn_string)
         self.service_name = service_name
         self.tenant = tenant
         self.prefetch_count = prefetch_count
@@ -295,9 +364,9 @@ class DirectTransport(Transport):
         self.publisher: AMQPPublisher | None = None
 
         # Operational counters, split into two so an ops dashboard
-        # can tell apart "the orchestrator's reply infrastructure is
+        # can tell apart "the caller's reply infrastructure is
         # broken" (response path, every failure dead-letters a command)
-        # from "the orchestrator isn't listening to status updates"
+        # from "the caller isn't listening to status updates"
         # (status path, best-effort and benign). Both are exposed for
         # logging and tests; not currently wired into a metrics backend.
         self.reply_publish_failures: int = 0
@@ -305,7 +374,7 @@ class DirectTransport(Transport):
         # Subset of reply_publish_failures: the reply exchange EXISTS but
         # the mandatory publish came back unroutable (Basic.Return — no
         # queue bound for the routing key; see publisher's
-        # _is_unroutable_return). Distinguishes "orchestrator never
+        # _is_unroutable_return). Distinguishes "the caller never
         # declared its reply exchange" from "declared it but the reply
         # queue is missing/unbound". Statuses stay best-effort with the
         # single status_publish_failures counter.
@@ -331,8 +400,17 @@ class DirectTransport(Transport):
         # up): the cause reported when a shutdown begins during the outage.
         self._broker_connection_lost_error: BaseException | None = None
 
+        # True from the moment the broker cancelled the command consumer
+        # (its queue was deleted, or the queue's node is down) until the
+        # service consumes again: /ready answers 503 meanwhile.
+        self._consumer_cancelled: bool = False
+        self._consumer_watch: asyncio.Task[None] | None = None
+
         # Blob components
-        self.azure_client = AzureBlobClient(blob_conn_string, default_container)
+        self.azure_client = AzureBlobClient(
+            blob_conn_string if blob_conn_string is None else str(blob_conn_string),
+            default_container,
+        )
         self.blob_ops = DirectBlobOperations(self.azure_client, default_container)
 
         logger.info(
@@ -367,15 +445,26 @@ class DirectTransport(Transport):
             # customer turns on; the URL in plaintext would put their
             # broker credentials in their log aggregator.
             logger.info(
-                "Connecting to the AMQP broker at %s (timeout %gs)",
+                "Connecting to the AMQP broker at %s (timeout %gs, heartbeat %s)",
                 _scrub_url_credentials(self.rabbitmq_url),
                 self.connect_timeout,
+                self._heartbeat_text(),
             )
             # A message property that is not UTF-8 must not stop the
             # consumer (see kbm_ledsas_sdk.utils.amqp_text): the tolerant
             # decoders go in when the service starts, before its first
             # frame is decoded, not when the package is imported.
-            _amqp_text.install()
+            if not _amqp_text.install():
+                # The installed AMQP protocol library has another layout:
+                # a message property that is not UTF-8 then drops the
+                # connection instead of dead-lettering that one message.
+                logger.warning(
+                    "Could not make the AMQP protocol decoder tolerant of "
+                    "message properties that are not UTF-8 (the installed "
+                    "pamqp has another layout): such a message drops the "
+                    "connection instead of being dead-lettered once. Install "
+                    "a pamqp version this SDK release supports (3.3 to 4.x)."
+                )
             # The connection object being made, so a start that is given
             # up while it connects can close it (see below).
             connecting: list = []
@@ -384,7 +473,7 @@ class DirectTransport(Transport):
                 # later reconnects; a first attempt that times out fails
                 # the start (TransportUnavailable below).
                 self.connection = await aio_pika.connect_robust(
-                    url_with_heartbeat(self.rabbitmq_url, self.heartbeat),
+                    url_with_heartbeat(str(self.rabbitmq_url), self.heartbeat),
                     timeout=self.connect_timeout,
                     connection_class=_recorded_connection_class(connecting),
                 )
@@ -396,8 +485,18 @@ class DirectTransport(Transport):
                 # connection is closed.
                 await self._close_unstarted(connecting)
                 raise
-            except aiormq.exceptions.ProbableAuthenticationError:
-                raise  # credentials: dedicated handling below
+            except aiormq.exceptions.ProbableAuthenticationError as e:
+                # The broker refused the credentials (wrong password, a user
+                # without access to the virtual host): one clean line naming
+                # the broker, raised as TransportUnavailable like every other
+                # refusal of the connection.
+                raise TransportUnavailable(
+                    "AMQP authentication refused by the broker at "
+                    f"{_scrub_url_credentials(self.rabbitmq_url)}: check the "
+                    "user name and password in KBM_LEDSAS_RABBITMQ_URL and "
+                    "the user's access to the virtual host. Broker reply: "
+                    f"{_describe_error(e) or type(e).__name__}"
+                ) from e
             except Exception as e:
                 # Broker unreachable (connection refused, DNS, timeout) or
                 # it refused the connection during setup (unknown virtual
@@ -406,7 +505,15 @@ class DirectTransport(Transport):
                 # malformed URL is a ValueError) keeps its own handling.
                 if not _is_connect_failure(e):
                     raise
-                if isinstance(e, asyncio.TimeoutError):
+                unresolved = _unresolved_host_error(e)
+                if unresolved is None and isinstance(e, asyncio.TimeoutError):
+                    # A slow or failing name lookup counts in the connect
+                    # timeout: tell it apart from a host that does not
+                    # answer before blaming a firewall.
+                    unresolved = await self._host_lookup_failure()
+                if unresolved is not None:
+                    reason = unresolved
+                elif isinstance(e, asyncio.TimeoutError):
                     reason = (
                         f"no answer within {self.connect_timeout:g}s "
                         "(KBM_LEDSAS_CONNECT_TIMEOUT); a firewall may be "
@@ -465,6 +572,11 @@ class DirectTransport(Transport):
             )
             await self.consumer.start()
             logger.debug("Consumer started")
+            # Notice a cancel of the consumer by the broker (the client
+            # library only logs it): see _watch_consumer.
+            self._consumer_watch = asyncio.create_task(
+                self._watch_consumer(), name="sdk-consumer-watch"
+            )
 
             logger.info("DirectTransport started successfully")
 
@@ -624,7 +736,7 @@ class DirectTransport(Transport):
 
     async def send_response(self, response: Response) -> bool:
         """
-        Send response message to orchestrator.
+        Send the response message to the caller (its reply_to exchange).
 
         Returns True on success (or when there is no reply_to), False when
         the publish was attempted but failed (e.g. the caller's reply
@@ -688,6 +800,17 @@ class DirectTransport(Transport):
                 routing_key="response",
             )
             return True
+        except asyncio.CancelledError as e:
+            # The client library cancels a publish still waiting for the
+            # broker when the connection is closed under it (a heartbeat
+            # timeout while the broker was frozen). Unless this task itself
+            # is being cancelled, that is a reply lost with the connection.
+            task = asyncio.current_task()
+            if (task is not None and task.cancelling()) or not (
+                self._broker_connection_lost or self._connection_down()
+            ):
+                raise
+            await self._reply_lost(response, exchange_name, e)
         except Exception as e:
             if self._unreachable_at_shutdown(e):
                 # Shutdown in progress and the broker cannot be reached (or
@@ -716,29 +839,7 @@ class DirectTransport(Transport):
                 )
                 return False
             if self._reply_lost_with_connection(e, response.envelope.message_id):
-                # The broker connection was lost while the command ran
-                # (e.g. a broker restart): not a reply-infrastructure
-                # problem. The command's delivery belongs to the lost
-                # connection, so the broker returns it to the queue and
-                # delivers it again; give it back here and say so once.
-                self.replies_lost_with_connection += 1
-                logger.warning(
-                    "Reply to exchange '%s' not sent: the connection to the "
-                    "AMQP broker was lost (%s). The command was not "
-                    "acknowledged; the broker delivers it again, so it runs "
-                    "again (after a broker restart, only if it was published "
-                    "persistent).",
-                    exchange_name,
-                    type(e).__name__,
-                    extra={
-                        **_command_fields(response.envelope),
-                        "exchange": exchange_name,
-                        "error_class": type(e).__name__,
-                    },
-                )
-                if self.consumer is not None:
-                    await self.consumer.release(response.envelope.message_id)
-                raise DeliveryLost("reply not sent: broker connection lost") from e
+                await self._reply_lost(response, exchange_name, e)
             self.reply_publish_failures += 1
             # Point the operator at the actual cause:
             # - unroutable return (Basic.Return): the exchange exists but
@@ -792,7 +893,10 @@ class DirectTransport(Transport):
                 )
             elif type(e).__name__ == "ChannelNotFoundEntity":
                 error_text = _publish_error_text(e)
-                action_hint = "verify the orchestrator pre-declared this exchange."
+                action_hint = (
+                    "verify the caller declared this exchange and bound a "
+                    "queue to it for routing key 'response'."
+                )
             else:
                 error_text = _publish_error_text(e)
                 action_hint = (
@@ -818,9 +922,42 @@ class DirectTransport(Transport):
             )
             return False
 
+    async def _reply_lost(
+        self, response: Response, exchange_name: str, error: BaseException
+    ) -> None:
+        """The broker connection was lost while the command ran (e.g. a
+        broker restart, or a heartbeat timeout): not a reply-infrastructure
+        problem. The command's delivery belongs to the lost connection, so
+        the broker returns it to the queue and delivers it again; give it
+        back here, say so once (WARNING) and raise ``DeliveryLost``."""
+        self.replies_lost_with_connection += 1
+        error_class = (
+            "ConnectionLost" if isinstance(error, asyncio.CancelledError) else type(error).__name__
+        )
+        logger.warning(
+            "Reply to exchange '%s' not sent: the connection to the "
+            "AMQP broker was lost (%s). The command was not "
+            "acknowledged; the broker delivers it again, so it runs "
+            "again (after a broker restart, only if it was published "
+            "persistent).",
+            exchange_name,
+            error_class,
+            extra={
+                **_command_fields(response.envelope),
+                "exchange": exchange_name,
+                "error_class": error_class,
+            },
+        )
+        if self.consumer is not None:
+            # The attempt counts toward KBM_LEDSAS_MAX_RETRIES: a command
+            # whose every run loses the connection is dead-lettered once its
+            # retries are spent (see ServiceApp), instead of running forever.
+            await self.consumer.release(response.envelope.message_id, count_attempt=True)
+        raise DeliveryLost("reply not sent: broker connection lost") from error
+
     async def send_status(self, status: Status) -> None:
         """
-        Send status update to orchestrator.
+        Send a status update to the caller (its reply_to exchange).
 
         Statuses are best-effort: if the reply_to exchange does not exist
         (or the publish fails for another reason), the failure is logged as
@@ -880,8 +1017,8 @@ class DirectTransport(Transport):
                 return
             # Status is informational and best-effort: log and continue.
             # Bump the *status* failure counter (not the response
-            # one) so an ops dashboard can distinguish "orchestrator's
-            # reply infra is broken" from "orchestrator isn't listening
+            # one) so an ops dashboard can distinguish "the caller's
+            # reply infra is broken" from "the caller isn't listening
             # to status updates."
             self.status_publish_failures += 1
             # A DeliveryError's args can embed the returned message, body
@@ -963,20 +1100,86 @@ class DirectTransport(Transport):
     def _on_broker_connection_closed(
         self, _sender: object, error: BaseException | None = None
     ) -> None:
-        """Close callback: one WARNING per outage (not on our own close)."""
+        """Close callback: one WARNING per outage (not on our own close).
+
+        The service closes the connection itself only in ``stop()``, after
+        shutdown began; any other close is a lost connection, also one
+        without an error: the client library closes the connection with
+        no error (or a cancellation) when no frame came from the broker
+        within its heartbeat timeout (a frozen broker, a network path that
+        drops packets, or this service's event loop blocked too long)."""
         if self._shutdown_guard.stopping or self._broker_connection_lost:
             return
         if error is None or isinstance(error, asyncio.CancelledError):
-            return  # closed locally, not lost
+            cause = (
+                "no frames from the broker within the heartbeat timeout, "
+                f"about {self._heartbeat_timeout_text()}"
+            )
+            error_class = "HeartbeatTimeout"
+        else:
+            cause = _describe_error(error) or type(error).__name__
+            error_class = type(error).__name__
         self._broker_connection_lost = True
-        self._broker_connection_lost_error = error
+        self._broker_connection_lost_error = (
+            error
+            if error is not None and not isinstance(error, asyncio.CancelledError)
+            else BrokerNotReachable(cause)
+        )
         logger.warning(
             "Lost the connection to the AMQP broker (%s); reconnecting "
             "automatically. Commands not yet acknowledged are redelivered "
             "by the broker; /ready answers 503 until the connection is back.",
-            _describe_error(error) or type(error).__name__,
-            extra={"error_class": type(error).__name__},
+            cause,
+            extra={"error_class": error_class},
         )
+
+    def _effective_heartbeat(self) -> int | None:
+        """The heartbeat interval requested from the broker: the URL's
+        ``?heartbeat=`` when it sets one, else ``heartbeat`` (None: the
+        client library's default, 60)."""
+        from_url = _url_heartbeat(urlsplit(str(self.rabbitmq_url)).query)
+        if from_url is not None:
+            try:
+                return int(from_url)
+            except ValueError:
+                return None
+        return 60 if self.heartbeat is None else int(self.heartbeat)
+
+    def _heartbeat_text(self) -> str:
+        """``60s`` / ``off`` for the connect record."""
+        value = self._effective_heartbeat()
+        return "off" if value == 0 else f"{value}s"
+
+    def _heartbeat_timeout_text(self) -> str:
+        """How long the client library waits for a frame before it closes
+        the connection (3 x (interval + 1) s)."""
+        value = self._effective_heartbeat() or 60
+        return f"{3 * (value + 1)} s"
+
+    async def _host_lookup_failure(self) -> str | None:
+        """After a connect timeout: the 'does not resolve' reason when the
+        broker's host name cannot be looked up (within a few seconds),
+        else None."""
+        host = urlsplit(str(self.rabbitmq_url)).hostname
+        if not host:
+            return None
+        try:
+            await asyncio.wait_for(
+                asyncio.get_running_loop().getaddrinfo(host, None),
+                timeout=min(5.0, float(self.connect_timeout)),
+            )
+        except TimeoutError:
+            return (
+                f"the host name {host!r} did not resolve within "
+                f"{min(5.0, float(self.connect_timeout)):g}s (no answer from "
+                "the name server); check the host in KBM_LEDSAS_RABBITMQ_URL "
+                "and the DNS of the network the service runs in"
+            )
+        except OSError as e:
+            return _unresolved_host_error(e, host)
+        except Exception:  # pragma: no cover - never mask the real failure
+            return None
+        return None
 
     def _on_broker_reconnected(self, _sender: object, *_args: object) -> None:
         """Reconnect callback: one INFO once the connection is back."""
@@ -1124,6 +1327,11 @@ class DirectTransport(Transport):
         never comes, until the platform kills the process.
         """
         logger.info("Stopping DirectTransport")
+
+        watch = self._consumer_watch
+        self._consumer_watch = None
+        if watch is not None and not watch.done():
+            watch.cancel()
 
         step_timeout = self.SHUTDOWN_STEP_TIMEOUT_S
         guard = self._shutdown_guard
@@ -1289,7 +1497,114 @@ class DirectTransport(Transport):
         channel = self.channel
         if channel is None or getattr(channel, "is_closed", False) is True:
             return False
+        if self._consumer_cancelled or self._consumer_registered() is False:
+            # The broker cancelled the command consumer: the connection is
+            # up but no command arrives.
+            return False
         return True
+
+    def _consumer_registered(self) -> bool | None:
+        """Whether the broker still delivers to the command consumer: True
+        while its consumer tag is registered on the consumer channel,
+        False once the broker cancelled it (Basic.Cancel: the queue was
+        deleted, or the queue's node is down), None when it cannot be
+        told (not consuming yet, shutting down, the connection or the
+        channel is down, or a test double)."""
+        consumer = self.consumer
+        tag = getattr(consumer, "consumer_tag", None)
+        if not isinstance(tag, str) or not tag:
+            return None
+        if self._shutdown_guard.stopping or getattr(consumer, "consuming_stopped", False) is True:
+            return None
+        if self._connection_down():
+            return None
+        channel = self.channel
+        if channel is None or getattr(channel, "is_closed", True) is not False:
+            return None
+        try:
+            underlay = channel.channel
+        except Exception:
+            return None
+        consumers = getattr(underlay, "consumers", None)
+        if not isinstance(consumers, dict):
+            return None
+        return tag in consumers
+
+    async def _watch_consumer(self) -> None:
+        """Notice a cancel of the command consumer by the broker.
+
+        The broker cancels a consumer when its queue is deleted (another
+        client deleted it, even if it re-created it at once) or the node
+        holding a classic queue goes down. The client library then only
+        logs a WARNING of its own, and the service would consume nothing
+        while ``/ready`` kept answering 200. Checked every
+        ``CONSUMER_CHECK_INTERVAL_S`` (twice in a row, so a reconnect in
+        progress is not mistaken for it): one ERROR, ``/ready`` answers
+        503, and the service declares its exchanges and queues again and
+        consumes again, retrying with a growing delay (at most
+        ``CONSUMER_RETRY_MAX_S``) until it succeeds; one INFO then."""
+        misses = 0
+        try:
+            while not self._shutdown_guard.stopping:
+                await asyncio.sleep(self.CONSUMER_CHECK_INTERVAL_S)
+                registered = self._consumer_registered()
+                if registered is False:
+                    misses += 1
+                else:
+                    misses = 0
+                if misses >= 2:
+                    misses = 0
+                    await self._consume_again()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - the watch must never crash the service
+            logger.debug("The consumer watch stopped", exc_info=True)
+
+    async def _consume_again(self) -> None:
+        """After the broker cancelled the command consumer: declare the
+        topology again and consume again (see ``_watch_consumer``)."""
+        consumer = self.consumer
+        if consumer is None or self.channel is None:
+            return
+        queue_name = getattr(getattr(consumer, "queue", None), "name", "the command queue")
+        self._consumer_cancelled = True
+        logger.error(
+            "The AMQP broker cancelled the command consumer on %s (the queue "
+            "was deleted, or the node that holds it is down): no command "
+            "arrives, and /ready answers 503. Declaring the queue again and "
+            "consuming again.",
+            queue_name,
+            extra={"queue": queue_name},
+        )
+        delay = self.CONSUMER_CHECK_INTERVAL_S
+        while not self._shutdown_guard.stopping:
+            try:
+                await declare_topology(
+                    channel=self.channel,
+                    service_name=self.service_name,
+                    tenant=self.tenant,
+                )
+                await consumer.consume_again()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "Could not consume from %s again (%s); retrying in %g s",
+                    queue_name,
+                    _describe_cause(e),
+                    delay,
+                    extra={"queue": queue_name, "error_class": type(e).__name__},
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self.CONSUMER_RETRY_MAX_S)
+                continue
+            self._consumer_cancelled = False
+            logger.info(
+                "Consuming commands from %s again",
+                queue_name,
+                extra={"queue": queue_name},
+            )
+            return
 
     def get_retry_count(self, message_id: str) -> int:
         """Forward to the consumer's in-process retry tracker.

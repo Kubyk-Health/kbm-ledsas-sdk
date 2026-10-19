@@ -13,7 +13,13 @@ Use this in unit tests to test SDK logic without real infrastructure.
 import asyncio
 from collections.abc import AsyncIterable, AsyncIterator, Callable
 
-from ..blob.operations import BlobOperations, BytesLike, JSONValue
+from ..blob.operations import (
+    BlobOperations,
+    BytesLike,
+    JSONValue,
+    _check_upload_json_root,
+    _checked_json_root,
+)
 from ..models.blob import BlobRef
 from ..models.messages import Command, Response, Status
 from .base import Transport
@@ -54,7 +60,7 @@ class MockBlobOperations(BlobOperations):
         import json
 
         data = await self.download_bytes(blob_ref)
-        return json.loads(data.decode("utf-8"))
+        return _checked_json_root(blob_ref, json.loads(data.decode("utf-8")))
 
     async def upload_bytes(
         self,
@@ -92,6 +98,7 @@ class MockBlobOperations(BlobOperations):
         """Upload JSON to mock storage."""
         import json
 
+        _check_upload_json_root(obj)
         data = json.dumps(obj).encode("utf-8")
         return await self.upload_bytes(container, data, path, overwrite=overwrite)
 

@@ -40,7 +40,7 @@ import random
 import re
 import signal
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, TypeVar
 
 from pydantic import ValidationError
@@ -340,7 +340,13 @@ def _quiet_noisy_libraries() -> None:
 
 # The function a decorator returns unchanged (a handler: an async function;
 # a health check: a function taking no arguments).
-H = TypeVar("H", bound=Callable[..., Awaitable[Any]])
+# A handler: called with (ctx, payload), returns a dict (or another str-keyed
+# mapping) or None. The payload is Any so a handler may annotate it as a
+# dict, a TypedDict or a model it builds itself.
+H = TypeVar(
+    "H",
+    bound=Callable[[ExecutionContext, Any], Awaitable[Mapping[str, Any] | None]],
+)
 C = TypeVar("C", bound=Callable[[], object])
 
 
@@ -493,8 +499,8 @@ class ServiceApp:
 
         Example:
             @app.liveness_check("event_loop_responsive")
-            def _():
-                return not main_loop.is_blocked()
+            def event_loop_responsive():
+                return True  # reaching here proves the event loop runs
         """
 
         def decorator(func: C) -> C:
@@ -763,6 +769,13 @@ class ServiceApp:
         # Logged here, not when the handlers were registered (at import
         # time, before this method applied the log settings).
         self.registry.log_registered()
+        allowed = getattr(self.config, "allowed_containers", None)
+        if isinstance(allowed, (set, frozenset)) and allowed:
+            logger.info(
+                "Blob access limited to the containers in " "KBM_LEDSAS_ALLOWED_CONTAINERS: %s",
+                ", ".join(sorted(allowed)),
+                extra={"allowed_containers": sorted(allowed)},
+            )
 
         # Update registry with config (handlers already registered via decorators)
         self.registry._generic_errors = self.config.generic_errors
@@ -1299,10 +1312,12 @@ class ServiceApp:
                 )
 
                 # Create execution context
+                allowed = getattr(self.config, "allowed_containers", None)
                 ctx = ExecutionContext(
                     transport=self.transport,
                     envelope=envelope,
                     payload=command.payload,
+                    allowed_containers=(allowed if isinstance(allowed, (set, frozenset)) else None),
                 )
 
                 # Get timeout from config
@@ -1327,31 +1342,53 @@ class ServiceApp:
                     else None
                 )
 
-                # Execute handler (returns Response with success or error).
-                # While it runs, a second stop signal may cancel this task
-                # (_stop_now); from the moment it returns, the reply and the
-                # settlement below are never cancelled by that signal.
-                this_task = asyncio.current_task()
-                if this_task is not None:
-                    self._tasks_in_handler.add(this_task)
-                    self._handler_task_commands[this_task] = (
-                        f"{envelope.name} {envelope.message_id}"
-                    )
-                if self._loop_watchdog is not None:
-                    # Read and reset by the watchdog on every tick.
-                    self._handlers_started_since_tick.add(f"{envelope.name} {envelope.message_id}")
-                try:
-                    outcome = await self.registry.execute_with_outcome(
-                        ctx,
-                        command,
-                        timeout_seconds=timeout_seconds,
-                        final_attempt=final_attempt,
-                        attempt=(attempts_used + 1 if isinstance(attempts_used, int) else None),
-                    )
-                finally:
+                # Every earlier attempt of this command ended with the broker
+                # connection lost (its run finished, or was still running,
+                # when the connection dropped, so neither its reply nor its
+                # acknowledgement reached the broker), and those attempts
+                # used up the retry budget: it is not run again, but replied
+                # and dead-lettered like a retryable failure whose retries
+                # are spent. Otherwise such a command (typically a handler
+                # that blocks the event loop past the heartbeat timeout)
+                # would run forever. The count is kept in this process. Only
+                # a transport that counts such attempts (counts_lost_attempts)
+                # takes this path; any other keeps running the final attempt.
+                lost_attempts_exhausted = (
+                    getattr(self.transport, "counts_lost_attempts", False) is True
+                    and isinstance(attempts_used, int)
+                    and isinstance(max_retries, int)
+                    and attempts_used > max_retries
+                )
+                if lost_attempts_exhausted:
+                    outcome = self.registry.connection_lost_outcome(envelope)
+                else:
+                    # Execute handler (returns Response with success or error).
+                    # While it runs, a second stop signal may cancel this task
+                    # (_stop_now); from the moment it returns, the reply and the
+                    # settlement below are never cancelled by that signal.
+                    this_task = asyncio.current_task()
                     if this_task is not None:
-                        self._tasks_in_handler.discard(this_task)
-                        self._handler_task_commands.pop(this_task, None)
+                        self._tasks_in_handler.add(this_task)
+                        self._handler_task_commands[this_task] = (
+                            f"{envelope.name} {envelope.message_id}"
+                        )
+                    if self._loop_watchdog is not None:
+                        # Read and reset by the watchdog on every tick.
+                        self._handlers_started_since_tick.add(
+                            f"{envelope.name} {envelope.message_id}"
+                        )
+                    try:
+                        outcome = await self.registry.execute_with_outcome(
+                            ctx,
+                            command,
+                            timeout_seconds=timeout_seconds,
+                            final_attempt=final_attempt,
+                            attempt=(attempts_used + 1 if isinstance(attempts_used, int) else None),
+                        )
+                    finally:
+                        if this_task is not None:
+                            self._tasks_in_handler.discard(this_task)
+                            self._handler_task_commands.pop(this_task, None)
 
                 # Decide the outcome BEFORE replying. A command gets at most
                 # ONE reply, sent when the SDK has finished with it: success,
@@ -1440,7 +1477,7 @@ class ServiceApp:
                         # reports the outage once at stop).
                         return
                     else:
-                        # Reply publish failed (e.g. orchestrator's reply
+                        # Reply publish failed (e.g. the caller's reply
                         # exchange missing). The transport has already
                         # logged the failure (ERROR) and bumped its
                         # counter. Treat this command as Permanent-failed:
@@ -1481,12 +1518,36 @@ class ServiceApp:
                     # broker is unreachable while stopping) raises, the
                     # transport logs that once and the broker delivers the
                     # command again, so the record would claim a
-                    # dead-letter that did not happen.
+                    # dead-letter that did not happen. It names the error
+                    # of the last attempt (the handler layer's per-attempt
+                    # WARNINGs carry the details).
                     await self.transport.nack(envelope.message_id, requeue=False)
-                    logger.error(
-                        f"Max retries ({max_retries}) exceeded, sending to DLQ",
-                        extra={**_command_fields(envelope), "retry_count": retry_count},
-                    )
+                    final_fields = {
+                        **_command_fields(envelope),
+                        "retry_count": retry_count,
+                        "attempt": (attempts_used + 1 if isinstance(attempts_used, int) else None),
+                        "error_class": getattr(outcome, "error_class", None),
+                        "error_message": getattr(outcome, "error_message", None),
+                    }
+                    if lost_attempts_exhausted:
+                        logger.error(
+                            f"Max retries ({max_retries}) exceeded, sending to "
+                            f"DLQ: command {envelope.name} was delivered again "
+                            f"after {attempts_used} attempt(s) that did not "
+                            f"finish, the last one(s) because the connection to "
+                            f"the AMQP broker was lost while the command ran; "
+                            f"it is not run again. A handler that blocks the "
+                            f"event loop for longer than about two heartbeat "
+                            f"intervals (KBM_LEDSAS_HEARTBEAT) loses the "
+                            f"connection: run "
+                            f"blocking work with asyncio.to_thread",
+                            extra=final_fields,
+                        )
+                    else:
+                        logger.error(
+                            f"Max retries ({max_retries}) exceeded, sending to DLQ",
+                            extra=final_fields,
+                        )
                 else:
                     # Non-retryable error - send to DLQ immediately. The
                     # handler layer has already logged the cause once, at

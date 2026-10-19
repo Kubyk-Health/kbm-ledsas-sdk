@@ -6,8 +6,9 @@ version>`` (the image comes with the SDK and its runtime dependencies
 installed, and its tag is the SDK version), the service's own dependencies
 installed as root and checked with ``pip check``, pip removed as the last
 root step, and the service run as the base image's non-root user
-``kbmuser``. The tag is written literally so that a dependency bot can
-propose the next one.
+``kbmuser``, by number (``USER 1000:1000``: Kubernetes ``runAsNonRoot`` can
+only verify a numeric user). The tag is written literally so that a
+dependency bot can propose the next one.
 """
 
 import re
@@ -23,6 +24,9 @@ REQUIREMENTS = EXAMPLE / "requirements.txt"
 BASE = "ghcr.io/kebormed/kbm-ledsas-base-direct"
 VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 SDK_NAME = re.compile(r"kbm[-_.]ledsas[-_.]sdk", re.I)
+# The base image's kbmuser (uid 1000, gid 1000), by number.
+SERVICE_USER = "1000:1000"
+NUMERIC_USER = re.compile(r"[0-9]+(?::[0-9]+)?")
 
 # The last root step, byte for byte.
 PIP_REMOVAL_STEP = (
@@ -140,13 +144,27 @@ def test_pip_is_removed_as_the_last_root_step(text, instructions):
     ]
     assert len(removal) == 1
     after = instructions[removal[0] + 1 :]
-    assert [line for _, line in after][:1] == ["USER kbmuser"]
+    assert [line for _, line in after][:1] == [f"USER {SERVICE_USER}"]
     assert [_word(line) for _, line in after[1:]] == ["CMD"]
 
 
-def test_final_user_is_kbmuser(instructions):
+def test_final_user_is_kbmuser_by_number(instructions):
     users = [line.split(None, 1)[1].strip() for _, line in instructions if _word(line) == "USER"]
-    assert users[-1] == "kbmuser"
+    assert NUMERIC_USER.fullmatch(users[-1]) and users[-1] == SERVICE_USER, users
+
+
+def test_readme_dockerfile_snippets_end_on_the_numeric_user():
+    for rel in ("README.md", "examples/hello_world_service/README.md"):
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        for block in re.findall(r"^```dockerfile\n(.*?)^```", text, re.M | re.S):
+            users = [
+                line.split(None, 1)[1].strip()
+                for _, line in _instructions(block)
+                if _word(line) == "USER"
+            ]
+            if users:
+                assert NUMERIC_USER.fullmatch(users[-1]), (rel, users)
+        assert "USER kbmuser" not in text, rel
 
 
 def test_requirements_never_name_the_sdk():
