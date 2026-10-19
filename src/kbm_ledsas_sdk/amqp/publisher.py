@@ -170,8 +170,14 @@ def _build_publisher_channel_class(base: Any) -> Any:
                 await channel.close(e)
                 self._channel = None
                 raise
-            if self._closed.done():
-                self._closed = asyncio.get_running_loop().create_future()
+            # Reopened: reset the explicit-close marker the way the installed
+            # aio-pika keeps it (a future from 9.5, a bool before).
+            closed = self._closed
+            if isinstance(closed, asyncio.Future):
+                if closed.done():
+                    self._closed = asyncio.get_running_loop().create_future()
+            else:
+                self._closed = False
 
         async def _on_close(self, closing: asyncio.Future) -> Any:
             try:

@@ -18,13 +18,13 @@ This software includes the following third-party components:
    Copyright: Copyright (c) Microsoft Corporation
    URL: https://github.com/Azure/azure-sdk-for-python
 
-3. pydantic (v2.5.0+)
+3. pydantic (v2.8.0+)
    License: MIT License
    Copyright: Copyright (c) 2017 to present Pydantic Services Inc. and
    individual contributors
    URL: https://github.com/pydantic/pydantic
 
-4. aiohttp (v3.14.3+)
+4. aiohttp (v3.14.4+)
    License: Apache License 2.0 AND MIT License (Apache-2.0 for aiohttp;
    MIT for the llhttp HTTP parser it bundles)
    Copyright: Copyright aio-libs contributors; llhttp: Copyright (c) 2018

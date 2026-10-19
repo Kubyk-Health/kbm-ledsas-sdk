@@ -13,7 +13,7 @@ unchanged, but some behaviour changes and input that was never valid is now refu
 
 1. Upgrade with `pip install -U --upgrade-strategy eager kbm-ledsas-sdk==0.3.6` (a plain `-U`
    keeps an installed `aio-pika` 9.x), and raise any pin of `cryptography` below 50.0.0,
-   `aiohttp` below 3.14.3 or `azure-core` below 1.38.0.
+   `aiohttp` below 3.14.4 or `azure-core` below 1.38.0.
 2. Import your service module: handler registration errors now appear there (see "Handlers").
 3. Start the service against your configuration: invalid settings now stop the start with one
    `Configuration error` line (see "Configuration").

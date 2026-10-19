@@ -71,7 +71,7 @@ changes and input that was never valid is now refused: read the upgrade notes an
   `consumer_timeout` (30 minutes by default). **Action:** have it raised for longer handlers.
 - **Deep bodies.** A command body nested more than 256 levels deep is dead-lettered. **Action:**
   flatten it, or send a blob reference.
-- **Dependency floors.** A pin of `cryptography` below 50.0.0, `aiohttp` below 3.14.3 or
+- **Dependency floors.** A pin of `cryptography` below 50.0.0, `aiohttp` below 3.14.4 or
   `azure-core` below 1.38.0 no longer resolves. **Action:** raise the pin.
 - **Numeric container user.** The example `Dockerfile` ends with the numeric `USER 1000:1000` (in
   0.3.3 it ended with the named `USER appuser`), so a pod with `runAsNonRoot: true` and no
@@ -167,7 +167,7 @@ changes and input that was never valid is now refused: read the upgrade notes an
 
 ### Security
 
-- `aiohttp>=3.14.3` (was `>=3.8.0`): fixes CVE-2026-69244.
+- `aiohttp>=3.14.4` (was `>=3.8.0`): fixes CVE-2026-69244, CVE-2026-111063, CVE-2026-111064 and GHSA-2g87-pp6c-29x5.
 - `cryptography>=50.0.0` (transitive, was `>=48.0.1`): fixes CVE-2026-69247 (GHSA-g6cj-pr64-35w5).
 - `azure-core>=1.38.0,<2.0` (no floor before): fixes CVE-2026-21226 (PYSEC-2026-1208); an in-place
   upgrade no longer keeps an older `azure-core`.
