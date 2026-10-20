@@ -342,6 +342,16 @@ def test_release_checks_the_tag_and_tests_before_building():
     assert text.index("python -m pytest") < text.index("python -m build")
 
 
+def test_pypi_check_compares_the_build_digests():
+    # The publish action adds *.publish.attestation files to dist/ during the upload,
+    # so the post-upload check takes the built files from the build job's digests.
+    jobs = _jobs("release.yml")
+    check = jobs["publish-pypi"].split("Check that PyPI holds exactly these files", 1)[1]
+    assert "DIGESTS: ${{ needs.build.outputs.digests }}" in check
+    assert 'base64.b64decode(os.environ["DIGESTS"])' in check
+    assert 'pathlib.Path("dist")' not in check
+
+
 def test_release_publish_is_checked_against_pypi():
     publish = "\n".join(s for s in steps("release.yml") if "pypi" in s.lower())
     if "skip-existing: true" in publish:
