@@ -23,7 +23,7 @@
 services:
   rabbitmq:
     # RabbitMQ 4.1 (LTS).
-    image: rabbitmq:4.1-management-alpine
+    image: rabbitmq:4.3-management-alpine
     container_name: hello-world-rabbitmq
     ports:
       - "127.0.0.1:${HELLO_WORLD_AMQP_PORT:-5672}:5672"    # AMQP protocol
