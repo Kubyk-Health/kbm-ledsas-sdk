@@ -234,13 +234,19 @@ jobs:
       - name: Check that PyPI holds exactly these files
         env:
           TAG: ${{ github.event.release.tag_name }}
+          DIGESTS: ${{ needs.build.outputs.digests }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib, json, os, pathlib, sys, time, urllib.request
+          import base64, json, os, sys, time, urllib.request
 
           version = os.environ["TAG"].removeprefix("v")
-          local = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path("dist").iterdir()}
+          # The build job's digests, not a listing of dist/: the publish action
+          # writes its *.publish.attestation files there during the upload.
+          local = {}
+          for line in base64.b64decode(os.environ["DIGESTS"]).decode().splitlines():
+              digest, name = line.split(maxsplit=1)
+              local[name.lstrip("*")] = digest
           url = f"https://pypi.org/pypi/kbm-ledsas-sdk/{version}/json"
           remote = {}
           for attempt in range(12):  # the JSON API can lag the upload by a few minutes
