@@ -43,7 +43,7 @@ services:
 
   azurite:
     # Pinned tag — keeps the local-dev image reproducible across machines.
-    image: mcr.microsoft.com/azure-storage/azurite:3.34.0
+    image: mcr.microsoft.com/azure-storage/azurite:3.37.0
     container_name: hello-world-azurite
     ports:
       - "127.0.0.1:${HELLO_WORLD_BLOB_PORT:-10000}:10000"  # Blob service (queue/table not mapped)
