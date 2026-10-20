@@ -2866,7 +2866,7 @@ the queue and the logs.
 ---
 
 **Version:** 0.3.6
-**Release:** 2026-10-21
+**Release:** 2026-10-20
 
 ### Version history
 
