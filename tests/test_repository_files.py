@@ -354,7 +354,9 @@ def test_builds_are_reproducible_and_release_links_are_pinned():
     assert "SOURCE_DATE_EPOCH" in release and "SOURCE_DATE_EPOCH" in ci
     assert "a second build" in ci and "cmp " in ci
     # The tagged commit is built as it is: no rewrite of the tree before the build.
-    assert "sed -i" not in release.split("Rehearsal version", 1)[1].split("Tests", 1)[1]
+    # (A rehearsal changes only the version, in its own step.)
+    after_rehearsal = release.split("Rehearsal version", 1)[1].split("\n      - name:", 1)[1]
+    assert "sed -i" not in after_rehearsal
     assert "'/blob/main/" in release  # the guard that fails on a link to main
     for step in steps("release.yml") + steps("ci.yml"):
         if "python -m build" in step:
@@ -375,6 +377,13 @@ def test_release_sbom_has_a_root_component_and_hashes():
     assert ".github/scripts/finish_sbom.py" in release
     finish = read(".github/scripts/finish_sbom.py")
     assert "pkg:pypi/kbm-ledsas-sdk@" in finish and "file://" in finish
+
+
+def test_release_tests_run_before_the_rehearsal_version():
+    # The tests check that the documents name the release version, so they run on
+    # the tree as committed: after the .devN rewrite they would fail every rehearsal.
+    release = read(".github/workflows/release.yml")
+    assert release.index("python -m pytest") < release.index("- name: Rehearsal version")
 
 
 def test_testpypi_rehearsal_is_repeatable_and_main_only():
