@@ -373,7 +373,9 @@ def test_the_package_page_and_the_source_link_this_release():
 
 def test_release_sbom_has_a_root_component_and_hashes():
     release = read(".github/workflows/release.yml")
-    assert "--pyproject pyproject.toml --mc-type library" in release
+    assert "--pyproject /tmp/pyproject.toml --mc-type library" in release
+    # ... whose version is the wheel's (a rehearsal's <version>.devN too).
+    assert 'version = \\"${VERSION}\\"/" pyproject.toml > /tmp/pyproject.toml' in release
     assert ".github/scripts/finish_sbom.py" in release
     finish = read(".github/scripts/finish_sbom.py")
     assert "pkg:pypi/kbm-ledsas-sdk@" in finish and "file://" in finish
