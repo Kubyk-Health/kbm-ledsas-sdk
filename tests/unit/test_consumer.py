@@ -53,7 +53,7 @@ class TestConsumerMalformedMessageRouting:
         body = json.dumps(
             {
                 "envelope": {"name": "ProcessCSV"},
-                "payload": {"csv_uri": "azblob://x/y.csv"},
+                "payload": {"csv_uri": "azblob://data/y.csv"},
             }
         ).encode()
         msg = _make_message(body)

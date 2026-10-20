@@ -7,8 +7,48 @@ with W3C trace context integration.
 
 import json
 import logging
+import math
+import re
 import sys
+from collections.abc import MutableMapping
+from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote as _url_quote
+from urllib.parse import unquote as _url_unquote
+
+# The datefmt older releases passed for the JSON ``timestamp`` (local time,
+# whole seconds, no offset). Treated like "no datefmt": the timestamp is
+# then UTC ISO 8601 with milliseconds.
+_LEGACY_JSON_DATEFMT = "%Y-%m-%dT%H:%M:%S"
+
+
+def _safe_repr(value: Any) -> str:
+    """``repr(value)``, or ``<TypeName (repr failed)>`` when the value's
+    own ``__repr__`` raises: a log record is never lost to a broken
+    ``__repr__`` (an ORM object detached from its session, say)."""
+    try:
+        return repr(value)
+    except Exception:
+        try:
+            name = type(value).__name__
+        except Exception:  # pragma: no cover - a broken class object
+            name = "object"
+        return f"<{name} (repr failed)>"
+
+
+def _safe_str(value: Any) -> str:
+    """``str(value)``, falling back to ``_safe_repr`` when it raises."""
+    try:
+        return str(value)
+    except Exception:
+        return _safe_repr(value)
+
+
+def utc_timestamp(created: float) -> str:
+    """``created`` (seconds since the epoch) as UTC ISO 8601 with
+    milliseconds and a ``Z`` suffix, e.g. ``2026-10-14T05:43:15.123Z``."""
+    stamp = datetime.fromtimestamp(created, UTC)
+    return stamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class JSONFormatter(logging.Formatter):
@@ -26,7 +66,19 @@ class JSONFormatter(logging.Formatter):
       about them in advance).
 
     Non-JSON-serialisable values fall back to ``repr()`` so a stray
-    object never breaks logging.
+    object never breaks logging: every record is one valid JSON line
+    (RFC 8259). NaN and Infinity become the strings ``"NaN"``,
+    ``"Infinity"`` and ``"-Infinity"``; a field that still cannot be
+    written (a dict with tuple keys, a container that contains itself) is
+    written as its ``repr()``, and a value whose own ``__repr__`` raises
+    as ``"<TypeName (repr failed)>"``. A message whose ``%`` arguments
+    cannot be formatted is written as its template.
+
+    ``timestamp`` is UTC ISO 8601 with milliseconds and a ``Z`` suffix
+    (``2026-10-14T05:43:15.123Z``), so records from hosts in different
+    time zones line up and records within the same second keep their
+    order. A formatter built with an explicit ``datefmt`` uses that
+    format instead (local time, as ``logging.Formatter`` does).
     """
 
     # Attributes the stdlib already sets on every LogRecord. Anything
@@ -61,11 +113,15 @@ class JSONFormatter(logging.Formatter):
     )
 
     def format(self, record: logging.LogRecord) -> str:
+        if self.datefmt in (None, _LEGACY_JSON_DATEFMT):
+            timestamp = utc_timestamp(record.created)
+        else:
+            timestamp = self.formatTime(record, self.datefmt)
         log_data: dict[str, Any] = {
-            "timestamp": self.formatTime(record, self.datefmt),
+            "timestamp": timestamp,
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": _record_message(record),
         }
 
         # Surface every caller-supplied extra= field.
@@ -78,16 +134,175 @@ class JSONFormatter(logging.Formatter):
             log_data[key] = value
 
         if record.exc_info:
-            log_data["exception"] = self.formatException(record.exc_info)
+            # A traceback already rendered for the record (exc_text: the
+            # masked one of a handler failure, see SecretMaskFilter) is used
+            # as it is.
+            log_data["exception"] = record.exc_text or self.formatException(record.exc_info)
 
-        return json.dumps(log_data, default=repr)
+        try:
+            line = json.dumps(log_data, default=_safe_repr, allow_nan=False)
+        except Exception:
+            # A field has no JSON form (NaN / Infinity, tuple keys, a
+            # container that contains itself, a value that raises while
+            # it is written): rewrite only the fields that fail, so the
+            # record is still one valid JSON line.
+            log_data = {key: _json_safe_field(value) for key, value in log_data.items()}
+            line = json.dumps(log_data, default=_safe_repr, allow_nan=False)
+        if "\\ud" in line:
+            # A lone surrogate (a "\ud800" escape a JSON request can carry,
+            # quoted into a message or a field) would be written as an
+            # escape that strict JSON readers refuse and that has no UTF-8
+            # form. Python text holds a character outside the BMP as one
+            # code point, so every surrogate here is lone: each becomes
+            # U+FFFD, as in error replies. "\ud" also starts the escapes of
+            # characters outside the BMP, which pass through unchanged.
+            line = json.dumps(
+                _without_surrogates(log_data),
+                default=lambda value: _without_surrogates(_safe_repr(value)),
+                allow_nan=False,
+            )
+        return line
+
+
+# A UTF-16 surrogate code point: in Python text always a lone one.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _without_surrogates(value: Any, depth: int = 0) -> Any:
+    """``value`` with every lone surrogate in its text (strings, dict keys,
+    list and tuple items, at any depth up to 100) replaced by U+FFFD."""
+    if isinstance(value, str):
+        return _SURROGATE.sub("\ufffd", value)
+    if depth > 100:
+        return value
+    if isinstance(value, dict):
+        return {
+            _without_surrogates(k, depth + 1): _without_surrogates(v, depth + 1)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_without_surrogates(v, depth + 1) for v in value]
+    return value
+
+
+def _record_message(record: logging.LogRecord) -> str:
+    """The record's message; its template when the ``%`` arguments cannot
+    be formatted (a wrong placeholder, an argument whose ``__str__``
+    raises), as the text format does."""
+    try:
+        return record.getMessage()
+    except Exception:
+        return _safe_str(record.msg)
+
+
+def _non_finite_as_text(value: Any, depth: int = 0) -> Any:
+    """``value`` with NaN / Infinity floats (at any depth) as the strings
+    ``"NaN"``, ``"Infinity"``, ``"-Infinity"``."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return "NaN" if value != value else ("Infinity" if value > 0 else "-Infinity")
+    if depth > 100:
+        return value
+    if isinstance(value, dict):
+        return {k: _non_finite_as_text(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_non_finite_as_text(v, depth + 1) for v in value]
+    return value
+
+
+def _json_safe_field(value: Any) -> Any:
+    """One log field in a form ``json.dumps(..., allow_nan=False)``
+    accepts: unchanged when it can be written, NaN / Infinity as text,
+    otherwise its ``repr()``."""
+    try:
+        json.dumps(value, default=_safe_repr, allow_nan=False)
+        return value
+    except Exception:
+        pass
+    try:
+        converted = _non_finite_as_text(value)
+        json.dumps(converted, default=_safe_repr, allow_nan=False)
+        return converted
+    except Exception:
+        pass
+    return _safe_repr(value)
+
+
+# The datefmt older releases passed for the text format (local time, whole
+# seconds, no zone). Treated like "no datefmt": the timestamp is then UTC
+# ISO 8601 with milliseconds, as in the JSON format.
+_LEGACY_TEXT_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+# Unicode format characters (category Cf, as of Unicode 15.1): bidirectional
+# overrides and isolates (U+202A-U+202E, U+2066-U+2069), zero-width
+# characters (U+200B-U+200F), the byte order mark, ... They are invisible,
+# and a bidirectional override makes a terminal show the rest of the line in
+# another order, so a value could disguise what a record says. The same set
+# BlobRef refuses in a blob name.
+_FORMAT_CHARS = (
+    "\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890-\u0891\u08e2\u180e"
+    "\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb"
+    "\U000110bd\U000110cd\U00013430-\U0001343f\U0001bca0-\U0001bca3"
+    "\U0001d173-\U0001d17a\U000e0001\U000e0020-\U000e007f"
+)
+# C0 control characters, DEL and the C1 range (\x9b is a one-byte terminal
+# escape introducer), the Unicode line and paragraph separators and the
+# format characters above.
+_CONTROL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029" + _FORMAT_CHARS + "]")
+# The same, except the newline (kept between the lines of a traceback).
+_CONTROL_CHARS_BUT_NEWLINE = re.compile(
+    "[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029" + _FORMAT_CHARS + "]"
+)
+# Plain values that need no quotes in a key=value pair.
+_PLAIN_VALUE = re.compile(r"[A-Za-z0-9_.:/@+-]+")  # used with fullmatch
+
+
+def _escape_control(match: "re.Match[str]") -> str:
+    ch = match.group(0)
+    named = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    if ch in named:
+        return named[ch]
+    code = ord(ch)
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    return f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+
+
+def _escape_text(text: str) -> str:
+    """``text`` with control characters written as escapes (``\\x1b``,
+    ``\\n``), so a value can neither drive the terminal nor start a new,
+    forged log line."""
+    return _CONTROL_CHARS.sub(_escape_control, text)
+
+
+def _format_value(value: Any) -> str:
+    """One key=value value: plain tokens as they are, anything else quoted
+    as a JSON string (which escapes quotes and control characters)."""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, default=_safe_repr)
+        except Exception:
+            text = _safe_repr(value)
+    if _PLAIN_VALUE.fullmatch(text):
+        return text
+    return json.dumps(text)
 
 
 class TextFormatter(logging.Formatter):
     """
     Human-readable text formatter for development.
 
-    Outputs logs with colors and readable formatting.
+    One line per record: ``<UTC timestamp> <LEVEL> <logger>: <message>``,
+    followed by ``[corr=...]`` / ``[trace=...]`` and every other
+    ``extra={...}`` field as ``key=value`` (the same fields the JSON format
+    carries, e.g. ``error_message``, ``error_class``, ``amqp_message_id``,
+    ``body_bytes``). The timestamp is UTC ISO 8601 with milliseconds and a
+    ``Z`` suffix, as in the JSON format. Control characters in the message,
+    the field values and an exception's text are escaped, so no value can
+    move the cursor, recolor the terminal or forge a line; a traceback
+    follows the line, each of its lines indented by ``  | ``. The level
+    name is colored when stderr is a terminal.
     """
 
     # ANSI color codes
@@ -100,32 +315,534 @@ class TextFormatter(logging.Formatter):
         "RESET": "\033[0m",
     }
 
+    # Extras rendered in their own bracket (correlation_id, trace_id).
+    # service_name is a key=value pair like every other field, as in the
+    # JSON format.
+    _NOT_AS_PAIRS = frozenset({"correlation_id", "trace_id"})
+
     def format(self, record: logging.LogRecord) -> str:
-        """Format log record as colored text."""
-        # Add color to level name
+        """Format log record as one escaped line (plus any traceback)."""
+        if self.datefmt in (None, _LEGACY_TEXT_DATEFMT):
+            timestamp = utc_timestamp(record.created)
+        else:
+            timestamp = self.formatTime(record, self.datefmt)
+
         levelname = record.levelname
         if sys.stderr.isatty():
             color = self.COLORS.get(levelname, "")
             reset = self.COLORS["RESET"]
-            colored_levelname = f"{color}{levelname:8s}{reset}"
+            shown_level = f"{color}{levelname:8s}{reset}"
         else:
-            colored_levelname = f"{levelname:8s}"
+            shown_level = f"{levelname:8s}"
 
-        # Base format
-        message = super().format(record)
+        message = _record_message(record)
+        line = f"{timestamp} {shown_level} {record.name}: {_escape_text(message)}"
 
-        # Add correlation_id if present
-        if hasattr(record, "correlation_id"):
-            message = f"{message} [corr={record.correlation_id}]"
+        correlation_id = getattr(record, "correlation_id", None)
+        if correlation_id is not None:
+            line += f" [corr={_escape_text(_safe_str(correlation_id))}]"
+        trace_id = getattr(record, "trace_id", None)
+        if trace_id is not None:
+            line += f" [trace={_escape_text(_safe_str(trace_id))[:16]}]"
 
-        # Add trace_id if present
-        if hasattr(record, "trace_id"):
-            message = f"{message} [trace={record.trace_id[:16]}]"
+        pairs = []
+        for key, value in record.__dict__.items():
+            if key in JSONFormatter._STANDARD_RECORD_ATTRS or key in self._NOT_AS_PAIRS:
+                continue
+            pairs.append(f"{_escape_text(str(key))}={_format_value(value)}")
+        if pairs:
+            line += " " + " ".join(pairs)
 
-        # Replace level name with colored version
-        message = message.replace(levelname, colored_levelname, 1)
+        extra_lines = []
+        if record.exc_text:
+            # Already rendered (the masked traceback of a handler failure,
+            # see SecretMaskFilter).
+            extra_lines.append(record.exc_text)
+        elif record.exc_info:
+            extra_lines.append(self.formatException(record.exc_info))
+        if record.stack_info:
+            extra_lines.append(self.formatStack(record.stack_info))
+        for block in extra_lines:
+            escaped = _CONTROL_CHARS_BUT_NEWLINE.sub(_escape_control, block)
+            line += "".join(f"\n  | {ln}" for ln in escaped.splitlines())
+        return line
 
-        return message
+
+# Secrets that exception texts commonly quote: the user info of a URL
+# ("amqp://user:password@host"), and the credential parts of a storage
+# connection string or SAS URL ("AccountKey=...", "SharedAccessSignature=...",
+# "sig=..."). Masked by redact_secrets().
+# A user info already masked ("***@", "***:***@") is left as it is.
+# Any URL quoted in a text (up to a space, a quote or an angle bracket);
+# its user info is found like a broker URL's (see _userinfo_end_any).
+_ANY_URL = re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://)([^\s'\"<>]+)")
+# A value already masked ("password=***" in a broker URL's query, possibly
+# followed by its masked fragment "#***" and by the punctuation that ends
+# the sentence, as in "...?password=***)." ) is left as it is: it is not
+# taken for the start of a value running to the next ";", which would drop
+# that punctuation.
+_ALREADY_MASKED_VALUE = r"(?!\*\*\*(?:#\*\*\*)?[.,:!?)\]}]*(?:[&;\s'\"<>]|$))"
+_SECRET_KEYS = (
+    r"AccountKey|SharedAccessSignature|SharedAccessKey|Password|Pwd|account_key"
+    r"|client_secret|api_key"
+)
+# KEY=value, with optional spaces around "=" or a ":" in its place
+# ("AccountKey = x", "AccountKey:x").
+_CONNECTION_STRING_SECRET = re.compile(
+    r"(?i)\b(" + _SECRET_KEYS + r")(\s*[=:]\s*)" + _ALREADY_MASKED_VALUE + r"[^;\s'\"]+"
+)
+# The same keys with a quoted value, in any of the forms a configuration
+# dump or a repr shows them: AccountKey="...", 'account_key': '...',
+# "AccountKey": "...".
+_QUOTED_SECRET = re.compile(
+    r"(?i)\b(" + _SECRET_KEYS + r")([\"']?\s*[=:]\s*)([\"'])(?!\*\*\*\3)[^\"'\n]*\3"
+)
+# A bearer token: any token after an "Authorization:" header's "Bearer"
+# ("Authorization: Bearer eyJ..."), and elsewhere a "Bearer" followed by
+# something shaped like a token (at least 16 token characters, or a JWT's
+# dotted form), so prose ("the bearer of bad news") is left alone.
+_BEARER_TOKEN_CHARS = r"[A-Za-z0-9\-._~+/]+=*"
+_BEARER_HEADER_TOKEN = re.compile(
+    r"(?i)\b(Authorization[\"']?\s*[:=]\s*[\"']?Bearer\s+)(?!\*\*\*)" + _BEARER_TOKEN_CHARS
+)
+_BEARER_TOKEN = re.compile(
+    r"(?i)\b(Bearer\s+)(?!\*\*\*)"
+    r"(?=[A-Za-z0-9\-._~+/]{16}|[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.)" + _BEARER_TOKEN_CHARS
+)
+# Query parameters that carry a credential in a URL of any scheme: a SAS
+# signature, an OAuth code or token.
+_SAS_SIGNATURE = re.compile(
+    r"(?i)((?:[?&]|&amp;|%26|%3F)(?:sig|code|access_token|token)(?:=|%3D))"
+    + _ALREADY_MASKED_VALUE
+    + r"(?:(?!%26|&amp;)[^&\s'\"])+"
+)
+# A broker URL written with one slash after the scheme ("amqps:/u:p@h"):
+# its user info.
+_BROKER_URL_ONE_SLASH = re.compile(r"(?i)\b(amqps?:/)(?!/)([^\s/'\"<>@]+)@")
+# Secret values the SDK itself was configured with (the broker password,
+# the storage account key, a SAS signature), masked wherever they appear,
+# whatever form the text quotes them in (see register_secret).
+_REGISTERED_SECRETS: "set[str]" = set()
+# Shorter values are not registered: masking every occurrence of a
+# two-letter password would garble unrelated text.
+_REGISTERED_SECRET_MIN_LENGTH = 6
+# A broker URL quoted in a text (up to a space, a quote or an angle bracket).
+_BROKER_URL = re.compile(r"(?i)\bamqps?://[^\s'\"<>]+")
+# Punctuation that ends a sentence rather than the URL it follows.
+_URL_TRAILING_PUNCTUATION = ".,;:!?)]}"
+# A query parameter name shown as it is; any other name is masked too.
+_PLAIN_QUERY_KEY = re.compile(r"[A-Za-z0-9_.\-]{1,64}")
+_QUERY_ITEM = re.compile(r"[^&;]+")
+
+
+def _mask_query(query: str) -> str:
+    """The query string ``query`` (without its ``?``) with every value
+    masked (``name=***``), separators kept; an item without ``=`` or whose
+    name is not a plain token is masked whole (``***``)."""
+
+    def item(match: "re.Match[str]") -> str:
+        key, eq, _value = match.group(0).partition("=")
+        if eq and _PLAIN_QUERY_KEY.fullmatch(key):
+            return f"{key}=***"
+        return "***"
+
+    return _QUERY_ITEM.sub(item, query)
+
+
+def _masked_userinfo(userinfo: str) -> str:
+    """``***:***``, or the user info as it is when it is already masked
+    (``***`` or ``***:***``)."""
+    return userinfo if userinfo in ("***", "***:***") else "***:***"
+
+
+def _query_or_fragment_start(text: str) -> int:
+    """The index of the first ``?`` or ``#`` of ``text`` (its length when
+    there is none)."""
+    cut = len(text)
+    for char in "?#":
+        index = text.find(char)
+        if index != -1:
+            cut = min(cut, index)
+    return cut
+
+
+def _userinfo_end(rest: str) -> int:
+    """The index of the ``@`` that ends the user info of ``rest`` (a URL
+    after its ``scheme://``), or -1. Found before the query and the
+    fragment are split off, because a password may hold an unencoded
+    ``?``, ``#`` or ``/``; it fails closed (masks more rather than less):
+
+    - the last ``@`` before the first ``/`` (a password with ``?`` or
+      ``#``: ``amqp://user:pa?ss@host/``);
+    - else the last ``@`` before the first ``?`` or ``#`` (a password with
+      ``/``: ``amqp://user:pa/ss@host/``);
+    - else the last ``@`` of all (a password with ``/`` and then ``?`` or
+      ``#``); so a ``@`` in the query or the fragment of a URL with no
+      user info masks its host and path as well."""
+    slash = rest.find("/")
+    at = rest.rfind("@", 0, len(rest) if slash == -1 else slash)
+    if at == -1:
+        at = rest.rfind("@", 0, _query_or_fragment_start(rest))
+    if at == -1:
+        at = rest.rfind("@")
+    return at
+
+
+# A host and port ("127.0.0.1:10000", "acct.blob.core.windows.net:443",
+# "[::1]:10000"): the authority of a URL without user info.
+_HOST_AND_PORT = re.compile(r"(?:\[[0-9A-Fa-f:.]*\]|[A-Za-z0-9.\-]+):\d*")
+
+
+def _userinfo_end_any(rest: str) -> int:
+    """The index of the ``@`` that ends the user info of ``rest`` (a URL
+    of any scheme after its ``scheme://``), or -1: the last ``@`` before
+    the first ``/``; else, when the text before the first ``/`` holds a
+    ``:`` (a password with an unencoded ``/``: ``https://svc:pa/ss@host/``),
+    the last ``@`` before the query and the fragment. A ``@`` in the path
+    of a URL without user info (``https://host/a@b``) is left alone, as is
+    one in the path of a URL with a port (``http://host:10000/c/a@b``):
+    when the text before the first ``/`` is a host and a port, the ``@`` is
+    taken for the end of a user info only when no other ``/`` comes
+    between (``https://svc:12/34@host/``)."""
+    slash = rest.find("/")
+    at = rest.rfind("@", 0, len(rest) if slash == -1 else slash)
+    if at == -1 and slash != -1 and ":" in rest[:slash]:
+        at = rest.rfind("@", 0, _query_or_fragment_start(rest))
+        if at != -1 and _HOST_AND_PORT.fullmatch(rest[:slash]) and "/" in rest[slash + 1 : at]:
+            at = -1
+    return at
+
+
+def _mask_any_url_userinfo(match: "re.Match[str]") -> str:
+    scheme, rest = match.group(1), match.group(2)
+    at = _userinfo_end_any(rest)
+    if at <= 0:
+        return match.group(0)
+    return f"{scheme}{_masked_userinfo(rest[:at])}@{rest[at + 1:]}"
+
+
+def mask_url_secrets(url: str) -> str:
+    """``url`` with what may carry a secret masked, read as text (it works
+    on a URL no parser accepts):
+
+    - the user info: everything before the last ``@`` of the part after
+      ``scheme://`` up to the first ``/`` becomes ``***:***`` (a ``?`` or
+      ``#`` in the password does not end it); with no ``@`` there,
+      everything before the last ``@`` ahead of the query and the fragment
+      (a password with an unencoded ``/``); with none there either,
+      everything before the last ``@`` of the URL (a password with ``/``
+      and ``?`` or ``#``: it fails closed, so a ``@`` in the query of a URL
+      without user info masks its host too);
+    - every value of the query string (``?name=***&other=***``; an item
+      without ``=`` or with an unusual name becomes ``***``);
+    - the fragment (``#***``).
+
+    The scheme, the host, the port and the path are kept. A broker URL has
+    no secret in its query by design, but the client library reads some
+    settings from it and an operator may put anything there."""
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        scheme, rest = "", url
+    userinfo = ""
+    at = _userinfo_end(rest)
+    if at != -1:
+        userinfo = _masked_userinfo(rest[:at]) + "@"
+        rest = rest[at + 1 :]
+    cut = _query_or_fragment_start(rest)
+    head, tail = rest[:cut], rest[cut:]
+    if tail.startswith("?"):
+        query, hash_, fragment = tail[1:].partition("#")
+        tail = "?" + _mask_query(query) + (hash_ + "***" if hash_ else "")
+    elif tail.startswith("#"):
+        tail = "#***"
+    return f"{scheme}{sep}{userinfo}{head}{tail}"
+
+
+def _mask_broker_url(match: "re.Match[str]") -> str:
+    url = match.group(0)
+    trailing = ""
+    while url and url[-1] in _URL_TRAILING_PUNCTUATION:
+        url, trailing = url[:-1], url[-1] + trailing
+    return mask_url_secrets(url) + trailing
+
+
+def redact_secrets(text: str) -> str:
+    """``text`` with the secrets it may quote masked: the user name and
+    password of a URL (``amqp://***:***@host``), the query values and the
+    fragment of a broker URL (``amqp://host/?password=***``, see
+    :func:`mask_url_secrets`), the user info of a URL of any other scheme
+    (up to the last ``@`` before the host, so a password holding ``@`` or
+    ``/`` is masked whole), the values of ``AccountKey=``,
+    ``SharedAccessSignature=``, ``SharedAccessKey=``, ``Password=`` /
+    ``Pwd=`` and ``account_key=`` (quoted or not), of a ``Bearer`` token
+    and of the ``sig=``, ``code=``, ``access_token=`` and ``token=`` query
+    parameters (``***``). Used on texts the
+    SDK logs or serves that come from code it does not control, such as the
+    exception a health check raised."""
+    if not isinstance(text, str):
+        return text
+    if "://" in text:
+        text = _BROKER_URL.sub(_mask_broker_url, text)
+    if "://" in text:
+        text = _ANY_URL.sub(_mask_any_url_userinfo, text)
+    if ":/" in text:
+        text = _BROKER_URL_ONE_SLASH.sub(r"\1***:***@", text)
+    text = _QUOTED_SECRET.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}***{m.group(3)}", text
+    )
+    text = _CONNECTION_STRING_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}***", text)
+    text = _BEARER_HEADER_TOKEN.sub(r"\1***", text)
+    text = _BEARER_TOKEN.sub(r"\1***", text)
+    text = _SAS_SIGNATURE.sub(r"\1***", text)
+    for secret in tuple(_REGISTERED_SECRETS):
+        if secret in text:
+            text = text.replace(secret, "***")
+    return text
+
+
+def mask_configured_secrets(text: str) -> str:
+    """``text`` with only the secrets the SDK is configured with masked
+    (``***``; see :func:`register_secret`), and no pattern-based masking:
+    for texts a handler wrote for the caller (a ``user_message``, a status
+    ``stage`` / ``note``), which reach the caller as written otherwise."""
+    if not isinstance(text, str) or not _REGISTERED_SECRETS:
+        return text
+    # Longest first, so a secret that contains another is masked whole.
+    for secret in sorted(_REGISTERED_SECRETS, key=len, reverse=True):
+        if secret in text:
+            text = text.replace(secret, "***")
+    return text
+
+
+def register_secret(value: Any) -> None:
+    """Mask ``value`` (and its percent-encoded and percent-decoded forms)
+    wherever a record or a reply text quotes it, in addition to the
+    pattern-based masking (see :func:`redact_secrets`). The SDK registers
+    the secrets it is configured with (the broker password, the storage
+    account key or SAS signature) when its configuration is read; values
+    shorter than six characters are not registered."""
+    if not isinstance(value, str):
+        return
+    forms = {value}
+    try:
+        forms.add(_url_quote(value, safe=""))
+        forms.add(_url_unquote(value))
+    except Exception:  # pragma: no cover - quote/unquote do not fail on text
+        pass
+    for form in forms:
+        if len(form) >= _REGISTERED_SECRET_MIN_LENGTH and form != "***":
+            _REGISTERED_SECRETS.add(form)
+
+
+def register_connection_secrets(rabbitmq_url: Any, blob_conn_string: Any) -> None:
+    """Register (see :func:`register_secret`) the password of the broker
+    URL and the AccountKey / SharedAccessSignature / sig values of the
+    storage connection string."""
+    if isinstance(rabbitmq_url, str) and "://" in rabbitmq_url:
+        rest = rabbitmq_url.split("://", 1)[1]
+        at = _userinfo_end(rest)
+        if at > 0:
+            _user, colon, password = rest[:at].partition(":")
+            if colon:
+                register_secret(password)
+    if isinstance(blob_conn_string, str):
+        for part in blob_conn_string.split(";"):
+            key, eq, val = part.strip().partition("=")
+            if not eq:
+                continue
+            if key.strip().lower() in ("accountkey", "sharedaccesssignature", "sharedaccesskey"):
+                register_secret(val.strip())
+                if key.strip().lower() == "sharedaccesssignature":
+                    for item in val.split("&"):
+                        name, eq2, sig = item.partition("=")
+                        if eq2 and name.strip().lower() == "sig":
+                            register_secret(sig)
+
+
+# What a record carries in place of a text that could not be masked: the
+# masking fails closed, so the text itself is never written.
+_WITHHELD_TEXT = "<withheld: secret masking failed>"
+_WITHHELD_MESSAGE = "<record text withheld: secret masking failed>"
+_WITHHELD_TRACEBACK = "<traceback withheld: secret masking failed>"
+# What a field value nested deeper, or holding more items, than the masking
+# walks carries in place of the part it could not walk.
+_WITHHELD_NESTED = "<withheld: too deeply nested or too large to mask>"
+# Bounds of the walk through a field value's dicts, lists, tuples and sets.
+_MASK_MAX_DEPTH = 32
+_MASK_MAX_ITEMS = 10_000
+# Values written as they are (no text to mask).
+_UNMASKED_SCALARS = (int, float, bool, type(None), bytes)
+
+
+class _MaskBudget:
+    """How many more items a field's masking walk may visit."""
+
+    __slots__ = ("left",)
+
+    def __init__(self) -> None:
+        self.left = _MASK_MAX_ITEMS
+
+
+def _mask_value(value: Any, depth: int, budget: _MaskBudget) -> Any:
+    """``value`` with every text inside it masked (see redact_secrets): a
+    string itself, the keys and values of a dict and the items of a list,
+    tuple or set (nested ones too, as a copy: the caller's object is never
+    changed), and the text another object is written as (its repr, which
+    the formatters write in its place). A part deeper than
+    ``_MASK_MAX_DEPTH`` levels, or past ``_MASK_MAX_ITEMS`` items in all,
+    becomes a placeholder (also a structure that contains itself)."""
+    budget.left -= 1
+    if budget.left < 0 or depth > _MASK_MAX_DEPTH:
+        return _WITHHELD_NESTED
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, _UNMASKED_SCALARS):
+        return value
+    if isinstance(value, dict):
+        masked_dict = {}
+        changed = False
+        for key, item in list(value.items()):
+            new_key = _mask_value(key, depth + 1, budget) if isinstance(key, str) else key
+            new_item = _mask_value(item, depth + 1, budget)
+            changed = changed or new_key is not key or new_item is not item
+            masked_dict[new_key] = new_item
+        return masked_dict if changed else value
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+        new_items = [_mask_value(item, depth + 1, budget) for item in items]
+        if all(new is old for new, old in zip(new_items, items)):  # noqa: B905
+            return value
+        # A copy of the built-in type (a subclass, such as a namedtuple, is
+        # written as a list or set either way).
+        if isinstance(value, frozenset):
+            return frozenset(new_items)
+        if isinstance(value, set):
+            return set(new_items)
+        if isinstance(value, tuple):
+            return tuple(new_items)
+        return new_items
+    # Another object: the formatters write its repr; mask that.
+    text = _safe_repr(value)
+    masked = redact_secrets(text)
+    return value if masked == text else masked
+
+
+class SecretMaskFilter(logging.Filter):
+    """Masks the secrets (see :func:`redact_secrets`) in the text a record
+    may quote from code the SDK does not control: its message, every
+    field (``extra={...}``: ``error``, ``error_message``,
+    ``internal_message``, ``reason``, ``uri``, ...), including the texts
+    inside a dict, list, tuple or set value (nested ones too; the masked
+    value is a copy) and the text another object is written as, its
+    traceback and its stack. Numbers, booleans and None are kept as they
+    are.
+
+    Attached to the logger of every SDK module (:func:`masked_logger`; a
+    logger's filter only sees the records created at that logger, not those
+    of its children) and to the handlers the SDK installs
+    (:func:`setup_logging`, :func:`install_root_handler`): an exception text
+    that quotes a connection URL or a storage key is logged masked, by
+    default, in every log format.
+
+    It fails closed: a field that cannot be masked is replaced by
+    ``<withheld: secret masking failed>``, and when the message or the
+    traceback cannot be masked, the record keeps its level, logger and
+    fields, with ``<record text withheld: secret masking failed>`` as its
+    message (and ``<traceback withheld: ...>`` as its traceback). The record
+    itself is never dropped."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            self._mask(record)
+        except Exception:
+            self._withhold(record)
+        return True
+
+    @staticmethod
+    def _text_fields(record: logging.LogRecord) -> "list[tuple[str, Any]]":
+        """The record's own fields (``extra={...}``) that may hold text:
+        everything except numbers, booleans and None."""
+        return [
+            (name, value)
+            for name, value in list(record.__dict__.items())
+            if name not in JSONFormatter._STANDARD_RECORD_ATTRS
+            and not isinstance(value, _UNMASKED_SCALARS)
+        ]
+
+    def _mask(self, record: logging.LogRecord) -> None:
+        for name, value in self._text_fields(record):
+            try:
+                masked = _mask_value(value, 0, _MaskBudget())
+            except Exception:
+                masked = _WITHHELD_TEXT
+            if masked is not value:
+                record.__dict__[name] = masked
+        try:
+            message = record.getMessage()
+        except Exception:
+            # The formatters then write the template: mask that.
+            message = _safe_str(record.msg)
+        masked = redact_secrets(message)
+        if masked != message:
+            record.msg = masked
+            record.args = None
+        if record.exc_info and record.exc_info[1] is not None:
+            text = record.exc_text or logging.Formatter().formatException(record.exc_info)
+            masked = redact_secrets(text)
+            if masked != text:
+                # Rendered once, masked; the formatters use it as it is.
+                record.exc_text = masked
+        if isinstance(record.stack_info, str):
+            masked = redact_secrets(record.stack_info)
+            if masked != record.stack_info:
+                record.stack_info = masked
+
+    @classmethod
+    def _withhold(cls, record: logging.LogRecord) -> None:
+        """Fail closed: replace every text of ``record`` that may quote a
+        secret by a placeholder."""
+        record.msg = _WITHHELD_MESSAGE
+        record.args = None
+        if record.exc_info:
+            record.exc_text = _WITHHELD_TRACEBACK
+        record.stack_info = None
+        try:
+            for name, _value in cls._text_fields(record):
+                record.__dict__[name] = _WITHHELD_TEXT
+        except Exception:  # pragma: no cover - a record whose __dict__ fails
+            pass
+
+
+def masked_logger(name: str) -> logging.Logger:
+    """``logging.getLogger(name)`` with a :class:`SecretMaskFilter` attached
+    (once). Every SDK module takes its logger from here, so the secrets in
+    its records are masked whichever handler writes them (the SDK's own or
+    one the application configured)."""
+    logger = logging.getLogger(name)
+    if not any(isinstance(f, SecretMaskFilter) for f in logger.filters):
+        logger.addFilter(SecretMaskFilter())
+    return logger
+
+
+def _command_fields(envelope: Any) -> "dict[str, Any]":
+    """The fields that identify a command in every per-command record:
+    ``correlation_id``, ``message_id`` (the key of the dead-letter queue
+    message and of a log search across services), ``command_name``,
+    ``trace_id`` (shown as ``[trace=...]`` in the text format),
+    ``idempotency_key`` and, when the command carries one, ``job_id``. The
+    envelope of a reply or a status update carries the same values as its
+    command's."""
+    fields = {
+        "correlation_id": getattr(envelope, "correlation_id", None),
+        "message_id": getattr(envelope, "message_id", None),
+        "command_name": getattr(envelope, "name", None),
+        "trace_id": getattr(envelope, "trace_id", None),
+        "idempotency_key": getattr(envelope, "idempotency_key", None),
+    }
+    job_id = getattr(envelope, "job_id", None)
+    if job_id is not None:
+        fields["job_id"] = job_id
+    return fields
 
 
 def setup_logging(
@@ -156,13 +873,16 @@ def setup_logging(
     handler.setLevel(getattr(logging, log_level.upper()))
 
     # Set formatter based on format
+    formatter: logging.Formatter
     if log_format == "json":
-        formatter = JSONFormatter(datefmt="%Y-%m-%dT%H:%M:%S")
+        formatter = JSONFormatter()
     else:
-        formatter = TextFormatter(
-            fmt="%(asctime)s %(levelname)s %(name)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
+        formatter = TextFormatter()
+
+    # Secrets are masked on the way out as well (handler-level, so it
+    # covers the records of every child logger, including one that has no
+    # filter of its own); the SDK modules' loggers mask them already.
+    handler.addFilter(SecretMaskFilter())
 
     # Attach the service-name filter to the HANDLER (not the logger).
     # Logger-level filters only fire on records originated at that exact
@@ -181,6 +901,122 @@ def setup_logging(
     logger.propagate = False
 
 
+# Marks the last-resort handler install_root_handler sets.
+_LAST_RESORT_MARK = "_kbm_ledsas_last_resort"
+
+
+class _StderrHandler(logging.Handler):
+    """Writes each record as one line to the ``sys.stderr`` of the moment
+    (looked up for each record, as Python's own last-resort handler does),
+    so a later redirection of stderr is followed."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            stream = sys.stderr
+            stream.write(self.format(record) + "\n")
+            stream.flush()
+        except RecursionError:  # pragma: no cover - as logging.StreamHandler
+            raise
+        except Exception:
+            self.handleError(record)
+
+
+class _WarningsFallback(logging.Handler):
+    """On the ``py.warnings`` logger: hands the record of a Python warning
+    to the last-resort handler when no handler of the application takes it.
+
+    ``logging.captureWarnings(True)`` gives ``py.warnings`` a ``NullHandler``
+    when it has none, so Python never hands a warning to its last resort.
+    This handler stands in for that ``NullHandler``; a handler the
+    application adds (to ``py.warnings``, a parent or the root logger, at
+    any time) takes the record instead, so it is never written twice."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        logger: logging.Logger | None = logging.getLogger(record.name)
+        while logger is not None:
+            for handler in logger.handlers:
+                if handler is self or isinstance(handler, (logging.NullHandler, _WarningsFallback)):
+                    continue
+                return  # the application's own handler takes the record
+            if not logger.propagate:
+                break
+            logger = logger.parent
+        last = logging.lastResort
+        if last is not None and record.levelno >= last.level:
+            last.handle(record)
+
+
+def _is_python_last_resort(handler: object) -> bool:
+    """True when ``handler`` is Python's own last-resort handler (the one
+    that writes the bare message), or one ``install_root_handler`` set."""
+    if getattr(handler, _LAST_RESORT_MARK, False):
+        return True
+    default = getattr(logging, "_defaultLastResort", None)
+    if default is not None and handler is default:
+        return True
+    stdlib_class = getattr(logging, "_StderrHandler", None)
+    return isinstance(stdlib_class, type) and type(handler) is stdlib_class
+
+
+def install_root_handler(
+    log_format: str = "json",
+    service_name: str | None = None,
+) -> bool:
+    """Write the records no handler takes, and Python warnings, in the SDK's
+    log format, when the application has not configured logging itself.
+
+    When the root logger has no handler (the application did not call
+    ``logging.basicConfig`` or add a handler to the root logger), Python's
+    last-resort handler (``logging.lastResort``, which writes only the
+    message of a WARNING or higher record that no handler takes) is
+    replaced with one that writes in the SDK's format (``log_format``: json
+    or text) to stderr, and Python warnings are routed through logging
+    (``logging.captureWarnings(True)``; ``py.warnings`` gets a handler
+    that passes a warning on to that last resort when no handler of the
+    application takes it, see ``_WarningsFallback``). The records of the
+    asyncio event loop ("Task exception was never retrieved", with its
+    traceback in the record), of the client libraries, of the application's
+    loggers that have no handler and of warnings then go out in that format,
+    one per line, instead of as plain multi-line text.
+
+    Which records come out is unchanged: those at WARNING or higher that
+    their logger's level lets through and that no handler takes. A logger
+    the application gave a handler of its own is written by that handler
+    only, so no record is written twice; INFO records still need a logging
+    configuration of the application's own. A ``logging.basicConfig(...)``
+    called later still configures the root logger, and from then on the
+    last resort is not used. Nothing is changed when the root logger
+    already has a handler, or when the application replaced
+    ``logging.lastResort`` itself.
+
+    Returns:
+        True when the SDK's handler is now the last resort.
+    """
+    if logging.getLogger().handlers:
+        return False
+    if not _is_python_last_resort(logging.lastResort):
+        return False
+    handler = _StderrHandler(logging.WARNING)
+    handler.setFormatter(JSONFormatter() if log_format == "json" else TextFormatter())
+    # The records it writes come from other code (the event loop, the
+    # client libraries): the secrets they quote are masked.
+    handler.addFilter(SecretMaskFilter())
+    if service_name:
+        handler.addFilter(ServiceNameFilter(service_name))
+    setattr(handler, _LAST_RESORT_MARK, True)
+    logging.lastResort = handler
+    warnings_logger = logging.getLogger("py.warnings")
+    if not any(isinstance(h, _WarningsFallback) for h in warnings_logger.handlers):
+        # Before captureWarnings, which adds a NullHandler only when the
+        # logger has no handler.
+        warnings_logger.addHandler(_WarningsFallback())
+    logging.captureWarnings(True)
+    return True
+
+
 class ServiceNameFilter(logging.Filter):
     """
     Logging filter that adds service_name to all log records.
@@ -197,7 +1033,7 @@ class ServiceNameFilter(logging.Filter):
         return True
 
 
-def json_log_formatter(datefmt: str = "%Y-%m-%dT%H:%M:%S") -> logging.Formatter:
+def json_log_formatter(datefmt: str | None = None) -> logging.Formatter:
     """Return the SDK's JSON log formatter for use on YOUR OWN handlers.
 
     The canonical handler-logging guidance — put structured fields in
@@ -215,12 +1051,28 @@ def json_log_formatter(datefmt: str = "%Y-%m-%dT%H:%M:%S") -> logging.Formatter:
         logging.basicConfig(level=logging.INFO, handlers=[handler])
 
     Args:
-        datefmt: strftime format for the ``timestamp`` field.
+        datefmt: Optional strftime format for the ``timestamp`` field.
+            It overrides the default UTC ISO 8601 format with
+            milliseconds and a ``Z`` suffix (``2026-10-14T05:43:15.123Z``):
+            the timestamp is then formatted by ``logging.Formatter``
+            (local time, no milliseconds unless the format asks for
+            them). Leave it unset to keep UTC timestamps.
 
     Returns:
         A ``logging.Formatter`` that emits one JSON object per record,
         including every caller-supplied ``extra={...}`` key.
+
+    Raises:
+        TypeError: ``datefmt`` is not a ``str`` (or None). Every record
+            would otherwise fail to format and be dropped.
     """
+    if datefmt is not None and not isinstance(datefmt, str):
+        from ..models.errors import ArgumentTypeError
+
+        raise ArgumentTypeError(
+            "json_log_formatter(datefmt=...): datefmt is a strftime format "
+            f"string (or None), got {type(datefmt).__name__}"
+        )
     return JSONFormatter(datefmt=datefmt)
 
 
@@ -241,7 +1093,7 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f"kbm_ledsas_sdk.{name}")
 
 
-class ContextAdapter(logging.LoggerAdapter):
+class ContextAdapter(logging.LoggerAdapter[logging.Logger]):
     """
     Logger adapter that adds context fields to all log records.
 
@@ -254,10 +1106,12 @@ class ContextAdapter(logging.LoggerAdapter):
         # Logs will include correlation_id field
     """
 
-    def process(self, msg: str, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    def process(
+        self, msg: Any, kwargs: MutableMapping[str, Any]
+    ) -> "tuple[Any, MutableMapping[str, Any]]":
         """Add context to log record."""
         # Add context fields to 'extra'
         extra = kwargs.get("extra", {})
-        extra.update(self.extra)
+        extra.update(self.extra or {})
         kwargs["extra"] = extra
         return msg, kwargs

@@ -13,16 +13,22 @@ actual aio-pika/aiormq semantics, guarding against aio-pika/aiormq version drift
 - reply_to exchange missing                        -> returns False,
   ``reply_unroutable_failures`` NOT bumped (path unchanged).
 
-All tests are marked ``@pytest.mark.integration`` and skip cleanly if
-the Docker stack (RabbitMQ + Azurite) isn't available.
+All tests are marked ``@pytest.mark.integration`` and skip cleanly when
+no RabbitMQ answers at the broker they use: ``LEDSAS_TEST_RABBITMQ_URL``
+when set, else ``amqp://guest:guest@127.0.0.1:5672/``. They declare and
+delete exchanges and queues there, so point them only at a local test
+broker (the tests never touch blob storage; the connection string only
+satisfies the transport's constructor).
 """
 
 from __future__ import annotations
 
+import os
 import socket
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 import aio_pika
 import pytest
@@ -32,15 +38,25 @@ from kbm_ledsas_sdk.models.envelope import Envelope
 from kbm_ledsas_sdk.models.messages import Response
 from kbm_ledsas_sdk.transport.direct import DirectTransport
 
-RABBITMQ_HOST = "127.0.0.1"
-RABBITMQ_PORT = 5672
-RABBITMQ_URL = f"amqp://guest:guest@{RABBITMQ_HOST}:{RABBITMQ_PORT}/"
+DEFAULT_RABBITMQ_URL = "amqp://guest:guest@127.0.0.1:5672/"
 AZURITE_CONN_STRING = (
     "DefaultEndpointsProtocol=http;"
     "AccountName=devstoreaccount1;"
     "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;"
     "BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
 )
+
+
+def live_rabbitmq_url(environ: dict[str, str] | None = None) -> str:
+    """The broker of the live tests: LEDSAS_TEST_RABBITMQ_URL when set, else
+    the local default (RabbitMQ on 127.0.0.1:5672)."""
+    environ = os.environ if environ is None else environ
+    return environ.get("LEDSAS_TEST_RABBITMQ_URL") or DEFAULT_RABBITMQ_URL
+
+
+RABBITMQ_URL = live_rabbitmq_url()
+RABBITMQ_HOST = urlsplit(RABBITMQ_URL).hostname or "127.0.0.1"
+RABBITMQ_PORT = urlsplit(RABBITMQ_URL).port or (5671 if RABBITMQ_URL.startswith("amqps") else 5672)
 
 
 def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -51,15 +67,16 @@ def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
         return False
 
 
-_STACK_UP = _port_open(RABBITMQ_HOST, RABBITMQ_PORT) and _port_open("127.0.0.1", 10000)
+_STACK_UP = _port_open(RABBITMQ_HOST, RABBITMQ_PORT)
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
         not _STACK_UP,
         reason=(
-            "RabbitMQ/Azurite not reachable on loopback — start the stack: "
-            "docker compose -f examples/hello_world_service/deploy/local/docker-compose.yml up -d"
+            f"RabbitMQ not reachable on {RABBITMQ_HOST}:{RABBITMQ_PORT} — start the local stack: "
+            "docker compose -f examples/hello_world_service/deploy/local/docker-compose.yml "
+            "up -d --wait (or point LEDSAS_TEST_RABBITMQ_URL at another local test broker)"
         ),
     ),
 ]

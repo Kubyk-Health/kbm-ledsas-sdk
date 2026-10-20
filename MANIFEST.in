@@ -1,0 +1,6 @@
+# The sdist carries the package source, the license files and the README. The
+# tests run from a clone of the repository (see CONTRIBUTING.md): they read files
+# outside the package (examples/, the workflows) that an sdist does not carry.
+prune tests
+prune examples
+global-exclude __pycache__ *.py[cod]

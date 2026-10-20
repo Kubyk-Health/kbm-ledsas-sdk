@@ -21,11 +21,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kbm_ledsas_sdk.amqp.consumer import AMQPConsumer
-from kbm_ledsas_sdk.runtime.config import SDKConfig, _strip_surrounding_quotes
+from kbm_ledsas_sdk.runtime.config import SDKConfig
+from kbm_ledsas_sdk.runtime.security import _strip_surrounding_quotes
 
 
 # ---------------------------------------------------------------------------
-# credential redaction on str()/f-string, not just repr()
+# Credential redaction on str()/f-string, not just repr()
 # ---------------------------------------------------------------------------
 class TestConfigStrDoesNotLeakCredentials:
     _SECRET_URL = "amqp://user:topsecret@127.0.0.1:5672/"
@@ -58,7 +59,7 @@ class TestConfigStrDoesNotLeakCredentials:
         assert str(cfg) == repr(cfg)
 
     def test_logging_percent_s_does_not_leak(self):
-        # The footgun in the finding: logger.info("cfg: %s", config)
+        # The footgun: logger.info("cfg: %s", config)
         cfg = self._cfg()
         rendered = "loaded config: %s" % cfg
         assert "topsecret" not in rendered
@@ -66,7 +67,7 @@ class TestConfigStrDoesNotLeakCredentials:
 
 
 # ---------------------------------------------------------------------------
-# surrounding-quote stripping for env-delivered connection settings
+# Surrounding-quote stripping for env-delivered connection settings
 # ---------------------------------------------------------------------------
 class TestStripSurroundingQuotes:
     def test_strips_matched_double_quotes(self):
@@ -106,7 +107,7 @@ class TestFromEnvStripsQuotes:
 
 
 # ---------------------------------------------------------------------------
-# non-UTF-8 body dead-letters cleanly with no traceback
+# Non-UTF-8 body dead-letters cleanly with no traceback
 # ---------------------------------------------------------------------------
 def _make_message(body: bytes):
     msg = MagicMock()

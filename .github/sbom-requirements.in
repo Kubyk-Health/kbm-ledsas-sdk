@@ -1,0 +1,3 @@
+# The SBOM generator of the release workflow.
+pip
+cyclonedx-bom==7.5.0

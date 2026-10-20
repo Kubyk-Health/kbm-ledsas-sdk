@@ -156,7 +156,8 @@ class TestHandleCommand:
 
     @pytest.mark.asyncio
     async def test_handle_command_retryable_error(self, app, sample_command):
-        """Handle command with retryable error - NACKs with requeue."""
+        """Retryable error with retry budget left: NACK with requeue and NO
+        reply (v0.3.6: a command gets one reply, when it finishes)."""
 
         # Register handler that raises Retryable
         @app.handler("ProcessDataset", "1.0")
@@ -173,11 +174,8 @@ class TestHandleCommand:
         # Handle command
         await app._handle_command(sample_command, semaphore)
 
-        # Error response should be sent
-        assert len(mock_transport.sent_responses) == 1
-        response = mock_transport.sent_responses[0]
-        assert "error" in response.payload
-        assert response.payload["error"]["retryable"] is True
+        # No reply for an attempt that will be retried
+        assert mock_transport.sent_responses == []
 
         # Message should be NACKed with requeue
         assert len(mock_transport.nacked_messages) == 1
@@ -380,13 +378,69 @@ class TestExecutionLoop:
 class TestConcurrencyControl:
     """Test concurrency limiting via semaphore."""
 
-    @pytest.mark.skip(
-        reason="Deterministic concurrency-limit timing assertion not yet implemented for MockTransport"
-    )
     @pytest.mark.asyncio
     async def test_concurrency_limit_respected(self, app):
-        """Concurrency limit is respected."""
-        # Skipped - complex timing with MockTransport
+        """With KBM_LEDSAS_CONCURRENCY=2, at most two handlers run at once:
+        four commands, handlers held until released, peak in flight 2."""
+        in_flight = 0
+        peak = 0
+        started = 0
+        release = asyncio.Event()
+        two_started = asyncio.Event()
+
+        @app.handler("ProcessDataset", "1.0")
+        async def _handler(ctx, payload):
+            nonlocal in_flight, peak, started
+            in_flight += 1
+            started += 1
+            peak = max(peak, in_flight)
+            if started >= 2:
+                two_started.set()
+            try:
+                await release.wait()
+            finally:
+                in_flight -= 1
+            return {"ok": True}
+
+        transport = MockTransport()
+        for i in range(4):
+            transport.add_command(
+                Command(
+                    envelope=Envelope(
+                        schema_version="1.0",
+                        type="command",
+                        name="ProcessDataset",
+                        message_version="1.0",
+                        message_id=f"550e8400-e29b-41d4-a716-44665544010{i}",
+                        correlation_id=f"660e8400-e29b-41d4-a716-44665544010{i}",
+                        idempotency_key=f"idem-concurrency-{i}",
+                        sent_at=datetime.now(UTC),
+                        trace_id="trace-concurrency",
+                        reply_to="resp.dev.orchestrator.v1",
+                    ),
+                    payload={},
+                )
+            )
+        await transport.start()
+        app.transport = transport
+        app.config = Mock(concurrency=2, handler_timeout=1800, max_retries=3, generic_errors=False)
+
+        loop_task = asyncio.create_task(app._execution_loop())
+        await asyncio.wait_for(two_started.wait(), timeout=2.0)
+        # Give a third handler every chance to start if the limit leaked.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert in_flight == 2
+        release.set()
+        for _ in range(200):
+            if len(transport.acked_messages) == 4:
+                break
+            await asyncio.sleep(0.01)
+        app._shutdown_event.set()
+        await asyncio.wait_for(loop_task, timeout=2.0)
+        assert peak == 2
+        assert started == 4
+        assert len(transport.acked_messages) == 4
 
 
 class TestShutdown:
@@ -563,13 +617,11 @@ class TestReplyToEdgeCases:
         assert len(mock_transport.acked_messages) == 1
 
     @pytest.mark.asyncio
-    async def test_handle_command_send_response_failure_still_acks(self, app_with_handler):
-        """If send_response() raises exception, message should still be ACKed.
-
-        This tests the graceful error handling: even if publishing the response
-        fails (e.g., exchange doesn't exist), we should NOT requeue the message.
-        Requeueing would cause the infinite loop bug.
-        """
+    async def test_handle_command_send_response_failure_dead_letters(self, app_with_handler):
+        """If send_response() raises, the command is dead-lettered (NACK
+        without requeue), never requeued: publishing the reply fails the
+        same way on every attempt (e.g. the reply exchange does not exist),
+        so a requeue would loop."""
         envelope = Envelope(
             schema_version="1.0",
             type="command",
@@ -599,13 +651,8 @@ class TestReplyToEdgeCases:
         # Process the command - should NOT raise despite send_response failure
         semaphore = asyncio.Semaphore(10)
 
-        # The current implementation will NACK with requeue due to exception
-        # After our fix in DirectTransport, this should ACK instead
-        # But at app.py level, the exception is caught and NACKed
-        # So this test documents current behavior - the fix is in DirectTransport
+        # Must not raise despite the send_response failure.
         await app_with_handler._handle_command(command, semaphore)
 
-        # Note: With MockTransport, the exception propagates to _handle_command's
-        # except block which NACKs. The real fix is in DirectTransport which
-        # catches the exception and doesn't re-raise.
-        # This test verifies the exception doesn't crash the app.
+        assert mock_transport.acked_messages == []
+        assert mock_transport.nacked_messages == [(envelope.message_id, False)]

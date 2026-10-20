@@ -36,11 +36,13 @@ class TestEnsureBlobRef:
         assert result.version_id == "abc123"
 
     def test_blobref_passed_through(self):
-        """BlobRef should be passed through unchanged."""
+        """A valid BlobRef is accepted unchanged. (It is checked again, so
+        the result is an equal BlobRef rather
+        than the same object.)"""
         blob_ref = BlobRef.from_uri("azblob://container/file.txt")
         result = _ensure_blob_ref(blob_ref)
 
-        assert result is blob_ref
+        assert result == blob_ref and result.uri == blob_ref.uri
 
     def test_invalid_uri_raises_error(self):
         """Invalid URI should raise ValueError."""
@@ -193,30 +195,27 @@ class TestStreamingMemoryBound:
     These tests *do not* exercise SDK code or transport. They iterate a
     standalone async generator and use tracemalloc to verify the
     consume-while-streaming pattern stays bounded. They prove the pattern,
-    not the SDK's implementation of it. These unit tests assert the
-    consume-while-streaming pattern's bounded-memory property with a
-    synthetic generator; the SDK's own wire-level streaming is not
-    exercised here.
+    not the SDK's implementation of it; they do not measure the memory use
+    of the SDK's own ``download_stream`` / ``upload_stream``.
+
     """
 
     @pytest.mark.asyncio
     async def test_download_stream_memory_bounded_with_synthetic_generator(self):
         """
-        Verify the streaming pattern has bounded memory.
 
-        Property: peak memory stays < 50 MB even for multi-GB files.
         Method: Use tracemalloc to measure peak memory while consuming a
         standalone async generator that mimics the SDK's chunk-yield shape.
         Acceptance: Peak memory delta < 50MB (52,428,800 bytes)
 
-        Note: this exercises a synthetic generator, not live transport I/O;
-        it verifies the streaming pattern's memory shape only.
+        Note: a synthetic generator, not the SDK's own download path; the
+        SDK's memory use is not measured here.
         """
         import tracemalloc
 
         # Simulate streaming 100MB of data in 4MB chunks (25 chunks)
         # This simulates a large file download without actually needing the data
-        _chunk_size = 4 * 1024 * 1024  # 4MB chunks (Azure default)
+        chunk_size = 4 * 1024 * 1024  # 4MB chunks (Azure default)
         num_chunks = 25  # 100MB total simulated
         memory_limit = 50 * 1024 * 1024  # 50MB limit
 
@@ -258,15 +257,11 @@ class TestStreamingMemoryBound:
     @pytest.mark.asyncio
     async def test_upload_stream_memory_bounded_with_synthetic_generator(self):
         """
-        Verify the streaming-upload pattern has bounded memory.
 
-        Property: memory stays proportional to chunk size, not total size.
         Method: Use tracemalloc to measure memory while iterating a
         standalone async generator that mimics the SDK's upload chunk shape.
         Acceptance: Peak memory delta < 50MB
 
-        Note: this exercises a synthetic generator, not live transport I/O;
-        it verifies the streaming pattern's memory shape only.
         """
         import tracemalloc
 
@@ -275,7 +270,7 @@ class TestStreamingMemoryBound:
         # Simulate streaming upload pattern
         async def mock_upload_stream():
             """Simulate generating upload chunks."""
-            for _ in range(25):  # 25 chunks
+            for i in range(25):  # 25 chunks
                 # Generate chunk without accumulation
                 chunk = b"y" * 1024  # 1KB per chunk
                 yield chunk

@@ -1,17 +1,62 @@
 version: 2
 updates:
+  # Python dependencies in pyproject.toml (runtime and the dev toolchain), one
+  # grouped pull request per week.
   - package-ecosystem: pip
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     labels:
       - dependencies
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
 
+  # SHA-pinned GitHub Actions, one grouped pull request per week.
   - package-ecosystem: github-actions
     directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - ci
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # The hash-pinned release toolchain (.github/release-requirements.txt and
+  # .github/sbom-requirements.txt).
+  - package-ecosystem: pip
+    directory: "/.github"
     schedule:
       interval: weekly
     labels:
       - dependencies
       - ci
+    groups:
+      release-toolchain:
+        patterns:
+          - "*"
+
+  # The example service's own requirements.txt.
+  - package-ecosystem: pip
+    directory: "/examples/hello_world_service"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+
+  # The images of the example's local stack (RabbitMQ, Azurite).
+  - package-ecosystem: docker-compose
+    directory: "/examples/hello_world_service/deploy/local"
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+
+  # No docker entry for examples/hello_world_service/Dockerfile: its base image
+  # tag is the SDK version and moves with each release of this repository.

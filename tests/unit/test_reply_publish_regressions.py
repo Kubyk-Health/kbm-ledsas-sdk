@@ -1,4 +1,4 @@
-"""Regression tests for direct-mode reply-publish parity.
+"""Regression tests for reply-publish behaviour.
 
 Replies (and statuses) now publish with ``mandatory=True`` so an
 exists-but-unbound reply exchange no longer swallows the response: the
@@ -102,7 +102,7 @@ def _envelope(type_: str, reply_to: str = "test.reply.exchange.v1") -> Envelope:
         message_version="1.0",
         message_id="550e8400-e29b-41d4-a716-446655440046",
         correlation_id="660e8400-e29b-41d4-a716-446655440046",
-        idempotency_key="idem-reply-pub",
+        idempotency_key="idem-reply-publish",
         sent_at=datetime.now(UTC),
         trace_id="00-test-trace-id",
         reply_to=reply_to,
@@ -122,7 +122,7 @@ def _transport() -> DirectTransport:
     return DirectTransport(
         rabbitmq_url="amqp://guest:guest@127.0.0.1:5672/",
         blob_conn_string=AZURITE_CONN,
-        service_name="reply-pub-svc",
+        service_name="reply-publish-svc",
     )
 
 
@@ -350,7 +350,7 @@ class TestSendResponseUnroutable:
         assert result is False
         assert transport.reply_publish_failures == 1
         assert transport.reply_unroutable_failures == 0
-        assert "pre-declared this exchange" in caplog.text
+        assert "the caller declared this exchange" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +386,7 @@ class TestSendStatusUnroutable:
     async def test_non_delivery_error_swallowed_with_original_text(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Pre-existing branch: a non-DeliveryError status
+        """A non-DeliveryError status
         failure is still swallowed with a WARNING carrying str(e) and
         the single status counter."""
 

@@ -8,9 +8,92 @@ These error types control retry behavior and DLQ routing:
   is in the past, so a retry would just exceed it again; goes to DLQ)
 """
 
+__all__ = [
+    "SDKError",
+    "Retryable",
+    "Permanent",
+    "DeadlineExceeded",
+    "ContainerNotAllowed",
+    "ArgumentTypeError",
+]
+
+
+def _checked_text(owner: str, name: str, value: object) -> str:
+    """``value`` as given, or a TypeError marked non-retryable: an SDK
+    error's message (and a refused container name) is text. Checked when
+    the error is built, so a wrong type is reported where the handler made
+    the error, not later as a reply that cannot be written."""
+    if isinstance(value, str):
+        return value
+    err = TypeError(f"{owner}: {name} must be a str, got {type(value).__name__}")
+    from ..blob.operations import _mark_non_retryable
+
+    _mark_non_retryable(err, str(err))
+    raise err
+
+
+def _checked_user_message(user_message: object) -> "str | None":
+    """``user_message`` as given, or a TypeError: a caller-facing message
+    is text (``str``) or None (not set). An empty string is a message too:
+    the caller then sees an empty message, never the internal one."""
+    if user_message is None or isinstance(user_message, str):
+        return user_message
+    err = TypeError(f"user_message must be a str or None, got {type(user_message).__name__}")
+    # A bug in the handler, the same on every attempt: replied Permanent
+    # (with this text, or the generic message when generic errors are on;
+    # never the internal message) and not retried.
+    from ..blob.operations import _mark_non_retryable
+
+    _mark_non_retryable(err, str(err))
+    raise err
+
+
+class ArgumentTypeError(TypeError, ValueError):
+    """An argument of the wrong type given to an SDK registration call (a
+    command name that is not a string, a check timeout that is not a
+    number). A ``TypeError``, as Python raises for a wrong type, and also a
+    ``ValueError``, as these calls raised before, so either ``except``
+    catches it."""
+
+
+class ContainerNotAllowed(PermissionError):
+    """A blob operation on a container that ``KBM_LEDSAS_ALLOWED_CONTAINERS``
+    does not list (``ctx.blob``: every upload and download, by container
+    name or by blob URI). Raised before anything is sent to storage. Not
+    retried: uncaught in a handler, it is replied as ``Permanent``.
+
+    Attributes:
+        container: The refused container name.
+    """
+
+    def __init__(self, message: str, container: str) -> None:
+        super().__init__(_checked_text(type(self).__name__, "message", message))
+        self.container = _checked_text(type(self).__name__, "container", container)
+
+    def __reduce__(self) -> "tuple[object, ...]":
+        # Pickle / copy re-create it with both arguments (the default
+        # passes only ``args``, the message, and fails on the missing
+        # ``container``); the instance state (``container``, marks) follows.
+        message = self.args[0] if self.args else ""
+        return (type(self), (message, self.container), self.__dict__)
+
 
 class SDKError(Exception):
-    """Base exception for all KeborMed LEDSAS SDK errors."""
+    """Base exception for all KeborMed LEDSAS SDK errors.
+
+    Every SDK error carries ``user_message`` (the caller-facing message, or
+    None when not set), so ``except errors.SDKError as e: e.user_message``
+    works for each of them.
+
+    Args:
+        message: Internal error message.
+        user_message: Caller-facing message: a ``str`` or None (not set);
+            any other type raises TypeError.
+    """
+
+    def __init__(self, message: str = "", user_message: str | None = None):
+        super().__init__(_checked_text(type(self).__name__, "message", message))
+        self.user_message: str | None = _checked_user_message(user_message)
 
 
 class Retryable(SDKError):
@@ -32,6 +115,8 @@ class Retryable(SDKError):
         user_message: Caller-facing message. **When set, the caller always sees
             this** (regardless of ``generic_errors``). Use it whenever you want
             to surface a friendly message to upstream callers.
+            A ``str`` (an empty string is a message too) or None (not set);
+            any other type raises TypeError here.
 
     Example:
         raise Retryable("Internal: connection pool exhausted",
@@ -39,8 +124,7 @@ class Retryable(SDKError):
     """
 
     def __init__(self, message: str, user_message: str | None = None):
-        super().__init__(message)
-        self.user_message = user_message
+        super().__init__(message, user_message)
 
 
 class Permanent(SDKError):
@@ -61,6 +145,8 @@ class Permanent(SDKError):
             when ``user_message`` is unset AND ``generic_errors`` is disabled.
         user_message: Caller-facing message. **When set, the caller always sees
             this** (regardless of ``generic_errors``).
+            A ``str`` (an empty string is a message too) or None (not set);
+            any other type raises TypeError here.
 
     Example:
         raise Permanent("Invalid field 'foo': expected int, got str",
@@ -68,8 +154,7 @@ class Permanent(SDKError):
     """
 
     def __init__(self, message: str, user_message: str | None = None):
-        super().__init__(message)
-        self.user_message = user_message
+        super().__init__(message, user_message)
 
 
 class DeadlineExceeded(SDKError):
@@ -82,15 +167,20 @@ class DeadlineExceeded(SDKError):
 
     Treated as terminal — the message goes to DLQ without retry. The
     deadline is already in the past, so a fresh attempt would just fail
-    the same way; the orchestrator is expected to resend with a new
+    the same way; the caller is expected to resend with a new
     deadline if appropriate.
 
     Args:
         message: Internal error message — always logged; sent to the caller only
             when ``user_message`` is unset AND ``generic_errors`` is disabled.
+            Defaults to "Processing deadline exceeded" (the generic
+            message), so a bare ``raise DeadlineExceeded()`` replies a
+            meaningful message.
         user_message: Caller-facing message. **When set, the caller always sees
             this** (regardless of ``generic_errors``). Symmetric with
             ``Retryable`` and ``Permanent``.
+            A ``str`` (an empty string is a message too) or None (not set);
+            any other type raises TypeError here.
 
     Example:
         if ctx.deadline and remaining < 5:
@@ -100,6 +190,9 @@ class DeadlineExceeded(SDKError):
             )
     """
 
-    def __init__(self, message: str = "", user_message: str | None = None):
-        super().__init__(message)
-        self.user_message = user_message
+    def __init__(
+        self,
+        message: str = "Processing deadline exceeded",
+        user_message: str | None = None,
+    ):
+        super().__init__(message, user_message)

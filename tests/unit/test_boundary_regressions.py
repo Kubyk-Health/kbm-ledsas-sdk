@@ -56,7 +56,7 @@ def isolated_env(monkeypatch) -> Iterator[None]:
 
 
 # ---------------------------------------------------------------------------
-# envelope.reply_to length boundary matches AMQP's 127-byte cap.
+# H1a: envelope.reply_to length boundary matches AMQP's 127-byte cap.
 # ---------------------------------------------------------------------------
 
 
@@ -85,7 +85,7 @@ class TestReplyToLengthBoundary:
 
 
 # ---------------------------------------------------------------------------
-# SDKConfig refuses tenant + service_name combos that overflow the
+# H1b: SDKConfig refuses tenant + service_name combos that overflow the
 # AMQP 127-byte cap on the resulting dlq.queue.{tenant}.{service}.v1 name.
 # ---------------------------------------------------------------------------
 
@@ -132,13 +132,13 @@ class TestTopologyNameBudget:
 
 
 # ---------------------------------------------------------------------------
-# cleartext-AMQP refusal fires at config-load (was: deferred to
+# M3: cleartext-AMQP refusal fires at config-load (was: deferred to
 # DirectTransport.start, after ~7 INFO lines of half-built state).
 # ---------------------------------------------------------------------------
 
 
 class TestCleartextAmqpAtConfigLoad:
-    """SDKConfig refuses amqp:// to non-loopback at LOAD time."""
+    """SDKConfig refuses amqp:// to non-loopback at LOAD time (M3)."""
 
     def test_loopback_amqp_accepted(self, isolated_env, monkeypatch):
         """Loopback hosts don't trigger the refusal."""
@@ -177,7 +177,7 @@ class TestCleartextAmqpAtConfigLoad:
 
     @pytest.mark.parametrize("truthy", ["1", "true", "TRUE", "yes", "YES", "on", "t", "y"])
     def test_allow_insecure_amqp_accepts_truthy_strings(self, isolated_env, monkeypatch, truthy):
-        """ALLOW_INSECURE_AMQP now accepts any truthy form, not only '1'."""
+        """L2: ALLOW_INSECURE_AMQP now accepts any truthy form, not only '1'."""
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@10.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", "x")
         monkeypatch.setenv("KBM_LEDSAS_ALLOW_INSECURE_AMQP", truthy)
@@ -196,7 +196,7 @@ class TestCleartextAmqpAtConfigLoad:
 
 
 # ---------------------------------------------------------------------------
-# unified boolean env-var parsing.
+# L2: unified boolean env-var parsing.
 # ---------------------------------------------------------------------------
 
 
@@ -209,30 +209,45 @@ class TestBoolEnvUnified:
     def test_truthy_forms(self, raw, monkeypatch):
         """Each of these values, when read from the env, must be truthy."""
         assert _is_truthy(raw) is True
-        monkeypatch.setenv("KBM_LEDSAS_TASK022_BOOL", raw)
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "false") is True
+        monkeypatch.setenv("KBM_LEDSAS_TEST_BOOL", raw)
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "false") is True
 
-    @pytest.mark.parametrize("raw", ["0", "false", "no", "off", "", "FALSE", "anything", "  "])
+    @pytest.mark.parametrize("raw", ["0", "false", "no", "off", "FALSE", "f", "n"])
     def test_falsy_forms(self, raw, monkeypatch):
-        """Anything not in the truthy set is falsy — including unknown
-        tokens like 'anything' (security-sensitive flags fail closed)."""
+        """The falsy tokens are false even with a true default."""
         assert _is_truthy(raw) is False
-        monkeypatch.setenv("KBM_LEDSAS_TASK022_BOOL", raw)
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "true") is False
+        monkeypatch.setenv("KBM_LEDSAS_TEST_BOOL", raw)
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "true") is False
+
+    @pytest.mark.parametrize("raw", ["", "  "])
+    def test_empty_gives_the_default(self, raw, monkeypatch):
+        """An empty value counts as unset."""
+        monkeypatch.setenv("KBM_LEDSAS_TEST_BOOL", raw)
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "true") is True
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "false") is False
+
+    @pytest.mark.parametrize("raw", ["anything", "ture", "maybe"])
+    def test_unknown_tokens_are_refused(self, raw, monkeypatch):
+        """An unrecognized value is a configuration error naming the
+        variable; it used to be read as false."""
+        assert _is_truthy(raw) is False
+        monkeypatch.setenv("KBM_LEDSAS_TEST_BOOL", raw)
+        with pytest.raises(ValueError, match="KBM_LEDSAS_TEST_BOOL=.* is not a boolean"):
+            _bool_env("KBM_LEDSAS_TEST_BOOL", "false")
 
     def test_none_is_falsy(self):
         assert _is_truthy(None) is False
 
     def test_bool_env_default_when_unset(self, monkeypatch):
         """When env var is unset, the default string is parsed via _is_truthy."""
-        monkeypatch.delenv("KBM_LEDSAS_TASK022_BOOL", raising=False)
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "false") is False
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "true") is True
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "1") is True
-        assert _bool_env("KBM_LEDSAS_TASK022_BOOL", "0") is False
+        monkeypatch.delenv("KBM_LEDSAS_TEST_BOOL", raising=False)
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "false") is False
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "true") is True
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "1") is True
+        assert _bool_env("KBM_LEDSAS_TEST_BOOL", "0") is False
 
     def test_generic_errors_accepts_one(self, isolated_env, monkeypatch):
-        """Regression: GENERIC_ERRORS=1 used to be silently false."""
+        """L2 regression: GENERIC_ERRORS=1 used to be silently false."""
         monkeypatch.setenv("KBM_LEDSAS_RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/")
         monkeypatch.setenv("KBM_LEDSAS_BLOB_CONN_STRING", "x")
         monkeypatch.setenv("KBM_LEDSAS_GENERIC_ERRORS", "1")
@@ -254,7 +269,7 @@ class TestBoolEnvUnified:
 
 
 class TestHealthServerHardening:
-    """Server header stripped, 404/405 responses are JSON.
+    """Server header stripped, 404/405 are JSON.
 
     Same pattern as test_health.py — bind a real socket on an ephemeral
     port and hit it with aiohttp.ClientSession. Avoids the pytest-aiohttp
@@ -294,7 +309,7 @@ class TestHealthServerHardening:
 
     @pytest.mark.asyncio
     async def test_server_header_stripped_on_200(self, started_health_server):
-        """Success responses must not advertise Python/aiohttp version."""
+        """M1: success responses must not advertise Python/aiohttp version."""
         import aiohttp
 
         _, url = started_health_server
@@ -306,20 +321,20 @@ class TestHealthServerHardening:
 
     @pytest.mark.asyncio
     async def test_404_is_json(self, started_health_server):
-        """Unknown route responds with JSON, not plaintext."""
+        """L3: unknown route responds with JSON, not plaintext."""
         import aiohttp
 
         _, url = started_health_server
         async with aiohttp.ClientSession() as s, s.get(f"{url}/admin") as r:
             assert r.status == 404
-            assert "Server" not in r.headers  # error paths too
+            assert "Server" not in r.headers  # M1 covers error paths too
             body = await r.json()
             assert body["status"] == "error"
             assert body["code"] == 404
 
     @pytest.mark.asyncio
     async def test_405_is_json(self, started_health_server):
-        """Disallowed method responds with JSON listing allowed verbs."""
+        """L3: disallowed method responds with JSON listing allowed verbs."""
         import aiohttp
 
         _, url = started_health_server

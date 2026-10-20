@@ -23,16 +23,16 @@ from kbm_ledsas_sdk.transport import (
 
 
 class TestTransportFactory:
-    """Transport construction."""
+    """The transport factory builds the direct transport."""
 
-    # Azurite-style connection string used for transport construction.
+    # Azurite-style connection string.
     _BLOB_CONN = (
         "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;"
-        "AccountKey=xxx;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1"
+        "AccountKey=eHh4;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1"  # base64 of "xxx": a key the client can sign with
     )
 
     def test_builds_direct_transport(self):
-        """create_transport builds DirectTransport for a valid config."""
+        """The factory builds DirectTransport."""
         config = SDKConfig(
             service_name="test",
             rabbitmq_url="amqp://guest:guest@127.0.0.1:5672/",
@@ -45,14 +45,14 @@ class TestTransportFactory:
         assert isinstance(transport, DirectTransport)
 
     def test_missing_rabbitmq_url_raises(self):
-        """Without a broker URL the SDK fails with an actionable error."""
+        """A configuration without a broker URL fails with an actionable error."""
         config = SDKConfig(service_name="test")
         with pytest.raises(ValueError) as excinfo:
             create_transport(config)
         assert "KBM_LEDSAS_RABBITMQ_URL" in str(excinfo.value)
 
     def test_missing_blob_conn_raises(self):
-        """With a broker URL but no blob connection string the SDK fails."""
+        """A configuration with a broker URL but no blob connection string fails."""
         config = SDKConfig(
             service_name="test",
             rabbitmq_url="amqp://guest:guest@127.0.0.1:5672/",
@@ -128,6 +128,39 @@ class TestMockBlobOperations:
         ref = await blob_ops.upload_bytes(container="test", data=b"data", path="custom/path.bin")
 
         assert "custom/path.bin" in ref.uri
+
+    @pytest.mark.asyncio
+    async def test_upload_refuses_overwrite_with_azure_semantics(self):
+        """overwrite=False on an existing path mirrors Azure's ResourceExistsError."""
+        from azure.core.exceptions import ResourceExistsError
+
+        blob_ops = MockBlobOperations()
+        await blob_ops.upload_bytes(container="test", data=b"a", path="same.bin")
+        with pytest.raises(ResourceExistsError, match="already exists"):
+            await blob_ops.upload_bytes(container="test", data=b"b", path="same.bin")
+
+    @pytest.mark.asyncio
+    async def test_upload_refuses_overwrite_without_azure_core(self, monkeypatch):
+        """Installs without azure-core (the lean wheel) get FileExistsError.
+
+        ``None`` in ``sys.modules`` makes the deferred import raise
+        ImportError, exactly as on an install that does not carry azure-core.
+        """
+        import sys
+
+        monkeypatch.setitem(sys.modules, "azure.core.exceptions", None)
+        blob_ops = MockBlobOperations()
+        await blob_ops.upload_bytes(container="test", data=b"a", path="same.bin")
+        with pytest.raises(FileExistsError, match="already exists") as exc_info:
+            await blob_ops.upload_bytes(container="test", data=b"b", path="same.bin")
+        # ``from None``: no chained ImportError noise in the traceback.
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+        # overwrite=True still succeeds on the same install.
+        ref = await blob_ops.upload_bytes(
+            container="test", data=b"c", path="same.bin", overwrite=True
+        )
+        assert "same.bin" in ref.uri
 
 
 class TestMockTransport:

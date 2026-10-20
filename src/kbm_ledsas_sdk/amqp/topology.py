@@ -1,15 +1,16 @@
 """
 AMQP topology declaration for RabbitMQ exchanges and queues.
 
-Declares the messaging infrastructure for Direct transport mode.
+Declares the RabbitMQ exchanges and queues a service consumes from.
 """
-
-import logging
 
 from aio_pika import ExchangeType
 from aio_pika.abc import AbstractChannel, AbstractQueue
+from aio_pika.exceptions import AMQPError
 
-logger = logging.getLogger(__name__)
+from kbm_ledsas_sdk.utils.logging import masked_logger
+
+logger = masked_logger(__name__)
 
 
 def build_exchange_name(prefix: str, tenant: str | None, service_name: str) -> str:
@@ -81,6 +82,16 @@ class TopologyInfo:
         self.cmd_queue_obj = cmd_queue_obj
 
 
+# Arguments of the dead-letter queue: messages kept 7 days, at most
+# 100 000 of them (see declare_topology).
+DLQ_MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+DLQ_MAX_LENGTH = 100_000
+DLQ_QUEUE_ARGUMENTS = {
+    "x-message-ttl": DLQ_MESSAGE_TTL_MS,
+    "x-max-length": DLQ_MAX_LENGTH,
+}
+
+
 async def declare_topology(
     channel: AbstractChannel,
     service_name: str,
@@ -139,39 +150,30 @@ async def declare_topology(
         )
         logger.debug(f"Declared DLQ exchange: {dlq_exchange_name}")
 
-        # 2. Declare DLQ queue with retention bounds.
-        #
-        # A long-running service hit by a flood of malformed
-        # envelopes, oversize payloads, schema failures, etc. previously
-        # filled the DLQ indefinitely (the SDK's in-process DoS surfaces
-        # are bounded by `pending_messages` cap and
-        # `max_payload_bytes`; the broker-side DLQ was not). Apply two
-        # native broker arguments so operators get sane behavior by
-        # default without writing a drain consumer on day one:
+        # 2. Declare DLQ queue with retention bounds (DLQ_QUEUE_ARGUMENTS):
         #
         # - ``x-message-ttl``: 7 days. Old DLQ entries are useful for
-        #   post-mortem for a week — past that they almost always go
-        #   uninvestigated and only consume disk.
-        # - ``x-max-length``: 100 000 messages. Cap the queue so a
-        #   hostile sender can't blow up the broker's disk; on overflow
-        #   the broker drops the oldest entries (default behavior).
+        #   post-mortem for a week; past that they only consume disk.
+        # - ``x-max-length``: 100 000 messages; on overflow the broker
+        #   drops the oldest entries (its default behavior).
         #
-        # NOTE on upgrade: queues declared by an older SDK without these
-        # arguments will fail to re-declare with PRECONDITION_FAILED.
-        # Operators upgrading from an earlier version must delete the
-        # existing DLQ (`dlq.queue.{tenant}.{service}.v1`) once before
-        # restarting; the SDK will re-create it with the new arguments.
-        # Customers who want different limits can pre-declare the DLQ
-        # with their own arguments; the SDK does not redeclare an
-        # existing queue, it just consults the broker's view.
+        # These bound the number and the age of dead letters, not their
+        # total size in bytes: 100 000 messages of up to
+        # KBM_LEDSAS_MAX_PAYLOAD_BYTES each can still be large. Cap the
+        # bytes with a broker policy (``max-length-bytes``), which applies
+        # without redeclaring the queue.
+        #
+        # The arguments are fixed: a DLQ that already exists with other
+        # arguments (declared by hand with other limits, or by an older
+        # release without any) makes this declaration fail with
+        # PRECONDITION_FAILED. To change the limits, use a broker policy,
+        # or delete the DLQ (``dlq.queue.[{tenant}.]{service}.v1``) once
+        # before restarting so it is re-created with these arguments.
         dlq_queue = await channel.declare_queue(
             dlq_queue_name,
             durable=True,
             auto_delete=False,
-            arguments={
-                "x-message-ttl": 7 * 24 * 60 * 60 * 1000,  # 7 days in ms
-                "x-max-length": 100_000,
-            },
+            arguments=dict(DLQ_QUEUE_ARGUMENTS),
         )
         logger.debug(f"Declared DLQ queue: {dlq_queue_name}")
 
@@ -180,10 +182,10 @@ async def declare_topology(
         # land here regardless of how the broker tagged them. Note that
         # this also means any broker user with publish rights to the DLQ
         # exchange can post directly into the DLQ. The SDK trusts the
-        # broker as the security boundary — restrict publish rights on
-        # ``dlq.*`` exchanges in production deployments (the default
-        # RabbitMQ ``guest:guest`` user is loopback-only by default in
-        # the bundled docker-compose).
+        # broker as the security boundary: restrict publish rights on
+        # ``dlq.*`` exchanges in production deployments (RabbitMQ's
+        # default ``guest`` user can only connect from the broker's own
+        # host).
         await dlq_queue.bind(dlq_exchange, routing_key="#")
         logger.debug("Bound DLQ queue to DLQ exchange")
 
@@ -253,10 +255,16 @@ async def declare_topology(
                 e,
                 extra={"error": str(e)},
             )
-        else:
-            logger.error(
-                "Failed to declare AMQP topology",
-                exc_info=True,
+        elif isinstance(e, AMQPError):
+            # The broker refused a declaration (an existing queue with
+            # other arguments, missing permissions, ...). The transport
+            # reports it as one ERROR line with the broker's reason and the
+            # remedy; a traceback here would only repeat it.
+            logger.debug(
+                "Broker refused the AMQP topology declaration: %s",
+                e,
                 extra={"error": str(e)},
             )
+        else:
+            logger.error("Failed to declare AMQP topology", exc_info=True, extra={"error": str(e)})
         raise

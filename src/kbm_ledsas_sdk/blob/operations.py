@@ -5,17 +5,201 @@ Provides methods for uploading/downloading data to/from Azure Blob Storage.
 Streaming operations support multi-GB files with minimal memory footprint.
 """
 
+import functools
+import inspect
+import json
+import math
+import weakref
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Callable
+from typing import Any, Union
 
-from ..models.blob import BlobRef
+from ..models.blob import (
+    LONE_SURROGATE,
+    BlobRef,
+    blob_name_problem,
+    container_name_problem,
+    refused_character,
+)
+from ..models.errors import ContainerNotAllowed
+from ..utils.logging import masked_logger
+
+_logger = masked_logger(__name__)
+
 
 # Default chunk size: 4MB (optimal for Azure blob storage performance)
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 
+# A JSON document as download_json returns it and upload_json takes it:
+# an object or an array.
+JSONValue = Union[dict[str, Any], list[Any]]  # noqa: UP007
+# The data an upload takes: any bytes-like object.
+BytesLike = Union[bytes, bytearray, memoryview]  # noqa: UP007
+
 # Type aliases for progress callbacks
 DownloadProgressCallback = Callable[[int, int], None]  # (bytes_downloaded, total_bytes)
 UploadProgressCallback = Callable[[int], None]  # (bytes_uploaded)
+
+# Attribute the blob helpers set on an exception whose cause is the blob's
+# content (e.g. download_json on content that is not valid JSON): the same
+# content fails the same way on every attempt. The value is a short
+# reason. If the handler lets such an exception propagate, the SDK treats
+# it as a Permanent error (not retried) instead of an UnexpectedError.
+# The exception's type is unchanged, so `except json.JSONDecodeError` /
+# `except ValueError` in handler code keeps working.
+NON_RETRYABLE_MARKER = "ledsas_non_retryable"
+
+
+def _mark_non_retryable(exc: BaseException, reason: str) -> None:
+    """Tag ``exc`` as non-retryable (see NON_RETRYABLE_MARKER)."""
+    try:
+        setattr(exc, NON_RETRYABLE_MARKER, reason)
+    except Exception:  # pragma: no cover - exceptions without __dict__
+        pass
+
+
+# Attribute the blob helpers set on an exception that a new attempt is
+# expected to get past although its class looks permanent: an HTTP 412
+# from the SDK's own consistency check in download_stream (the blob was
+# overwritten while it was being read; a new attempt reads the new
+# content). The value is a short reason. If the handler lets such an
+# exception propagate, the SDK retries the command and logs one WARNING
+# per attempt without a traceback, as for a transient storage error. The
+# exception's type is unchanged.
+RETRYABLE_MARKER = "ledsas_retryable"
+
+
+def _mark_retryable(exc: BaseException, reason: str) -> None:
+    """Tag ``exc`` as worth retrying (see RETRYABLE_MARKER)."""
+    try:
+        setattr(exc, RETRYABLE_MARKER, reason)
+    except Exception:  # pragma: no cover - exceptions without __dict__
+        pass
+
+
+def _lone_surrogate_in(text: str) -> tuple[int, int] | None:
+    """``(code point, position)`` of the first lone surrogate in ``text``
+    (a ``\\ud800``-style escape a JSON request can carry), or None."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as e:
+        return (ord(text[e.start]) if e.start < len(text) else 0), e.start
+    return None
+
+
+def _find_lone_surrogate(value: Any, path: str, depth: int = 0) -> str | None:
+    """``<path> ...`` naming the first string (a dict key or a value) in
+    ``value`` that holds a lone surrogate, or None.
+
+    JSON writes such a string as an escape (``"\\ud800"``), which RFC 8259
+    leaves unpredictable: strict parsers refuse it, and .NET's
+    System.Text.Json reads the document but throws when the string is
+    read. The SDK therefore refuses it in what it writes (replies, status
+    updates, ``upload_json``), as ``upload_text`` refuses text UTF-8
+    cannot encode.
+    """
+    if isinstance(value, str):
+        found = _lone_surrogate_in(value)
+        if found is None:
+            return None
+        code, pos = found
+        return (
+            f"{path} is text with a lone surrogate U+{code:04X} at position "
+            f"{pos}, which UTF-8 cannot encode"
+        )
+    if depth > 300:
+        return None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                found = _lone_surrogate_in(key)
+                if found is not None:
+                    code, pos = found
+                    return (
+                        f"{path} has a key with a lone surrogate U+{code:04X} "
+                        f"at position {pos}, which UTF-8 cannot encode"
+                    )
+            shown = json.dumps(key if isinstance(key, str) else str(key))
+            problem = _find_lone_surrogate(item, f"{path}[{shown}]", depth + 1)
+            if problem is not None:
+                return problem
+    elif isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            problem = _find_lone_surrogate(item, f"{path}[{i}]", depth + 1)
+            if problem is not None:
+                return problem
+    return None
+
+
+# Longest blob name the storage service accepts.
+_BLOB_NAME_MAX = 1024
+
+
+def _check_upload_path(path: str | None) -> None:
+    """Refuse an upload ``path`` that the returned ``azblob://`` URI could
+    not represent, BEFORE anything is written.
+
+    The blob name is the path as given (one leading ``/`` is ignored), and
+    the URI the upload returns is ``azblob://<container>/<path>``. A ``?``
+    or ``#`` in the path would become a query string or a fragment of that
+    URI (``q/x.bin?versionId=abc`` would come back as a reference to a
+    version that does not exist, and ``x#y`` cannot be referenced at all),
+    control characters and Unicode format characters are refused by every
+    blob URI, and ``.`` / ``..`` segments, empty segments (``a//b``) and a
+    trailing ``/`` are refused when the URI is read back. A backslash is
+    refused: storage may store it as ``/`` (``a\\b`` stored as ``a/b``), so
+    the returned URI would not name the blob written. ``None`` or ``""``
+    (auto-generated name) is fine. The ValueError is marked non-retryable,
+    so a handler that lets it propagate gets one Permanent reply.
+    """
+    if path is None or path == "":
+        return
+    problem: str | None = None
+    if not isinstance(path, str):
+        problem = f"must be a string, got {type(path).__name__}"
+    else:
+        name = path[1:] if path.startswith("/") else path
+        if not name.strip("/"):
+            problem = "is empty"
+        elif len(name) > _BLOB_NAME_MAX:
+            # The limit is storage's, on the blob name: the ignored
+            # leading '/' does not count.
+            problem = f"is longer than {_BLOB_NAME_MAX} characters"
+        elif "?" in path or "#" in path:
+            problem = "contains '?' or '#', which a blob URI cannot carry in a blob name"
+        else:
+            # The same characters a blob URI refuses (refused_character):
+            # control characters (the ASCII ones, DEL and U+0080 to
+            # U+009F), Unicode format characters, the line / paragraph
+            # separators and lone surrogates.
+            refused = refused_character(path)
+            if refused is not None:
+                o, kind = refused
+                if kind in ("line separator", "paragraph separator"):
+                    problem = f"contains the {kind} U+{o:04X}"
+                elif kind == LONE_SURROGATE:
+                    problem = f"contains a lone surrogate U+{o:04X}, which UTF-8 " f"cannot encode"
+                else:
+                    problem = f"contains the control or format character U+{o:04X}"
+            if problem is None:
+                problem = blob_name_problem(name)
+    if problem is not None:
+        err = ValueError(
+            f"Invalid blob path: the path {problem}. A blob path is at most "
+            f"{_BLOB_NAME_MAX} characters (a leading '/' not counted), with "
+            f"no '?', '#', '\\', control characters, empty segments ('//') "
+            f"or '.' / '..' segments, and does not end with '/'."
+        )
+        _mark_non_retryable(err, f"invalid blob path (the path {problem})")
+        raise err
+
+
+def _refuse_argument(err: Exception, reason: str) -> None:
+    """Raise ``err`` marked non-retryable: an invalid argument fails the
+    same way on every attempt, so a handler that lets it propagate gets one
+    Permanent reply (no retries, no traceback)."""
+    _mark_non_retryable(err, reason)
+    raise err
 
 
 def _ensure_blob_ref(blob_ref: str | BlobRef) -> BlobRef:
@@ -29,11 +213,177 @@ def _ensure_blob_ref(blob_ref: str | BlobRef) -> BlobRef:
         BlobRef instance
 
     Raises:
-        ValueError: If string is not a valid azblob:// URI
+        ValueError: If string is not a valid azblob:// URI, or a BlobRef
+            holds a URI that is not (one built without the checks, for
+            example with ``object.__setattr__``): a BlobRef is checked
+            again here, before the blob call uses or logs its URI.
+        TypeError: If ``blob_ref`` is neither a string nor a BlobRef (for
+            example ``None`` from a request field that is missing). Marked
+            non-retryable, like the ValueError.
     """
+    if isinstance(blob_ref, BlobRef):
+        # Checked again (revalidate_instances): the result is a BlobRef
+        # whose URI passed from_uri's checks.
+        return BlobRef.model_validate(blob_ref)
     if isinstance(blob_ref, str):
         return BlobRef.from_uri(blob_ref)
-    return blob_ref
+    hint = " (is a required request field missing?)" if blob_ref is None else ""
+    _refuse_argument(
+        TypeError(
+            f"blob_ref must be an azblob:// URI string or a BlobRef, got "
+            f"{type(blob_ref).__name__}{hint}"
+        ),
+        f"invalid blob reference (got {type(blob_ref).__name__}{hint})",
+    )
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _check_container(container: Any) -> None:
+    """Refuse an upload ``container`` the storage service would refuse,
+    before any I/O (non-retryable TypeError / ValueError)."""
+    problem = container_name_problem(container)
+    if problem is None:
+        return
+    err_class = TypeError if not isinstance(container, str) else ValueError
+    _refuse_argument(
+        err_class(f"Invalid container: {problem}"),
+        f"invalid container ({problem})",
+    )
+
+
+def _check_upload_data(data: Any) -> bytes:
+    """``data`` for ``upload_bytes`` as ``bytes``. ``bytearray`` and
+    ``memoryview`` are converted; anything else (a ``str``, ``None``, a
+    number) is refused (non-retryable TypeError)."""
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, (bytearray, memoryview)):
+        return bytes(data)
+    if isinstance(data, str):
+        msg = "upload_bytes() takes bytes, got str; for text use upload_text()"
+    else:
+        msg = (
+            f"upload_bytes() takes bytes (or bytearray / memoryview), got " f"{type(data).__name__}"
+        )
+    _refuse_argument(TypeError(msg), msg)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _check_upload_stream(stream: Any) -> None:
+    """Refuse an ``upload_stream`` source that is not an async iterable of
+    byte chunks (non-retryable TypeError)."""
+    if hasattr(stream, "__aiter__"):
+        return
+    msg = (
+        f"upload_stream() takes an async iterable of bytes (for example an "
+        f"async generator), got {type(stream).__name__}; for bytes in "
+        f"memory use upload_bytes()"
+    )
+    _refuse_argument(TypeError(msg), msg)
+
+
+def _check_stream_chunk(chunk: Any) -> bytes:
+    """One chunk an ``upload_stream`` source yielded, as ``bytes``.
+    ``bytearray`` and ``memoryview`` are converted; anything else (a
+    ``str``, ``None``, a number, a dict) is refused (non-retryable
+    TypeError), before it reaches the storage service: a ``str`` was stored
+    UTF-8 encoded without a word, and the other types failed inside the
+    storage client, logged as a storage failure and retried."""
+    if isinstance(chunk, bytes):
+        return chunk
+    if isinstance(chunk, (bytearray, memoryview)):
+        return bytes(chunk)
+    msg = (
+        f"upload_stream() got a chunk of type {type(chunk).__name__}; the "
+        f"stream must yield bytes"
+    )
+    _refuse_argument(TypeError(msg), msg)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _check_overwrite(overwrite: Any) -> None:
+    """Refuse an upload ``overwrite`` that is not a bool (non-retryable
+    TypeError), before anything is written: the storage client reads it by
+    truthiness, so ``overwrite="false"`` (a flag read from the environment
+    or a request field) replaced an existing blob."""
+    if type(overwrite) is bool:
+        return
+    msg = f"overwrite must be True or False, got {type(overwrite).__name__}"
+    _refuse_argument(TypeError(msg), msg)
+
+
+def _encode_text(text: str) -> bytes:
+    """UTF-8 bytes of ``text`` for ``upload_text``. Text that UTF-8 cannot
+    encode (a lone surrogate such as ``"\\ud800"``, which a JSON request
+    can carry) is refused with a non-retryable ValueError naming the
+    position, instead of an uncaught UnicodeEncodeError that is retried."""
+    try:
+        return text.encode("utf-8")
+    except UnicodeEncodeError as e:
+        code = ord(text[e.start]) if e.start < len(text) else 0
+        msg = (
+            f"upload_text() got text that UTF-8 cannot encode (a lone "
+            f"surrogate U+{code:04X} at position {e.start})"
+        )
+        _refuse_argument(ValueError(msg), msg)
+        raise AssertionError("unreachable")  # pragma: no cover  # noqa: B904
+
+
+def _replace_non_finite(value: Any) -> Any:
+    """``value`` with every NaN / Infinity float replaced by None."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _replace_non_finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_replace_non_finite(v) for v in value]
+    return value
+
+
+def _json_dumps_as_reply(obj: Any) -> str:
+    """``obj`` as JSON text by the rules of a reply payload (a datetime, a
+    UUID, a Decimal, a set, a dataclass, an Enum, a pydantic model, ...
+    have a JSON form; binary data does not). Raises when it has none."""
+    from ..runtime.handler import _JSONABLE, _normalize_result
+
+    normalized = _normalize_result(obj, "obj", set())
+    return json.dumps(_JSONABLE.dump_python(normalized, mode="json"), allow_nan=False)
+
+
+def _json_dumps_for_blob(obj: Any) -> str:
+    """Standard JSON (RFC 8259) for ``upload_json``: NaN and Infinity,
+    which have no JSON form, are written as ``null``, as in replies.
+    A value ``json.dumps`` has no form for is written as a reply writes it
+    (a datetime as ISO 8601 text, a UUID or a Decimal as text, a set as an
+    array, a dataclass or a pydantic model as an object, ...), so
+    ``upload_json`` accepts what a reply accepts. Text with a lone
+    surrogate (which UTF-8 cannot encode) is refused with a ValueError
+    naming where it is, as in replies. A value with no JSON form at all
+    (and a circular reference) raises the ``json.dumps`` error unchanged."""
+    try:
+        text = json.dumps(obj, allow_nan=False)
+    except TypeError as e:
+        try:
+            text = _json_dumps_as_reply(obj)
+        except Exception:  # noqa: BLE001 - no reply form either
+            raise e from None
+    except ValueError as e:
+        if "Out of range float values" not in str(e):
+            raise
+        try:
+            text = json.dumps(_replace_non_finite(obj), allow_nan=False)
+        except TypeError:
+            try:
+                text = _json_dumps_as_reply(obj)
+            except Exception:  # noqa: BLE001 - no reply form either
+                raise e from None
+    # json.dumps writes every non-ASCII character as an escape, so a lone
+    # surrogate can only be present when the text holds "\ud".
+    if "\\ud" in text:
+        problem = _find_lone_surrogate(obj, "obj")
+        if problem is not None:
+            raise ValueError(f"upload_json() refused: {problem}")
+    return text
 
 
 class BlobOperations(ABC):
@@ -56,8 +406,13 @@ class BlobOperations(ABC):
             Blob contents as bytes
 
         Raises:
-            Retryable: Transient blob storage errors (throttling, network issues)
-            Permanent: Blob not found, access denied, invalid URI
+            ValueError: If ``blob_ref`` is not a valid azblob:// URI
+            TypeError: If ``blob_ref`` is neither a string nor a BlobRef
+                (for example ``None`` from a missing request field)
+            Exception: Storage errors from the underlying client, e.g. a
+                missing blob. Uncaught in a handler, a missing blob, an
+                invalid URI or an invalid ``blob_ref`` is replied as
+                Permanent (not retried); other storage errors are retried.
 
         Example:
             >>> data = await ctx.blob.download_bytes("azblob://dev/input.json")
@@ -66,7 +421,7 @@ class BlobOperations(ABC):
         """
 
     @abstractmethod
-    async def download_json(self, blob_ref: str | BlobRef) -> dict:
+    async def download_json(self, blob_ref: str | BlobRef) -> JSONValue:
         """
         Download blob contents and parse as JSON.
 
@@ -74,11 +429,27 @@ class BlobOperations(ABC):
             blob_ref: Reference to the blob to download (BlobRef or azblob:// URI string)
 
         Returns:
-            Parsed JSON as dict
+            The parsed JSON document (a dict or a list)
 
         Raises:
-            Retryable: Transient blob storage errors
-            Permanent: Blob not found, invalid JSON, access denied
+            ValueError: If ``blob_ref`` is not a valid azblob:// URI, or the
+                content is not valid JSON (``json.JSONDecodeError`` is a
+                ValueError), or it holds an integer with more digits than
+                Python converts (4300 by default).
+            RecursionError: If the content is nested more levels deep than
+                Python's JSON parser supports. Uncaught in a handler, any
+                of these content errors is replied as Permanent (not
+                retried): the same content fails the same way every time.
+            Exception: Storage errors from the underlying client, e.g. a
+                missing blob.
+
+            ValueError: Also when the content is valid JSON whose root is
+                not an object or an array (a number, a string, true / false,
+                null): replied as Permanent if uncaught (the same content
+                fails the same way). Use ``download_text`` for such content.
+            ContainerNotAllowed: The blob's container is not in
+                ``KBM_LEDSAS_ALLOWED_CONTAINERS`` (every operation; nothing
+                is sent to storage; replied as Permanent if uncaught).
 
         Example:
             >>> data = await ctx.blob.download_json("azblob://dev/config.json")
@@ -90,7 +461,7 @@ class BlobOperations(ABC):
     async def upload_bytes(
         self,
         container: str,
-        data: bytes,
+        data: BytesLike,
         path: str | None = None,
         overwrite: bool = False,
     ) -> BlobRef:
@@ -102,19 +473,33 @@ class BlobOperations(ABC):
             data: Bytes to upload
             path: Optional blob path (auto-generated if not provided)
             overwrite: If True, replace an existing blob at ``path``;
-                if False (default) and the blob already exists, raises
-                ``BlobAlreadyExists``. Set ``overwrite=True`` when keying
+                if False (default) and the blob already exists, the upload
+                fails with the storage service's "blob already exists"
+                error (error code ``BlobAlreadyExists``; the exception
+                class is named in the API reference). Set ``overwrite=True`` when keying
                 output paths on ``ctx.idempotency_key`` so DLQ replays
                 of the same logical request rewrite the same blob
-                instead of being rejected as duplicates.
+                instead of being rejected as duplicates. It must be
+                ``True`` or ``False``: any other value (``"false"``, ``1``,
+                ``None``) is refused before anything is written and,
+                uncaught, is replied as Permanent (not retried).
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         Raises:
-            BlobAlreadyExists: When ``overwrite=False`` and ``path`` exists
-            Retryable: Transient blob storage errors
-            Permanent: Invalid container, access denied, quota exceeded
+            TypeError: If ``data`` is not bytes-like (``bytes``,
+                ``bytearray``, ``memoryview``; a ``str`` belongs in
+                :meth:`upload_text`) or ``container`` is not a string.
+            ValueError: If ``container`` is not a valid container name
+                (3 to 63 characters: lowercase letters, digits and single
+                hyphens) or ``path`` is not a valid blob path. Both are
+                raised before anything is written and, uncaught, are
+                replied as Permanent (not retried).
+            Exception: When ``overwrite=False`` and ``path`` already exists
+                (the storage service's ``BlobAlreadyExists`` error), and for
+                other storage errors (access denied).
 
         Example:
             >>> ref = await ctx.blob.upload_bytes(container="results", data=b"hello")
@@ -126,7 +511,7 @@ class BlobOperations(ABC):
     async def upload_json(
         self,
         container: str,
-        obj: dict,
+        obj: JSONValue,
         path: str | None = None,
         overwrite: bool = False,
     ) -> BlobRef:
@@ -135,18 +520,33 @@ class BlobOperations(ABC):
 
         Args:
             container: Container name
-            obj: Dict to serialize as JSON
+            obj: dict or list to serialize as JSON
             path: Optional blob path (auto-generated if not provided)
             overwrite: See :meth:`upload_bytes` (default False; set True
                 for the idempotency-key replay pattern).
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
+
+        NaN and Infinity, which have no JSON form, are written as ``null``
+        (as in replies), so the blob is standard JSON (RFC 8259).
 
         Raises:
-            BlobAlreadyExists: When ``overwrite=False`` and ``path`` exists
-            Retryable: Transient blob storage errors
-            Permanent: Invalid container, access denied, serialization error
+            TypeError: If ``obj`` is not a dict or a list (the root of the
+                JSON document; use ``upload_text`` / ``upload_bytes`` for
+                other content), is not JSON-serializable (ValueError for a
+                circular reference), or ``container`` is not a string.
+            ContainerNotAllowed: ``container`` is not in
+                ``KBM_LEDSAS_ALLOWED_CONTAINERS`` (every operation).
+            ValueError: If ``container`` is not a valid container name
+                (3 to 63 characters: lowercase letters, digits and single
+                hyphens) or ``path`` is not a valid blob path.
+                These errors are raised before anything is written and,
+                uncaught, are replied as Permanent (not retried).
+            Exception: When ``overwrite=False`` and ``path`` already exists
+                (the storage service's ``BlobAlreadyExists`` error), and for
+                other storage errors (access denied).
         """
 
     @abstractmethod
@@ -167,12 +567,22 @@ class BlobOperations(ABC):
             overwrite: See :meth:`upload_bytes` (default False).
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         Raises:
-            BlobAlreadyExists: When ``overwrite=False`` and ``path`` exists
-            Retryable: Transient blob storage errors
-            Permanent: Invalid container, access denied
+            TypeError: If ``text`` is not a string, or ``container`` is
+                not a string.
+            ValueError: If ``text`` holds a lone surrogate (e.g.
+                ``"\\ud800"``), which UTF-8 cannot encode, ``container`` is
+                not a valid container name (3 to 63 characters: lowercase
+                letters, digits and single hyphens) or ``path`` is not a
+                valid blob path. These errors are raised before anything is
+                written and, uncaught, are replied as Permanent (not
+                retried).
+            Exception: When ``overwrite=False`` and ``path`` already exists
+                (the storage service's ``BlobAlreadyExists`` error), and for
+                other storage errors (access denied).
         """
 
     @abstractmethod
@@ -187,8 +597,10 @@ class BlobOperations(ABC):
             Text content as string
 
         Raises:
-            Retryable: Transient blob storage errors
-            Permanent: Blob not found, invalid UTF-8, access denied
+            ValueError: If ``blob_ref`` is not a valid azblob:// URI
+            UnicodeDecodeError: If the content is not valid UTF-8
+            Exception: Storage errors from the underlying client, e.g. a
+                missing blob.
 
         Example:
             >>> text = await ctx.blob.download_text("azblob://logs/message.txt")
@@ -200,7 +612,7 @@ class BlobOperations(ABC):
     async def upload_stream(
         self,
         container: str,
-        stream: AsyncIterator[bytes],
+        stream: AsyncIterable[BytesLike],
         path: str | None = None,
         progress_callback: UploadProgressCallback | None = None,
         overwrite: bool = False,
@@ -216,21 +628,41 @@ class BlobOperations(ABC):
 
         Args:
             container: Container name
-            stream: Async iterator yielding byte chunks
+            stream: Async iterator yielding byte chunks (an async generator
+                or any object with ``__aiter__``; a plain iterator or a
+                list is refused with TypeError, replied as Permanent)
             path: Optional blob path (auto-generated if not provided)
             progress_callback: Optional callback(bytes_uploaded) for progress reporting
 
         Returns:
-            BlobRef with URI including versionId
+            BlobRef of the uploaded blob (its URI carries ?versionId= when
+            the storage account has blob versioning on)
 
         Raises:
-            Retryable: Transient blob storage errors
-            Permanent: Invalid container, access denied
+            TypeError: If ``stream`` is not an async iterable, or
+                ``container`` is not a string (raised before anything is
+                written), or the stream yields a chunk that is not
+                ``bytes``, ``bytearray`` or ``memoryview`` (encode text
+                first: a ``str`` chunk is refused, not stored encoded).
+            ValueError: If ``container`` is not a valid container name
+                (3 to 63 characters: lowercase letters, digits and single
+                hyphens) or ``path`` is not a valid blob path (raised
+                before anything is written).
+                These errors are replied as Permanent if uncaught (not
+                retried).
+            Exception: When ``overwrite=False`` and ``path`` already exists
+                (the storage service's ``BlobAlreadyExists`` error), and for
+                other storage errors (access denied). An exception raised
+                by ``stream`` itself (its own read failed) is raised
+                unchanged: it is the handler's own error, not a storage
+                failure.
 
         Example:
             >>> async def file_stream():
-            ...     async with aiofiles.open("large.bin", "rb") as f:
-            ...         while chunk := await f.read(4 * 1024 * 1024):
+            ...     # Each read runs in a worker thread (asyncio.to_thread),
+            ...     # so the file read never blocks the event loop.
+            ...     with open("large.bin", "rb") as f:
+            ...         while chunk := await asyncio.to_thread(f.read, 4 * 1024 * 1024):
             ...             yield chunk
             >>> ref = await ctx.blob.upload_stream(
             ...     container="uploads",
@@ -240,7 +672,7 @@ class BlobOperations(ABC):
         """
 
     @abstractmethod
-    async def download_stream(
+    def download_stream(
         self,
         blob_ref: str | BlobRef,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -249,29 +681,269 @@ class BlobOperations(ABC):
         """
         Download blob contents as true streaming async iterator.
 
-        Uses Azure SDK's streaming download to transfer data without
-        loading entire blob into memory. Memory usage is bounded by
-        chunk_size regardless of blob size.
+        Not a coroutine: call it and iterate the result with ``async
+        for`` (implementations are async generators).
 
-        Supports multi-GB files with <50MB peak memory usage.
+        Transfers the blob without loading it into memory: chunks of at
+        most ``chunk_size`` bytes are yielded as they arrive, so memory
+        use is bounded by the chunk size regardless of blob size.
 
         Args:
             blob_ref: Reference to the blob to download (BlobRef or azblob:// URI string)
-            chunk_size: Chunk size in bytes (default 4MB for optimal Azure performance)
+            chunk_size: Size of each yielded chunk in bytes
             progress_callback: Optional callback(bytes_downloaded, total_bytes)
 
         Returns:
             Async iterator yielding byte chunks
 
         Raises:
-            Retryable: Transient blob storage errors
-            Permanent: Blob not found, access denied
+            ValueError: If ``blob_ref`` is not a valid azblob:// URI
+            Exception: Storage errors from the underlying client (for
+                example a missing blob)
 
         Example:
-            >>> async with aiofiles.open("output.bin", "wb") as f:
+            >>> with open("output.bin", "wb") as f:
             ...     async for chunk in ctx.blob.download_stream(
             ...         blob_ref,
             ...         progress_callback=lambda d, t: print(f"{d}/{t} bytes")
             ...     ):
-            ...         await f.write(chunk)
+            ...         # The write runs in a worker thread, off the event loop.
+            ...         await asyncio.to_thread(f.write, chunk)
         """
+
+
+# ---------------------------------------------------------------------------
+# The JSON root contract of download_json / upload_json (a dict or a list)
+# ---------------------------------------------------------------------------
+
+
+def _check_upload_json_root(obj: Any) -> None:
+    """Refuse an ``upload_json`` object that is not a dict or a list (the
+    JSON document's root), before it is serialized: non-retryable
+    TypeError. Text and other content go through ``upload_text`` /
+    ``upload_bytes``."""
+    if isinstance(obj, (dict, list)):
+        return
+    _refuse_argument(
+        TypeError(
+            f"upload_json() takes a dict or a list (the root of the JSON "
+            f"document), got {type(obj).__name__}; use upload_text() or "
+            f"upload_bytes() for other content"
+        ),
+        f"upload_json() got {type(obj).__name__}, not a dict or a list",
+    )
+
+
+def _checked_json_root(blob_ref: BlobRef, obj: Any) -> JSONValue:
+    """``obj`` (parsed blob content) when its root is an object or an
+    array; otherwise one ERROR and a non-retryable ValueError: the same
+    content fails the same way on every attempt."""
+    if isinstance(obj, (dict, list)):
+        return obj
+    kind = "null" if obj is None else type(obj).__name__
+    detail = f"its root is {kind}, not an object or an array"
+    _logger.error(
+        "Blob content is JSON but %s", detail, extra={"uri": blob_ref.uri, "error": detail}
+    )
+    err = ValueError(
+        f"Blob {blob_ref.uri} holds JSON whose root is {kind}: download_json() "
+        f"returns a dict or a list; use download_text() or download_bytes() "
+        f"for other content"
+    )
+    _mark_non_retryable(err, f"blob content is JSON but {detail}")
+    raise err
+
+
+# ---------------------------------------------------------------------------
+# KBM_LEDSAS_ALLOWED_CONTAINERS: the containers handler code may use
+# ---------------------------------------------------------------------------
+
+#: The setting that limits the containers ``ctx.blob`` may use.
+ALLOWED_CONTAINERS_ENV = "KBM_LEDSAS_ALLOWED_CONTAINERS"
+
+
+def parse_allowed_containers(raw: str | None) -> "frozenset[str] | None":
+    """The container names of a ``KBM_LEDSAS_ALLOWED_CONTAINERS`` value:
+    comma-separated, spaces around each name ignored; None (no restriction)
+    when the value is unset, empty or blank. Raises ValueError naming the
+    setting for an empty item (``a,,b``, a trailing comma) or a name the
+    storage service would refuse."""
+    if raw is None or not raw.strip():
+        return None
+    items = [item.strip() for item in raw.split(",")]
+    names = []
+    for name in items if all(items) else [""]:
+        if not name:
+            raise ValueError(
+                f"{ALLOWED_CONTAINERS_ENV}={raw[:200]!r} has an empty item: list "
+                f"container names separated by commas (for example "
+                f"'input,results'), or unset it for no restriction"
+            )
+        problem = container_name_problem(name)
+        if problem is not None:
+            raise ValueError(
+                f"{ALLOWED_CONTAINERS_ENV}: {name[:80]!r} is not a valid container "
+                f"name ({problem})"
+            )
+        names.append(name)
+    return frozenset(names)
+
+
+# AllowedContainersBlobOperations -> the operations it restricts.
+_UNRESTRICTED: "weakref.WeakKeyDictionary[Any, BlobOperations]" = weakref.WeakKeyDictionary()
+
+
+class AllowedContainersBlobOperations(BlobOperations):
+    """``ctx.blob`` when ``KBM_LEDSAS_ALLOWED_CONTAINERS`` is set: every
+    operation first checks that its container (the ``container`` argument
+    of an upload, the container of the blob URI of a download) is listed,
+    and raises :class:`ContainerNotAllowed` before any storage call
+    otherwise; listed containers go to the underlying operations
+    unchanged."""
+
+    def __init__(self, inner: BlobOperations, allowed: "frozenset[str]") -> None:
+        # The unrestricted operations are kept outside the instance, so no
+        # attribute of ``ctx.blob`` hands them out (see __getattr__).
+        _UNRESTRICTED[self] = inner
+        self._allowed = frozenset(allowed)
+
+    @property
+    def allowed_containers(self) -> "frozenset[str]":
+        """The containers this interface may use."""
+        return self._allowed
+
+    def _require(self, container: Any, operation: str) -> None:
+        if not isinstance(container, str) or container in self._allowed:
+            return  # a container of the wrong type is refused by the operation itself
+        _logger.warning(
+            "Blob %s refused: container %r is not in %s",
+            operation,
+            container[:80],
+            ALLOWED_CONTAINERS_ENV,
+            extra={"container": container[:80], "operation": operation},
+        )
+        err = ContainerNotAllowed(
+            f"Blob {operation} refused: container {container[:80]!r} is not in "
+            f"{ALLOWED_CONTAINERS_ENV} (allowed: {', '.join(sorted(self._allowed))}); "
+            f"nothing was sent to storage",
+            container,
+        )
+        _mark_non_retryable(
+            err, f"container {container[:80]!r} is not allowed ({ALLOWED_CONTAINERS_ENV})"
+        )
+        raise err
+
+    def _ref(self, blob_ref: str | BlobRef, operation: str) -> BlobRef:
+        ref = _ensure_blob_ref(blob_ref)
+        self._require(ref.container, operation)
+        return ref
+
+    async def download_bytes(self, blob_ref: str | BlobRef) -> bytes:
+        return await _UNRESTRICTED[self].download_bytes(self._ref(blob_ref, "download"))
+
+    async def download_json(self, blob_ref: str | BlobRef) -> JSONValue:
+        return await _UNRESTRICTED[self].download_json(self._ref(blob_ref, "download"))
+
+    async def download_text(self, blob_ref: str | BlobRef) -> str:
+        return await _UNRESTRICTED[self].download_text(self._ref(blob_ref, "download"))
+
+    async def download_stream(
+        self,
+        blob_ref: str | BlobRef,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        progress_callback: DownloadProgressCallback | None = None,
+    ) -> AsyncIterator[bytes]:
+        ref = self._ref(blob_ref, "download")
+        async for chunk in _UNRESTRICTED[self].download_stream(
+            ref, chunk_size=chunk_size, progress_callback=progress_callback
+        ):
+            yield chunk
+
+    async def upload_bytes(
+        self,
+        container: str,
+        data: BytesLike,
+        path: str | None = None,
+        overwrite: bool = False,
+    ) -> BlobRef:
+        self._require(container, "upload")
+        return await _UNRESTRICTED[self].upload_bytes(container, data, path, overwrite=overwrite)
+
+    async def upload_json(
+        self,
+        container: str,
+        obj: JSONValue,
+        path: str | None = None,
+        overwrite: bool = False,
+    ) -> BlobRef:
+        self._require(container, "upload")
+        return await _UNRESTRICTED[self].upload_json(container, obj, path, overwrite=overwrite)
+
+    async def upload_text(
+        self,
+        container: str,
+        text: str,
+        path: str | None = None,
+        overwrite: bool = False,
+    ) -> BlobRef:
+        self._require(container, "upload")
+        return await _UNRESTRICTED[self].upload_text(container, text, path, overwrite=overwrite)
+
+    async def upload_stream(
+        self,
+        container: str,
+        stream: AsyncIterable[BytesLike],
+        path: str | None = None,
+        progress_callback: UploadProgressCallback | None = None,
+        overwrite: bool = False,
+    ) -> BlobRef:
+        self._require(container, "upload")
+        return await _UNRESTRICTED[self].upload_stream(
+            container, stream, path, progress_callback=progress_callback, overwrite=overwrite
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        # Only the blob operations are forwarded: an implementation's own
+        # public coroutine method that names a container or a blob (a
+        # ``container`` or a ``blob_ref`` parameter, as the methods above
+        # do) is checked the same way before it runs. Any other attribute
+        # of the underlying operations (its storage client, its private
+        # state, a method that names no container) is not available, so no
+        # attribute of ``ctx.blob`` reaches a container outside the list.
+        refused = AttributeError(
+            f"ctx.blob has no attribute {name!r} while {ALLOWED_CONTAINERS_ENV} "
+            "is set: only the blob operations are available"
+        )
+        if name.startswith("_"):
+            raise refused
+        try:
+            unrestricted = _UNRESTRICTED[self]
+        except KeyError:
+            raise refused from None
+        attr = getattr(unrestricted, name)
+        if not inspect.iscoroutinefunction(attr):
+            raise refused
+        try:
+            signature = inspect.signature(attr)
+        except (TypeError, ValueError):
+            raise refused from None
+        if "container" in signature.parameters:
+            target = "container"
+        elif "blob_ref" in signature.parameters:
+            target = "blob_ref"
+        else:
+            raise refused
+
+        @functools.wraps(attr)
+        async def checked(*args: Any, **kwargs: Any) -> Any:
+            try:
+                value = signature.bind_partial(*args, **kwargs).arguments.get(target)
+            except TypeError:
+                value = None  # wrong arguments: the method itself refuses them
+            if target == "container":
+                self._require(value, "upload")
+            elif value is not None:
+                self._ref(value, "download")
+            return await attr(*args, **kwargs)
+
+        return checked

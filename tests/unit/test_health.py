@@ -41,6 +41,7 @@ async def started_server():
         readiness: HealthCheckRegistry | None = None,
         default_ready=_ok_readiness,
         verbose: bool = True,
+        emit_deployment_id: bool = True,
     ):
         port = _free_port()
         server = HealthServer(
@@ -51,6 +52,7 @@ async def started_server():
             readiness_registry=readiness or HealthCheckRegistry(),
             default_readiness=default_ready,
             verbose=verbose,
+            emit_deployment_id=emit_deployment_id,
         )
         await server.start()
         return server, f"http://127.0.0.1:{port}"
@@ -245,15 +247,9 @@ class TestDeploymentId:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"{url}/health") as r:
                 assert r.status == 200
-                assert await r.json() == {
-                    "status": "healthy",
-                    "deployment_id": "abc1234",
-                }
+                assert await r.json() == {"status": "healthy", "deployment_id": "abc1234"}
             async with s.get(f"{url}/ready") as r:
-                assert await r.json() == {
-                    "status": "healthy",
-                    "deployment_id": "abc1234",
-                }
+                assert await r.json() == {"status": "healthy", "deployment_id": "abc1234"}
 
     @pytest.mark.asyncio
     async def test_deployment_id_present_in_verbose_body_when_set(
@@ -270,7 +266,6 @@ class TestDeploymentId:
 
     @pytest.mark.asyncio
     async def test_deployment_id_omitted_when_unset(self, started_server, monkeypatch):
-        monkeypatch.delenv("KBM_LEDSAS_DEPLOYMENT_ID", raising=False)
         monkeypatch.delenv("KBM_LASTCOMMITID", raising=False)
         _, url = await started_server(verbose=False)
         async with aiohttp.ClientSession() as s:
@@ -279,38 +274,11 @@ class TestDeploymentId:
 
     @pytest.mark.asyncio
     async def test_deployment_id_omitted_when_blank(self, started_server, monkeypatch):
-        monkeypatch.delenv("KBM_LEDSAS_DEPLOYMENT_ID", raising=False)
         monkeypatch.setenv("KBM_LASTCOMMITID", "   ")
         _, url = await started_server(verbose=False)
         async with aiohttp.ClientSession() as s:
             async with s.get(f"{url}/health") as r:
                 assert await r.json() == {"status": "healthy"}
-
-    @pytest.mark.asyncio
-    async def test_deployment_id_prefers_namespaced_var(self, started_server, monkeypatch):
-        """KBM_LEDSAS_DEPLOYMENT_ID wins over the KBM_LASTCOMMITID fallback."""
-        monkeypatch.setenv("KBM_LEDSAS_DEPLOYMENT_ID", "namespaced")
-        monkeypatch.setenv("KBM_LASTCOMMITID", "fallback")
-        _, url = await started_server(verbose=False)
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"{url}/health") as r:
-                assert await r.json() == {
-                    "status": "healthy",
-                    "deployment_id": "namespaced",
-                }
-
-    @pytest.mark.asyncio
-    async def test_deployment_id_falls_back_to_lastcommitid(self, started_server, monkeypatch):
-        """KBM_LASTCOMMITID is used when the namespaced var is unset."""
-        monkeypatch.delenv("KBM_LEDSAS_DEPLOYMENT_ID", raising=False)
-        monkeypatch.setenv("KBM_LASTCOMMITID", "fallback")
-        _, url = await started_server(verbose=False)
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"{url}/health") as r:
-                assert await r.json() == {
-                    "status": "healthy",
-                    "deployment_id": "fallback",
-                }
 
     @pytest.mark.asyncio
     async def test_deployment_id_present_on_unhealthy_response(self, started_server, monkeypatch):

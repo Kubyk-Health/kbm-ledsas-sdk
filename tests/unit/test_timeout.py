@@ -264,11 +264,14 @@ class TestTimeoutEnforcement:
         command = create_command(deadline=deadline)
         ctx = create_context(mock_transport, command.envelope)
 
-        # Deadline (~0.5s) is smaller than config (10s)
+        # Deadline (~0.5s) is smaller than config (10s): the deadline binds,
+        # and its expiry is the command's deadline passing, a terminal
+        # DeadlineExceeded (not a retryable Timeout).
         response = await registry.execute(ctx, command, timeout_seconds=10)
 
         assert "error" in response.payload
-        assert response.payload["error"]["code"] == "Timeout"
+        assert response.payload["error"]["code"] == "DeadlineExceeded"
+        assert response.payload["error"]["retryable"] is False
 
     @pytest.mark.asyncio
     async def test_timeout_error_contains_duration(self, registry, mock_transport):
@@ -312,7 +315,7 @@ class TestTimeoutWithGenericErrors:
         assert "error" in response.payload
         assert response.payload["error"]["code"] == "Timeout"
         # Generic message should be used
-        assert response.payload["error"]["message"] == "Processing timed out (will retry)"
+        assert response.payload["error"]["message"] == "Processing timed out"
         assert response.payload["error"]["retryable"] is True
 
     @pytest.mark.asyncio

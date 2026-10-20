@@ -15,7 +15,7 @@
 ## Checklist
 
 - [ ] Tests added/updated and `pytest` passes locally
-- [ ] `ruff check .` and `black --check .` pass locally (`mypy src` is advisory — please don't add new type errors)
-- [ ] `CHANGELOG.md` updated under `## [Unreleased]` (for user-facing changes)
+- [ ] The checks in CONTRIBUTING.md "Pull request checks" pass locally (`ruff check .`, `black --check .`, the typed-consumer `mypy` check, `pytest`)
+- [ ] For a user-facing change: an entry in `CHANGELOG.md` under `## [Unreleased]`
 - [ ] All commits are **signed off** for the DCO (`git commit -s`)
 - [ ] I am not introducing any secrets, credentials, or private/internal references

@@ -1,5 +1,6 @@
-# The LEDSAS SDK (pulls in its own dependencies: pydantic, aio-pika,
-# azure-storage-blob, aiohttp, cryptography).
-kbm-ledsas-sdk>=0.3.3
-
-# Add your service's own pinned dependencies below.
+# This service's own third-party dependencies (none yet). Add your pinned
+# deps below; the Dockerfile installs them on top of the base image.
+#
+# Never list kbm-ledsas-sdk here: the SDK and its runtime dependencies come
+# pre-installed in the base image, and the base image tag is the SDK version.
+# scripts/send_hello.py uses aio-pika, which the SDK already depends on.

@@ -12,8 +12,8 @@ from .factory import create_transport
 from .mock import MockBlobOperations, MockTransport
 
 __all__ = [
-    "MockBlobOperations",
-    "MockTransport",
     "Transport",
     "create_transport",
+    "MockTransport",
+    "MockBlobOperations",
 ]

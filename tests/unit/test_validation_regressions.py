@@ -33,7 +33,7 @@ AZURITE_CONN = (
 
 
 # ---------------------------------------------------------------------------
-# expected-startup-error suppression for broker-unreachable
+# Expected-startup-error suppression for broker-unreachable
 # ---------------------------------------------------------------------------
 
 
@@ -50,7 +50,7 @@ def test_aiormq_connection_error_qualname_is_expected() -> None:
 def test_broker_unreachable_exits_clean_without_traceback(
     monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture
 ) -> None:
-    """Broker down at startup (the 'Connection Refused' case)
+    """Broker down at startup
     must exit 1 via the expected-startup-error path: no 'Fatal error in
     ServiceApp' re-log and no raw Python traceback frames."""
     monkeypatch.setenv("KBM_LEDSAS_SERVICE_NAME", "probe-svc")
@@ -72,17 +72,13 @@ def test_broker_unreachable_exits_clean_without_traceback(
     err = capfd.readouterr().err
     assert "ServiceApp exiting (startup failure already" in err
     assert "Fatal error in ServiceApp" not in err
-    # The transport layer logs the failure ONCE, with the (possibly
-    # chained) traceback embedded in its single-line JSON record's
-    # "exception" field — that one record is by design. What must NOT
-    # appear: a second record embedding the traceback, or Python's own
-    # raw uncaught-exception dump (whose header sits at column 0 on its
-    # own line, outside any JSON record).
-    traceback_lines = [
-        line for line in err.splitlines() if "Traceback (most recent call last)" in line
-    ]
-    assert len(traceback_lines) == 1
-    assert traceback_lines[0].startswith("{")  # inside the JSON record
+    # The transport logs ONE clean line naming the
+    # broker URL (credentials scrubbed) and the cause; no traceback
+    # anywhere (previously the transport's JSON record embedded one).
+    assert "Could not connect to the AMQP broker at" in err
+    assert "guest:guest" not in err
+    assert "Traceback (most recent call last)" not in err
+    assert "TransportUnavailable" in err
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +170,7 @@ def test_none_credentials_dump_as_none() -> None:
 
 
 # ---------------------------------------------------------------------------
-# public JSON log formatter renders extra={} fields
+# The public JSON log formatter renders extra={} fields
 # ---------------------------------------------------------------------------
 
 
