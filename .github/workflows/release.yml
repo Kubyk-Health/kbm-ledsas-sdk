@@ -79,6 +79,10 @@ jobs:
             echo "::error::pyproject version ($PKG_VERSION) or kbm_ledsas_sdk.__version__ ($SRC_VERSION) does not match the release tag ($TAG)"
             exit 1
           fi
+      # The tests run on the tree as committed, before a rehearsal changes the
+      # version: they check that the documents name the release version.
+      - name: Tests
+        run: python -m pytest -q -m "not integration"
       - name: Rehearsal version (TestPyPI)
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -97,8 +101,6 @@ jobs:
           grep -q "^version = \"${DEV}\"$" pyproject.toml
           grep -q "^__version__ = \"${DEV}\"$" src/kbm_ledsas_sdk/__init__.py
           echo "rehearsal version: ${DEV}"
-      - name: Tests
-        run: python -m pytest -q -m "not integration"
       - name: Check that the package page and the source link a release tag
         run: |
           set -euo pipefail
