@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.6] - 2026-10-21
+## [0.3.6] - 2026-10-20
 
 Security, dependency and reliability release, upgrading from 0.3.3 (0.3.4 and 0.3.5 were not
 released: numbers skipped). No public method or parameter was removed or renamed, but some behaviour
