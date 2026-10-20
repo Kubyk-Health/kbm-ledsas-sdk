@@ -182,8 +182,12 @@ jobs:
           # The SBOM tool, hash-pinned, in a venv of its own.
           python -m venv /tmp/sbomtool
           /tmp/sbomtool/bin/pip install --quiet --require-hashes -r .github/sbom-requirements.txt
+          # The root component is the wheel: a rehearsal builds <version>.devN from
+          # this tree, so describe the wheel's version (a release: no change).
+          sed "s/^version = \"${VERSION%.dev*}\"$/version = \"${VERSION}\"/" pyproject.toml > /tmp/pyproject.toml
+          grep -q "^version = \"${VERSION}\"$" /tmp/pyproject.toml
           /tmp/sbomtool/bin/cyclonedx-py environment /tmp/sdkenv/bin/python \
-            --pyproject pyproject.toml --mc-type library \
+            --pyproject /tmp/pyproject.toml --mc-type library \
             --of JSON --sv 1.6 -o /tmp/raw.cdx.json
           /tmp/sbomtool/bin/python .github/scripts/finish_sbom.py /tmp/raw.cdx.json \
             /tmp/install-report.json "$WHEEL" "$VERSION" "kbm_ledsas_sdk-${VERSION}.cdx.json"
