@@ -258,8 +258,11 @@ def test_compatibility_says_how_to_verify_the_base_image_without_its_recipe():
     assert "Verify an image by its digest: each release lists the image's digest" in base
     assert "where the table says the image carries an SBOM attestation" in base
     # every published tag row gives its digest and says whether the image carries an SBOM attestation
-    rows = [line for line in section(read("COMPATIBILITY.md"), "Container base image").splitlines()
-            if line.startswith("| `") and not line.startswith("| `latest`")]
+    rows = [
+        line
+        for line in section(read("COMPATIBILITY.md"), "Container base image").splitlines()
+        if line.startswith("| `") and not line.startswith("| `latest`")
+    ]
     assert rows
     for row in rows:
         assert re.search(r"`sha256:[0-9a-f]{64}`", row), row
