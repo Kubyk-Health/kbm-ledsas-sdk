@@ -48,7 +48,8 @@ directory `/app`.
 
 | Image tag | kbm-ledsas-sdk | Python | OS | Platforms | Digest at release |
 |-----------|----------------|--------|----|-----------|-------------------|
-| `0.3.6`   | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | listed here when the image is published, with whether it carries an SBOM attestation |
+| `0.3.6-r1` | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | `sha256:fd261b825b0fa42c1bd24895bdad020a1308d242908ea37fbcea0ce04eb628a9`; carries an SBOM attestation |
+| `0.3.6`   | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | `sha256:b2928ffd47e1e39081996790127e068b435424c960604d5392e3c52cbd9c1e3b`; carries an SBOM attestation; an earlier build of the same release, superseded by `0.3.6-r1` |
 | `latest`  | the newest release | | | | |
 
 There is no image for a number that was not released. The image is built by the project
