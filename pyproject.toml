@@ -7,7 +7,7 @@
 # is not (its tar and gzip headers carry the build time and the builder's
 # account). Keep these pins equal to .github/release-requirements.in. Bump
 # deliberately.
-requires = ["setuptools==84.0.0", "wheel==0.48.0"]
+requires = ["setuptools==84.2.1", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
