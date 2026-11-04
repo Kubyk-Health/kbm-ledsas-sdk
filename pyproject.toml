@@ -7,7 +7,7 @@
 # is not (its tar and gzip headers carry the build time and the builder's
 # account). Keep these pins equal to .github/release-requirements.in. Bump
 # deliberately.
-requires = ["setuptools==84.0.0", "wheel==0.48.0"]
+requires = ["setuptools==84.2.1", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -41,7 +41,7 @@ dependencies = [
     # makes tolerant of non-UTF-8 message properties), so declared with the
     # ranges the SDK is tested with rather than left to aio-pika.
     "aiormq>=6.8.0,<8.0",
-    "pamqp>=3.3.0,<5.0",
+    "pamqp>=3.3.0,<6.0",
     "azure-storage-blob>=12.19.0,<13.0",
     # Imported directly (azure.core). Security floor: 1.38.0 fixes
     # CVE-2026-21226 (PYSEC-2026-1208); without it an in-place upgrade keeps
