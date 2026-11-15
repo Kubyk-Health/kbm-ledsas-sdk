@@ -266,13 +266,15 @@ pip install kbm-ledsas-sdk==0.3.6
 
 [`ghcr.io/kebormed/kbm-ledsas-base-direct`](https://github.com/orgs/KeborMed/packages/container/package/kbm-ledsas-base-direct)
 is Python 3.11 on Alpine Linux with `kbm-ledsas-sdk` of the tag's version installed and pinned
-(`PIP_CONSTRAINT`), running as `kbmuser` (uid 1000) in `/app`. The minimal shape of an image for the quickstart's
+(`PIP_CONSTRAINT`), running as `kbmuser` (uid 1000) in `/app`. Build on `<version>-current`, which
+moves to each security rebuild of that SDK version; to freeze one image, pin it by digest
+(`...:0.3.6-current@sha256:<digest>`). The minimal shape of an image for the quickstart's
 `my_service.py`, next to a `requirements.txt` with your service's own dependencies (empty for the
 quickstart; for production, copy the example's
 [`Dockerfile`](https://github.com/Kubyk-Health/kbm-ledsas-sdk/blob/v0.3.6/examples/hello_world_service/Dockerfile)):
 
 ```dockerfile
-FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6
+FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6-current
 WORKDIR /app
 USER root
 ENV PIP_ROOT_USER_ACTION=ignore

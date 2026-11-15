@@ -2,5 +2,5 @@
 # deps below; the Dockerfile installs them on top of the base image.
 #
 # Never list kbm-ledsas-sdk here: the SDK and its runtime dependencies come
-# pre-installed in the base image, and the base image tag is the SDK version.
+# pre-installed in the base image, whose tag starts with the SDK version.
 # scripts/send_hello.py uses aio-pika, which the SDK already depends on.

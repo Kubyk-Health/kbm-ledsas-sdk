@@ -206,7 +206,8 @@ def test_readme_container_section():
     ):
         assert setting in container, setting
     assert "terminationGracePeriodSeconds" in container
-    assert f"FROM ghcr.io/kebormed/kbm-ledsas-base-direct:{VERSION}\n" in container
+    assert f"FROM ghcr.io/kebormed/kbm-ledsas-base-direct:{VERSION}-current\n" in container
+    assert f"{VERSION}-current@sha256:<digest>" in container  # how to freeze one image
 
 
 @pytest.mark.parametrize("rel", ["README.md", "examples/hello_world_service/README.md"])
@@ -257,16 +258,62 @@ def test_compatibility_says_how_to_verify_the_base_image_without_its_recipe():
     assert "carries no `org.opencontainers.image.source` label" in base
     assert "Verify an image by its digest: each release lists the image's digest" in base
     assert "where the table says the image carries an SBOM attestation" in base
-    # every published tag row gives its digest and says whether the image carries an SBOM attestation
+    # every published tag row gives its digest and says whether the image carries an SBOM
+    # attestation; the moving pointers (`latest`, `<version>-current`) have no fixed digest
     rows = [
         line
         for line in section(read("COMPATIBILITY.md"), "Container base image").splitlines()
-        if line.startswith("| `") and not line.startswith("| `latest`")
+        if line.startswith("| `")
+        and not line.startswith("| `latest`")
+        and not re.match(r"\| `[0-9]+\.[0-9]+\.[0-9]+-current`", line)
     ]
     assert rows
     for row in rows:
         assert re.search(r"`sha256:[0-9a-f]{64}`", row), row
         assert "SBOM attestation" in row, row
+
+
+def _base_image_rows() -> dict[str, str]:
+    rows = {}
+    for line in section(read("COMPATIBILITY.md"), "Container base image").splitlines():
+        match = re.match(r"\| `([^`]+)`", line)
+        if match:
+            rows[match.group(1)] = line
+    return rows
+
+
+def test_compatibility_lists_the_current_pointer_and_the_superseded_tags():
+    rows = _base_image_rows()
+    current = rows[f"{VERSION}-current"]
+    assert "sha256:" not in current  # it moves: no fixed digest
+    assert "security rebuild" in current
+    # the current release's rebuild tags (if any yet) follow -r<N> and say what they are
+    rebuilds = [tag for tag in rows if re.fullmatch(rf"{re.escape(VERSION)}-r[1-9][0-9]*", tag)]
+    for tag in rebuilds:
+        row = rows[tag]
+        assert "superseded" in row or "security rebuild" in row, row
+
+
+def test_compatibility_marks_the_retired_0_3_6_images():
+    # fixed facts about 0.3.6's images, whatever the current release is
+    rows = _base_image_rows()
+    # every 0.3.6 image except the current one points readers to 0.3.6-current
+    for tag in ("0.3.6", "0.3.6-r1", "0.3.6-r2", "0.3.6-r3"):
+        assert "superseded: use `0.3.6-current`" in rows[tag], tag
+    assert "same content as `0.3.6-r4`" in rows["0.3.6-r3"]
+
+
+def test_compatibility_states_the_tag_scheme():
+    base = " ".join(section(read("COMPATIBILITY.md"), "Container base image").split())
+    assert "keeps the tag" not in base  # a rebuild gets a new tag
+    for fact in (
+        "`<version>` is the first image of an SDK release and never changes",
+        "under a new tag `<version>-r<N>`, which never changes either",
+        "`<version>-current` always names the newest checked rebuild of that SDK version",
+        "`<version>-current@sha256:<digest>` to freeze one image",
+        "never build on it",
+    ):
+        assert fact in base, fact
 
 
 def test_upgrading_shows_the_handler_registration_errors():
@@ -817,9 +864,33 @@ def test_example_readme_names_the_port_variables_and_the_handler_timeout():
 
 
 def test_example_readme_states_what_the_base_image_ships():
+    """The base image keeps setuptools, wheel and ensurepip; removing pip does not
+    remove every way to install, so the README says to install at build time and
+    never claims the opposite."""
     text = " ".join(EXAMPLE_README.split())
     assert "stays in the image" not in text and "may still carry" not in text
-    assert "The base image ships without `setuptools`, `wheel`" in text
+    assert "ships without" not in text and "nothing can install" not in text
+    assert "The base image keeps `setuptools`, `wheel` and Python's bundled `ensurepip`" in text
+    assert "old releases with known vulnerabilities" in text
+    assert "must not create a virtual environment or run `ensurepip`" in text
+    assert "Install everything at build time" in text
+
+
+@pytest.mark.parametrize(
+    "rel",
+    ["README.md", "UPGRADING.md", "COMPATIBILITY.md", "THIRD_PARTY_NOTICES.txt", "CONTRIBUTING.md"],
+)
+def test_no_document_claims_the_base_image_lacks_build_tools(rel):
+    text = " ".join(read(rel).split())
+    assert not re.search(r"without `?(?:setuptools|wheel|ensurepip)", text), rel
+
+
+def test_notices_name_every_packaging_tool_the_base_image_keeps():
+    # The base image keeps pip's companions setuptools and wheel; a notice that lists
+    # only "pip and packaging" understates what an image redistributes.
+    text = " ".join(read("THIRD_PARTY_NOTICES.txt").split())
+    assert "the Python packaging tools pip, setuptools, wheel and packaging" in text
+    assert "tools pip and packaging" not in text
 
 
 def test_example_wording_names_no_indirect_path():
@@ -827,13 +898,18 @@ def test_example_wording_names_no_indirect_path():
         assert "straight to" not in read(rel), rel
 
 
-def test_example_dependency_bot_advice_is_for_your_own_repository():
-    text = " ".join(EXAMPLE_README.split())
-    assert "into your own repository" in text and "package-ecosystem: docker" in EXAMPLE_README
+def test_example_readme_makes_no_dependency_bot_promise_for_the_base_image():
+    # No docker entry in this repository's dependabot.yml shows how a bot treats the
+    # base image's tags, so the README promises nothing about it.
+    assert "package-ecosystem: docker" not in EXAMPLE_README
+    assert "dependabot" not in EXAMPLE_README.lower()
+
+
+def test_example_readme_lists_every_place_that_names_the_sdk_version():
     # Every place the example names the SDK version is listed in "Updating the SDK version".
     update = " ".join(section(EXAMPLE_README, "Updating the SDK version").split())
     pins = {
-        "Dockerfile": f"kbm-ledsas-base-direct:{VERSION}"
+        "Dockerfile": f"kbm-ledsas-base-direct:{VERSION}-current"
         in read("examples/hello_world_service/Dockerfile"),
         "main.py": f"kbm-ledsas-sdk=={VERSION}" in read("examples/hello_world_service/main.py"),
         "Run it locally": f"kbm-ledsas-sdk=={VERSION}" in section(EXAMPLE_README, "Run it locally"),

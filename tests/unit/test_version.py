@@ -82,4 +82,4 @@ def test_example_service_names_the_version():
     readme = _read("examples/hello_world_service/README.md")
     assert f"kbm-ledsas-sdk=={VERSION}" in readme
     dockerfile = _read("examples/hello_world_service/Dockerfile")
-    assert f"FROM ghcr.io/kebormed/kbm-ledsas-base-direct:{VERSION}\n" in dockerfile
+    assert f"FROM ghcr.io/kebormed/kbm-ledsas-base-direct:{VERSION}-current\n" in dockerfile

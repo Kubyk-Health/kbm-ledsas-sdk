@@ -48,8 +48,12 @@ directory `/app`.
 
 | Image tag | kbm-ledsas-sdk | Python | OS | Platforms | Digest at release |
 |-----------|----------------|--------|----|-----------|-------------------|
-| `0.3.6-r1` | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | `sha256:fd261b825b0fa42c1bd24895bdad020a1308d242908ea37fbcea0ce04eb628a9`; carries an SBOM attestation |
-| `0.3.6`   | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | `sha256:b2928ffd47e1e39081996790127e068b435424c960604d5392e3c52cbd9c1e3b`; carries an SBOM attestation; an earlier build of the same release, superseded by `0.3.6-r1` |
+| `0.3.6-current` | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | moves to each new security rebuild of 0.3.6 (on 2026-11-15, the same image as `0.3.6-r4`); build on this tag |
+| `0.3.6-r4` | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | `sha256:c6d00433361c7d289522d50e5280c7b7be9c45de9de1f7bd0ed073f162a8daa3`; carries an SBOM attestation; security rebuild, the image `0.3.6-current` names on 2026-11-15 |
+| `0.3.6-r3` | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | `sha256:aa84652080b1cc9d08f6f7c1cc43ed811913113315a8c2477206ee1eb7ee8928`; carries an SBOM attestation; same content as `0.3.6-r4`; superseded: use `0.3.6-current` |
+| `0.3.6-r2` | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | `sha256:30e553b7ed4f6cf54f994111958bd77c5654bc890ba1756de348bcc1abb1f7dc`; carries an SBOM attestation; superseded: use `0.3.6-current` |
+| `0.3.6-r1` | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | `sha256:fd261b825b0fa42c1bd24895bdad020a1308d242908ea37fbcea0ce04eb628a9`; carries an SBOM attestation; superseded: use `0.3.6-current` |
+| `0.3.6`   | 0.3.6 | 3.11 | Alpine Linux (musl libc) | `linux/amd64`, `linux/arm64` | `sha256:b2928ffd47e1e39081996790127e068b435424c960604d5392e3c52cbd9c1e3b`; carries an SBOM attestation; the first image of the release; superseded: use `0.3.6-current` |
 | `latest`  | the newest release | | | | |
 
 There is no image for a number that was not released. The image is built by the project
@@ -59,8 +63,16 @@ this project). Verify an image by its digest: each release lists the image's dig
 above (`docker buildx imagetools inspect ghcr.io/kebormed/kbm-ledsas-base-direct:<tag>`), and,
 where the table says the image carries an SBOM attestation, read it with
 `docker buildx imagetools inspect ghcr.io/kebormed/kbm-ledsas-base-direct@<digest> --format '{{json .SBOM}}'`.
-A rebuild for Alpine or Python security patches keeps the tag and changes the digest: pin the
-digest you tested, and never build on `latest`.
+
+Tags. `<version>` is the first image of an SDK release and never changes. A security rebuild of the
+same SDK (Alpine, Python and the SDK's own dependencies within its declared ranges) is published
+under a new tag `<version>-r<N>`, which never changes either. `<version>-current` always names the
+newest checked rebuild of that SDK version: build on it to receive security rebuilds, or pin
+`<version>-current@sha256:<digest>` to freeze one image. `latest` names the current tag of the
+newest SDK release; never build on it. To see which image `<version>-current` names now, run
+`docker buildx imagetools inspect ghcr.io/kebormed/kbm-ledsas-base-direct:<version>-current`: a
+digest the table does not list is a newer security rebuild, published after this file was last
+updated.
 
 ## Stability guarantees within 0.x
 

@@ -81,9 +81,9 @@ you ship an image, and include this notice with it.
 
 This notice covers only the SDK's Python packages. The base image also
 contains an operating system (Alpine Linux) with its own packages, the
-Python runtime, and the Python packaging tools pip and packaging, each
-under its own license; several of the OS packages are under GPL or LGPL
-licenses (for example busybox, the shell and core utilities,
+Python runtime, and the Python packaging tools pip, setuptools, wheel and
+packaging, each under its own license; several of the OS packages are
+under GPL or LGPL licenses (for example busybox, the shell and core utilities,
 GPL-2.0-only), whose terms on source availability apply
 when you redistribute an image. They are not listed here. To list what
 an image contains, with each package's license, run:
@@ -146,4 +146,4 @@ packages built with older tools keep it directly in `<pkg>-*.dist-info/`).
 
 All third-party software is used in accordance with their respective licenses.
 
-Last Updated: 2026-10-18
+Last Updated: 2026-11-15

@@ -173,4 +173,5 @@ requirements and compose images. Update these by hand, tag plus digest
   tags as the example's `docker-compose.yml`; a test checks it);
 - `setuptools==` and `wheel==` in `pyproject.toml` `[build-system]` and
   `.github/release-requirements.in` (kept equal; a test checks it);
-- the base image tag in `examples/hello_world_service/Dockerfile` (the SDK version).
+- the base image tag in `examples/hello_world_service/Dockerfile` (`<SDK version>-current`,
+  without a digest: it receives security rebuilds).
