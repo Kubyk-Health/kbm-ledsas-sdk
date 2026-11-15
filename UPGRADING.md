@@ -120,9 +120,10 @@ unchanged, but some behaviour changes and input that was never valid is now refu
 
 ### Containers
 
-- **Build `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6`**, which has the SDK installed; never
-  list `kbm-ledsas-sdk` in your `requirements.txt`. See the
-  [README](README.md#container-base-image). (`pip install kbm-ledsas-sdk==0.3.6` on any Python
+- **Build `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6-current`**, which has the SDK
+  installed and moves to each security rebuild of 0.3.6; to freeze one image, pin it by digest
+  (`...:0.3.6-current@sha256:<digest>`). Never list `kbm-ledsas-sdk` in your `requirements.txt`.
+  See the [README](README.md#container-base-image). (`pip install kbm-ledsas-sdk==0.3.6` on any Python
   3.11+ image still works.)
 - **End your `Dockerfile` with the numeric `USER 1000:1000`** (the base image's `kbmuser`), as
   the example does: Kubernetes admits a pod with `runAsNonRoot: true` and no `runAsUser` only

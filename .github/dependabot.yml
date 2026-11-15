@@ -59,4 +59,5 @@ updates:
       - dependencies
 
   # No docker entry for examples/hello_world_service/Dockerfile: its base image
-  # tag is the SDK version and moves with each release of this repository.
+  # tag is <version>-current, which already follows each security rebuild of
+  # that SDK version; moving it to a new SDK version is a manual change.

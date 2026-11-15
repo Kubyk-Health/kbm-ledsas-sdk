@@ -4,7 +4,7 @@ The smallest LEDSAS service: it answers every `SayHello` command with
 `{"greeting": "hello <name>"}` (default `"hello world"`). Copy this folder to start your own
 service. It is configured through `KBM_LEDSAS_*` environment variables; its image builds `FROM`
 the LEDSAS base image `ghcr.io/kebormed/kbm-ledsas-base-direct`, which has the SDK installed
-(the tag is the SDK version).
+(the tag starts with the SDK version).
 
 ## Layout
 
@@ -109,18 +109,14 @@ docker run --rm --network hello-world-net --env-file .env \
 
 ### Base image
 
-- **The tag is the SDK version:** `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6` runs SDK
-  0.3.6. Pin the digest too for a reproducible build
-  (`...:0.3.6@sha256:<digest>`), and never build on `latest`. Once you copy this folder into
-  your own repository, a `docker` entry in its `.github/dependabot.yml` proposes the next tag:
-
-  ```yaml
-    - package-ecosystem: docker
-      directory: "/"            # the folder of your Dockerfile
-      schedule:
-        interval: weekly
-  ```
-
+- **The tag starts with the SDK version:**
+  `FROM ghcr.io/kebormed/kbm-ledsas-base-direct:0.3.6-current` runs SDK 0.3.6, and the tag moves
+  to each security rebuild of 0.3.6 (Alpine, Python and the SDK's own dependencies), so
+  rebuilding your image with `docker build --pull` picks up the newest one (without `--pull`, a
+  cached copy of the base image is reused). To freeze one image for a reproducible build, pin
+  it by digest (`...:0.3.6-current@sha256:<digest>`) and move the digest when you choose. Never
+  build on `latest`. The SDK repository's
+  [COMPATIBILITY.md](../../COMPATIBILITY.md#container-base-image) lists the tags and digests.
 - **Do not install the SDK again:** never list `kbm-ledsas-sdk` in `requirements.txt`. The base
   image's `PIP_CONSTRAINT` file pins `kbm-ledsas-sdk==<version>` and the `cryptography>=50.0.0`
   floor, so a requirement for another version fails the build (a pip error that says
@@ -131,10 +127,13 @@ docker run --rm --network hello-world-net --env-file .env \
   so the service cannot change its code; write scratch files to `/tmp`. Its `LABEL` clears the
   base image's labels: add your own.
 - **pip is removed at the end of the build:** keep every `pip` command above that step, and
-  install into the base image's Python (not a venv); the step fails the build if pip is left
-  anywhere. The base image ships without `setuptools`, `wheel` and Python's bundled installer
-  under `ensurepip`, so nothing can install packages at runtime: put everything in
-  `requirements.txt`.
+  install into the base image's Python, not a virtual environment; the step fails the build if an
+  installed copy of pip is left. The base image keeps `setuptools`, `wheel` and Python's bundled
+  `ensurepip` (which brings back pip 24.0 and setuptools 79.0.1, for example in a virtual
+  environment): removing pip removes only the installer the build uses, not the means to bring
+  one back. Those bundled copies are old releases with known vulnerabilities, which is why the
+  image must not create a virtual environment or run `ensurepip`. Install everything at build
+  time: put it in `requirements.txt`.
 - **One stage:** keep a single `FROM` line, on this base image.
 
 #### Third-party packages on Alpine (musl libc)
@@ -151,7 +150,7 @@ there install on Alpine but are built for glibc, so `import torch` fails.
 
 ## Updating the SDK version
 
-1. Change the version everywhere this folder names it: the `FROM` tag in the `Dockerfile` (and in
-   "Base image" above), the `kbm-ledsas-sdk==` pin in "Run it locally", and the pin in the
-   docstring of `main.py`.
+1. Change the version everywhere this folder names it: the version in the `FROM` tag in the
+   `Dockerfile` (and in "Base image" above), the `kbm-ledsas-sdk==` pin in "Run it locally", and
+   the pin in the docstring of `main.py`.
 2. Re-run the tests and one local round-trip.

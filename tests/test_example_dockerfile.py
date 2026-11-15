@@ -2,13 +2,14 @@
 
 ``examples/hello_world_service/Dockerfile`` is the shape a service image
 takes: one stage ``FROM ghcr.io/kebormed/kbm-ledsas-base-direct:<SDK
-version>`` (the image comes with the SDK and its runtime dependencies
-installed, and its tag is the SDK version), the service's own dependencies
+version>-current`` (the image comes with the SDK and its runtime dependencies
+installed; its tag starts with the SDK version, and ``-current`` moves to each
+security rebuild of it), the service's own dependencies
 installed as root and checked with ``pip check``, pip removed as the last
 root step, and the service run as the base image's non-root user
 ``kbmuser``, by number (``USER 1000:1000``: Kubernetes ``runAsNonRoot`` can
-only verify a numeric user). The tag is written literally so that a
-dependency bot can propose the next one.
+only verify a numeric user). The tag is written literally (no build
+argument), so the SDK version is changed in one visible place.
 """
 
 import re
@@ -78,10 +79,17 @@ def _word(instruction: str) -> str:
     return instruction.split(None, 1)[0].upper()
 
 
-# The FROM line: the base image at this SDK version's tag, optionally pinned by
-# digest as the documentation recommends. Written at column 0, upper case, one
-# space, no build argument, no stage name, no platform flag.
-FROM_LINE = re.compile(rf"FROM {re.escape(BASE)}:{re.escape(VERSION)}(?:@sha256:[0-9a-f]{{64}})?")
+# The FROM line: the base image at a tag of this SDK version (the release's
+# first image, a ``-r<N>`` security rebuild, or the ``-current`` pointer),
+# optionally pinned by digest as the documentation recommends. Written at
+# column 0, upper case, one space, no build argument, no stage name, no
+# platform flag.
+FROM_LINE = re.compile(
+    rf"FROM {re.escape(BASE)}:{re.escape(VERSION)}"
+    r"(?:-current|-r[1-9][0-9]*)?(?:@sha256:[0-9a-f]{64})?"
+)
+# The example builds on the -current pointer, so it receives security rebuilds.
+EXAMPLE_FROM = f"FROM {BASE}:{VERSION}-current"
 
 
 @pytest.mark.parametrize(
@@ -90,8 +98,22 @@ FROM_LINE = re.compile(rf"FROM {re.escape(BASE)}:{re.escape(VERSION)}(?:@sha256:
         (f"FROM {BASE}:{VERSION}", True),
         (f"FROM {BASE}:{VERSION}@sha256:{'0' * 64}", True),
         (f"FROM {BASE}:{VERSION}@sha256:{'0' * 63}", False),
+        (f"FROM {BASE}:{VERSION}-current", True),
+        (f"FROM {BASE}:{VERSION}-current@sha256:{'0' * 64}", True),
+        (f"FROM {BASE}:{VERSION}-current@sha256:{'0' * 63}", False),
+        (f"FROM {BASE}:{VERSION}-r1", True),
+        (f"FROM {BASE}:{VERSION}-r4", True),
+        (f"FROM {BASE}:{VERSION}-r12@sha256:{'0' * 64}", True),
+        (f"FROM {BASE}:{VERSION}-r0", False),
+        (f"FROM {BASE}:{VERSION}-r", False),
+        (f"FROM {BASE}:{VERSION}-r01", False),
+        (f"FROM {BASE}:{VERSION}-Current", False),
+        (f"FROM {BASE}:{VERSION}-current-r1", False),
+        (f"FROM {BASE}:{VERSION}-rc1", False),
+        (f"FROM {BASE}:0.0.0-current", False),
         (f"FROM {BASE}:latest", False),
         (f"FROM {BASE}:{VERSION} AS build", False),
+        (f"FROM {BASE}:{VERSION}-current AS build", False),
         (f"FROM --platform=linux/amd64 {BASE}:{VERSION}", False),
     ],
 )
@@ -102,6 +124,7 @@ def test_from_line_shape(line, accepted):
 def test_one_literal_from_line_on_the_base_image_of_this_sdk_version(text, instructions):
     froms = [line for _, line in instructions if _word(line) == "FROM"]
     assert len(froms) == 1 and FROM_LINE.fullmatch(froms[0]), froms
+    assert froms[0].split("@", 1)[0] == EXAMPLE_FROM, froms
     assert [ln for ln in text.splitlines() if FROM_LINE.fullmatch(ln)] == froms
     assert not any(_word(line) == "ARG" for _, line in instructions)
 
